@@ -8,9 +8,21 @@
 # https://opensource.org/licenses/MIT.
 
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from tbp.monty.frameworks.run_parallel import parse_episode_spec
+import pandas as pd
+
+from omegaconf import OmegaConf
+
+from tbp.monty.frameworks.loggers.monty_handlers import BasicCSVStatsHandler
+from tbp.monty.frameworks.run_parallel import (
+    is_partial_eval_run,
+    parse_episode_spec,
+    post_parallel_eval,
+)
 
 
 class ParseEpisodeSpecTest(unittest.TestCase):
@@ -105,6 +117,86 @@ class ParseEpisodeSpecTest(unittest.TestCase):
             parse_episode_spec(":1", total=0)
         with self.assertRaises(ValueError):
             parse_episode_spec("0:", total=0)
+
+
+class PartialEvalRunTest(unittest.TestCase):
+    def test_detects_full_eval_selection(self):
+        cfg = OmegaConf.create(
+            {
+                "episodes": "all",
+                "experiment": {"config": {"do_train": False, "n_eval_epochs": 4}},
+            }
+        )
+
+        self.assertFalse(is_partial_eval_run(cfg))
+
+    def test_detects_subset_eval_selection(self):
+        cfg = OmegaConf.create(
+            {
+                "episodes": "1:3",
+                "experiment": {"config": {"do_train": False, "n_eval_epochs": 4}},
+            }
+        )
+
+        self.assertTrue(is_partial_eval_run(cfg))
+
+    def test_training_run_is_not_partial_eval(self):
+        cfg = OmegaConf.create(
+            {
+                "episodes": "1:3",
+                "experiment": {"config": {"do_train": True, "n_eval_epochs": 4}},
+            }
+        )
+
+        self.assertFalse(is_partial_eval_run(cfg))
+
+
+class PostParallelEvalTest(unittest.TestCase):
+    def test_resume_eval_merges_existing_eval_stats(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            existing_eval = base_dir / "eval_stats.csv"
+            parallel_dir = base_dir / "parallel_eval_episode_1"
+            parallel_dir.mkdir()
+
+            pd.DataFrame(
+                [
+                    {"episode_seed": 100, "lm_id": "LM_0", "primary_performance": "correct"},
+                    {"episode_seed": 100, "lm_id": "LM_1", "primary_performance": "correct"},
+                ]
+            ).to_csv(existing_eval, index=False)
+            pd.DataFrame(
+                [
+                    {"episode_seed": 200, "lm_id": "LM_0", "primary_performance": "correct_mlh"},
+                    {"episode_seed": 200, "lm_id": "LM_1", "primary_performance": "correct_mlh"},
+                ]
+            ).to_csv(parallel_dir / "eval_stats.csv", index=False)
+
+            experiments = [
+                {
+                    "config": {
+                        "logging": {
+                            "output_dir": str(parallel_dir),
+                            "detailed_save_per_episode": False,
+                            "monty_handlers": [BasicCSVStatsHandler],
+                            "python_log_to_file": False,
+                        }
+                    }
+                }
+            ]
+
+            with mock.patch("hydra.utils.instantiate", return_value=object()):
+                post_parallel_eval(
+                    experiments,
+                    base_dir,
+                    merge_existing_eval_stats=True,
+                )
+
+            merged = pd.read_csv(existing_eval)
+
+            self.assertEqual(len(merged), 4)
+            self.assertEqual(sorted(merged["episode_seed"].unique().tolist()), [100, 200])
+            self.assertFalse(parallel_dir.exists())
 
 
 if __name__ == "__main__":

@@ -607,7 +607,8 @@ class MontyExperiment:
     def post_epoch(self):
         """Call sub post_epoch functions and save state dict."""
         # NOTE: maybe an option not to save everything every epoch?
-        self.save_state_dict(output_dir=self.output_dir / f"{self.train_epochs}")
+        if self.experiment_mode is ExperimentMode.TRAIN:
+            self.save_state_dict(output_dir=self.output_dir / f"{self.train_epochs}")
         self.logger_handler.post_epoch(self.logger_args)
 
         if self.experiment_mode is ExperimentMode.TRAIN:

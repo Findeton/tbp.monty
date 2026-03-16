@@ -85,6 +85,15 @@ def cat_csv(filenames: Iterable[Path], outfile: Path):
     df.to_csv(outfile, index=False)
 
 
+def is_partial_eval_run(cfg: DictConfig) -> bool:
+    if cfg.experiment.config.do_train:
+        return False
+
+    n_eval_epochs = cfg.experiment.config.n_eval_epochs
+    selected_episodes = parse_episode_spec(cfg.episodes, total=n_eval_epochs)
+    return len(selected_episodes) < n_eval_epochs
+
+
 def sample_params_to_init_args(params):
     new_params = {}
     new_params["positions"] = [params["position"]]
@@ -463,7 +472,11 @@ def collect_detailed_episodes_names(parallel_dirs: Iterable[Path]) -> list[Path]
     return filenames
 
 
-def post_parallel_eval(experiments: list[Mapping], base_dir: Path) -> None:
+def post_parallel_eval(
+    experiments: list[Mapping],
+    base_dir: Path,
+    merge_existing_eval_stats: bool = False,
+) -> None:
     """Post-execution cleanup after running evaluation in parallel.
 
     Logs are consolidated across parallel runs and saved to disk.
@@ -500,8 +513,17 @@ def post_parallel_eval(experiments: list[Mapping], base_dir: Path) -> None:
             filename = "eval_stats.csv"
             filenames = [pdir / filename for pdir in parallel_dirs]
             outfile = base_dir / filename
-            maybe_rename_existing_file(outfile)
-            post_parallel_log_cleanup(filenames, outfile, cat_fn=cat_csv)
+            existing_files = [f for f in filenames if f.exists()]
+            if len(existing_files) == 0:
+                continue
+
+            if merge_existing_eval_stats and outfile.exists():
+                cat_csv([outfile, *existing_files], outfile)
+                for f in existing_files:
+                    f.unlink(missing_ok=True)
+            else:
+                maybe_rename_existing_file(outfile)
+                post_parallel_log_cleanup(filenames, outfile, cat_fn=cat_csv)
             continue
 
     if experiments[0]["config"]["logging"]["python_log_to_file"]:
@@ -597,6 +619,7 @@ def run_episodes_parallel(
     num_parallel: int,
     experiment_name: str,
     train: bool = True,
+    merge_existing_eval_stats: bool = False,
 ) -> None:
     """Run episodes in parallel.
 
@@ -668,7 +691,11 @@ def run_episodes_parallel(
             else:
                 print(f"No csv table found at {csv_path} to log to wandb")
     else:
-        post_parallel_eval(experiments, base_dir)
+        post_parallel_eval(
+            experiments,
+            base_dir,
+            merge_existing_eval_stats=merge_existing_eval_stats,
+        )
         if log_parallel_wandb:
             csv_path = base_dir / "eval_stats.csv"
             if csv_path.exists():
@@ -745,4 +772,5 @@ def main(cfg: DictConfig):
                 cfg.num_parallel,
                 cfg.experiment.config.logging.run_name,
                 train=False,
+                merge_existing_eval_stats=is_partial_eval_run(cfg),
             )

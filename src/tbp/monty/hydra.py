@@ -59,11 +59,16 @@ def tests_dir_resolver(path: str) -> str:
     return str(Path(__file__).parents[3] / "tests" / Path(path))
 
 
+def _register_resolver(name: str, resolver) -> None:
+    if not OmegaConf.has_resolver(name):
+        OmegaConf.register_new_resolver(name, resolver)
+
+
 def register_resolvers() -> None:
-    OmegaConf.register_new_resolver("monty.agent_id", agent_id_resolver)
-    OmegaConf.register_new_resolver("monty.class", monty_class_resolver)
-    OmegaConf.register_new_resolver("np.array", ndarray_resolver)
-    OmegaConf.register_new_resolver("np.ones", ones_resolver)
-    OmegaConf.register_new_resolver("np.list_eval", numpy_list_eval_resolver)
-    OmegaConf.register_new_resolver("path.expanduser", path_expanduser_resolver)
-    OmegaConf.register_new_resolver("path.tests", tests_dir_resolver)
+    _register_resolver("monty.agent_id", agent_id_resolver)
+    _register_resolver("monty.class", monty_class_resolver)
+    _register_resolver("np.array", ndarray_resolver)
+    _register_resolver("np.ones", ones_resolver)
+    _register_resolver("np.list_eval", numpy_list_eval_resolver)
+    _register_resolver("path.expanduser", path_expanduser_resolver)
+    _register_resolver("path.tests", tests_dir_resolver)
