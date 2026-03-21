@@ -1,0 +1,10 @@
+defaults:
+  - tutorial/omniglot_inference
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_omniglot_cross_version_control_train/pretrained/}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: phase2_omniglot_cross_version_control_eval
+  eval_env_interface_args:
+    versions: [2, 2, 2, 2, 2, 2]

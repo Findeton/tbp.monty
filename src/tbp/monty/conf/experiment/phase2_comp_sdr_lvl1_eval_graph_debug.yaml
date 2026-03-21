@@ -1,0 +1,18 @@
+defaults:
+  - infer_comp_lvl1_with_comp_models
+  - config/monty/learning_modules/clear_learning_module_configs@config.monty_config
+  - config/monty/learning_modules/two_stacked_constrained_lms_sdr_inference@config.monty_config.learning_module_configs
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_comp_sdr_lvl1_train/pretrained/}
+  monty_config:
+    learning_module_configs:
+      learning_module_1:
+        learning_module_args:
+          sdr_args:
+            sdr_log_flag: true
+            log_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/${experiment.config.logging.run_name}/sdr_logs_lm1}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: phase2_comp_sdr_lvl1_eval_graph_debug
+    wandb_handlers: []

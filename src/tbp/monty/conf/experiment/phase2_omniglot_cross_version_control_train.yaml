@@ -1,0 +1,9 @@
+defaults:
+  - tutorial/omniglot_training
+
+config:
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: phase2_omniglot_cross_version_control_train
+  train_env_interface_args:
+    versions: [1, 1, 1, 1, 1, 1]

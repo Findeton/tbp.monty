@@ -598,6 +598,12 @@ class GridObjectModel(GraphObjectModel):
             updated_fm = feature_mapping
             new_feat_dim = features.shape[-1]
 
+        if self._feature_grid.shape[-1] != new_feat_dim:
+            self._feature_grid = self._resize_sparse_last_dim(
+                self._feature_grid,
+                new_feat_dim,
+            )
+
         # Since we have dense entries in the last dimension that we want associated
         # with the voxel id in the first 3 dims, we need to extract them a bit
         # tediously to do the averaging. TODO: Maybe there is a better way to do this
@@ -756,6 +762,18 @@ class GridObjectModel(GraphObjectModel):
         )
         return sparse_tensor.coalesce()
 
+    def _resize_sparse_last_dim(self, sparse_tensor, new_last_dim_size):
+        """Return a sparse tensor with the same entries and a wider last dimension."""
+        if sparse_tensor.shape[-1] == new_last_dim_size:
+            return sparse_tensor
+
+        new_shape = (*sparse_tensor.shape[:-1], new_last_dim_size)
+        return torch.sparse_coo_tensor(
+            sparse_tensor.indices(),
+            sparse_tensor.values(),
+            size=new_shape,
+        ).coalesce()
+
     def _get_new_voxel_location(
         self, new_locations_in_voxel, previous_loc_in_voxel, voxel
     ):
@@ -820,8 +838,16 @@ class GridObjectModel(GraphObjectModel):
             num_obs_in_voxel = self._observation_count[voxel[0], voxel[1], voxel[2], 0]
             num_new_obs = len(feats)
             if num_obs_in_voxel > num_new_obs:
-                old_ids = self.feature_mapping[feature]
-                previous_average = previous_feat_in_voxel[old_ids[0] : old_ids[1],]
+                previous_average = None
+                if feature in self.feature_mapping:
+                    old_ids = self.feature_mapping[feature]
+                    previous_average = previous_feat_in_voxel[old_ids[0] : old_ids[1],]
+
+                if previous_average is None:
+                    target_ids = target_fm[feature]
+                    new_feature_avg[target_ids[0] : target_ids[1]] = avg_feat
+                    continue
+
                 num_old_obs = num_obs_in_voxel - num_new_obs
 
                 if feature == "pose_vectors":
@@ -829,7 +855,9 @@ class GridObjectModel(GraphObjectModel):
                         avg_feat = previous_average
                     elif use_cds_to_update is False:
                         avg_feat[3:] = previous_average[3:]
-                elif feature == "object_id" and avg_feat != previous_average:
+                elif feature == "object_id" and not np.array_equal(
+                    np.ravel(avg_feat), np.ravel(previous_average)
+                ):
                     # TODO: Figure out a more nuanced way to take into account past obs
                     if num_old_obs > num_new_obs:
                         avg_feat = previous_average

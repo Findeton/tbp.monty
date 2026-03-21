@@ -1,0 +1,66 @@
+learning_module_0:
+  learning_module_class: ${monty.class:tbp.monty.frameworks.models.evidence_sdr_matching.EvidenceSDRGraphLM}
+  learning_module_args:
+    max_match_distance: 0.001
+    tolerances:
+      patch_0:
+        hsv: ${np.array:[0.1, 1, 1]}
+        principal_curvatures_log: ${np.ones:2}
+    feature_weights: {}
+    max_graph_size: 0.3
+    num_model_voxels_per_dim: 200
+    max_nodes_per_graph: 2000
+    object_evidence_threshold: 20
+    sdr_args:
+      log_path: null
+      sdr_length: 2048
+      sdr_on_bits: 41
+      sdr_lr: 1e-2
+      n_sdr_epochs: 1000
+      stability: 0.0
+      upward_top_k: 3
+      upward_support_top_k: 3
+      upward_support_temperature: 1.0
+      sdr_log_flag: false
+learning_module_1:
+  learning_module_class: ${monty.class:tbp.monty.frameworks.models.evidence_sdr_matching.EvidenceSDRGraphLM}
+  learning_module_args:
+    max_match_distance: 0.001
+    tolerances:
+      patch_1:
+        hsv: ${np.array:[0.1, 1, 1]}
+        principal_curvatures_log: ${np.ones:2}
+      learning_module_0:
+        # Initial overlap threshold for upward similarity transport.
+        object_id: 16
+        object_support: 0.6
+        object_id_rank_0: 16
+        object_id_rank_1: 16
+        object_id_rank_2: 16
+    feature_weights:
+      learning_module_0:
+        object_id: 1
+        object_support: 1
+        object_id_rank_0: 0.35
+        object_id_rank_1: 0.25
+        object_id_rank_2: 0.15
+    max_graph_size: 0.4
+    # Parent-LM graph building densifies per-channel feature grids; keep the grid
+    # small enough that the lower-LM SDR object_id channel remains tractable.
+    num_model_voxels_per_dim: 20
+    max_nodes_per_graph: 2000
+    sdr_args:
+      log_path: null
+      sdr_length: 2048
+      sdr_on_bits: 41
+      sdr_lr: 1e-2
+      n_sdr_epochs: 1000
+      stability: 0.0
+      upward_packet_top_k: 3
+      temporal_support_accumulator: true
+      temporal_support_decay: 0.8
+      temporal_support_object_id: true
+      graph_support_objective: true
+      graph_support_objective_weight: 2.0
+      graph_support_objective_tolerance: 0.0
+      sdr_log_flag: false

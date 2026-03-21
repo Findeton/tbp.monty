@@ -1,0 +1,5 @@
+# Ablation: pose vectors only (pure geometric orientation matching)
+patch:
+  hsv: ${np.array:[0, 0, 0]}
+  pose_vectors: ${np.ones:3}
+  principal_curvatures_log: ${np.array:[0, 0]}

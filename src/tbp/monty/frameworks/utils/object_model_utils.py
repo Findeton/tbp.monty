@@ -393,8 +393,14 @@ def get_most_common_value(values):
     Returns:
         Most common value.
     """
-    values = np.array(values, dtype=int).flatten()
-    return np.argmax(np.bincount(values))
+    values = np.asarray(values)
+
+    if values.ndim <= 1 or (values.ndim == 2 and values.shape[1] == 1):
+        flattened = values.astype(int).flatten()
+        return np.argmax(np.bincount(flattened))
+
+    unique_values, counts = np.unique(values, axis=0, return_counts=True)
+    return unique_values[np.argmax(counts)]
 
 
 def circular_mean(values):

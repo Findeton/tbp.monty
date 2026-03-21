@@ -1,0 +1,40 @@
+defaults:
+  - base_config_10distinctobj_surf_agent
+  - config/logging/clear_logging@config
+  - config/logging/csv@config.logging
+  - config/environment_interface/clear_train_env_interface_args@config
+  - config/environment_interface/per_object@config.train_env_interface_args
+  - config/environment_interface/ycb/phase2_category_train_objects@config.train_env_interface_args.object_names
+
+config:
+  do_train: true
+  do_eval: false
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_ycb_category_control_train/pretrained/}
+  n_train_epochs: ${benchmarks.rotations_all_count}
+  max_train_steps: 5000
+  max_total_steps: 5000
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    python_log_level: INFO
+    run_name: phase2_ycb_category_sdr_fit_train
+  monty_config:
+    monty_args:
+      min_train_steps: ${benchmarks.min_eval_steps}
+      num_exploratory_steps: 1
+    learning_module_configs:
+      learning_module_0:
+        learning_module_class: ${monty.class:tbp.monty.frameworks.models.evidence_sdr_matching.EvidenceSDRGraphLM}
+        learning_module_args:
+          sdr_args:
+            log_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_ycb_category_sdr_fit_train/sdr_logs}
+            sdr_length: 2048
+            sdr_on_bits: 41
+            sdr_lr: 1e-2
+            n_sdr_epochs: 1000
+            stability: 0.0
+            sdr_log_flag: false
+  train_env_interface_class: ${monty.class:tbp.monty.frameworks.environments.embodied_data.InformedEnvironmentInterface}
+  train_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}

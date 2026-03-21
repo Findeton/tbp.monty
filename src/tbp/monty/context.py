@@ -7,7 +7,8 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -21,3 +22,6 @@ class RuntimeContext:
 
     rng: np.random.RandomState
     """Random number generator."""
+
+    timer: Any = field(default=None)
+    """Optional global interval timer."""

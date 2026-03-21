@@ -316,6 +316,75 @@ class ObjectModelTest(unittest.TestCase):
                 self.dummy_features,
             )
 
+    def test_grid_update_handles_vector_object_id(self):
+        model = GridObjectModel(
+            "test_model", max_nodes=10, max_size=10, num_voxels_per_dim=5
+        )
+        features = {
+            "pose_vectors": np.array(
+                [self.dummy_pv.flatten(), self.dummy_pv.flatten()]
+            ),
+            "pose_fully_defined": np.array([True, True]),
+            "object_id": np.array(
+                [[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]]
+            ),
+        }
+        locations = np.array([[0.0, 0.0, 0.0], [0.1, 0.1, 0.0]])
+
+        model.build_model(locations, features)
+        model.update_model(
+            locations=np.array([[0.0, 0.0, 0.0]]),
+            features={
+                "pose_vectors": np.array([self.dummy_pv.flatten()]),
+                "pose_fully_defined": np.array([True]),
+                "object_id": np.array([[0.0, 1.0, 0.0, 1.0]]),
+            },
+            location_rel_model=np.array([0.0, 0.0, 0.0]),
+            object_location_rel_body=np.array([0.0, 0.0, 0.0]),
+            object_rotation=Rotation.identity(),
+        )
+
+        np.testing.assert_array_equal(
+            model.get_values_for_feature("object_id")[0],
+            np.array([1.0, 0.0, 1.0, 0.0]),
+        )
+
+    def test_grid_update_handles_new_feature_block_on_existing_voxel(self):
+        model = GridObjectModel(
+            "test_model", max_nodes=10, max_size=10, num_voxels_per_dim=5
+        )
+        base_pose = self.dummy_pv.flatten()
+        model.build_model(
+            np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]),
+            {
+                "pose_vectors": np.array([base_pose, base_pose]),
+                "pose_fully_defined": np.array([True, True]),
+                "object_id": np.array(
+                    [[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]]
+                ),
+            },
+        )
+
+        model.update_model(
+            locations=np.array([[0.0, 0.0, 0.0]]),
+            features={
+                "pose_vectors": np.array([base_pose]),
+                "pose_fully_defined": np.array([True]),
+                "object_id": np.array([[1.0, 0.0, 1.0, 0.0]]),
+                "object_support": np.array([[0.7, 0.3, 0.0, 0.0]]),
+            },
+            location_rel_model=np.array([0.0, 0.0, 0.0]),
+            object_location_rel_body=np.array([0.0, 0.0, 0.0]),
+            object_rotation=Rotation.identity(),
+        )
+
+        self.assertIn("object_support", model.feature_mapping)
+        self.assertEqual(model._feature_grid.shape[-1], 18)
+        np.testing.assert_allclose(
+            model.get_values_for_feature("object_support")[0],
+            np.array([0.7, 0.3, 0.0, 0.0]),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

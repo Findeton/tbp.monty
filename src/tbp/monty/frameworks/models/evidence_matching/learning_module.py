@@ -175,6 +175,9 @@ class EvidenceGraphLM(GraphLM):
         gsg: EvidenceGoalStateGenerator | None = None,
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
+        category_taxonomy: dict | None = None,
+        category_bias_strength: float = 0.0,
+        evidence_size_norm_power: float = 0.0,
         *args,
         **kwargs,
     ) -> None:
@@ -212,6 +215,18 @@ class EvidenceGraphLM(GraphLM):
         self.max_graph_size = max_graph_size
         # --- Debugging Params ---
         self.use_multithreading = use_multithreading
+        # --- Category Bias Params ---
+        # category_taxonomy maps graph_id -> category_name. When set, enables
+        # online category-aggregated evidence readout and optional evidence bias.
+        self.category_taxonomy = category_taxonomy or {}
+        self.category_bias_strength = category_bias_strength
+        self.category_evidence: dict[str, float] = {}
+        self._hippocampal_context: dict = {}
+        # Evidence normalization by graph size. Larger graphs accumulate more
+        # evidence from having more nodes. Normalizing by N^power corrects
+        # this bias. 0 = no normalization, 0.5 = sqrt, 0.75 = empirically best
+        # for alphabet accuracy on Omniglot, 1.0 = full normalization.
+        self.evidence_size_norm_power = evidence_size_norm_power
 
         # TODO make sure we always extract pose features and remove this
         self.tolerances = add_pose_features_to_tolerances(tolerances)
@@ -711,9 +726,10 @@ class EvidenceGraphLM(GraphLM):
         available_graph_ids = []
         available_graph_evidences = []
         for graph_id in graph_ids:
-            if len(self.evidence[graph_id]):
+            graph_evidence = self.evidence.get(graph_id)
+            if graph_evidence is not None and len(graph_evidence):
                 available_graph_ids.append(graph_id)
-                available_graph_evidences.append(np.max(self.evidence[graph_id]))
+                available_graph_evidences.append(np.max(graph_evidence))
 
         return available_graph_ids, np.array(available_graph_evidences)
 
@@ -732,6 +748,127 @@ class EvidenceGraphLM(GraphLM):
         if self.has_detailed_logger:
             stats = self._add_detailed_stats(stats)
         return stats
+
+    def _compute_category_evidence(self):
+        """Compute category-aggregated evidence from per-graph max evidence.
+
+        For each category in the taxonomy, computes the average max evidence
+        across all graphs in that category (normalized by category size).
+        This prevents categories with more training objects (e.g., cups: 7)
+        from dominating categories with fewer (e.g., clamps: 2).
+
+        Stores result in self.category_evidence dict.
+        This is the online version of the post-hoc readout that produced +10pp.
+        """
+        if not self.category_taxonomy:
+            return
+
+        from collections import defaultdict
+        cat_ev_sum = defaultdict(float)
+        cat_count = defaultdict(int)
+        for graph_id in self.get_all_known_object_ids():
+            cat = self.category_taxonomy.get(graph_id)
+            if cat is None:
+                continue
+            cat_count[cat] += 1
+            ev_array = self.evidence.get(graph_id)
+            if ev_array is not None and len(ev_array) > 0:
+                max_ev = float(np.max(ev_array))
+                if max_ev > 0:
+                    cat_ev_sum[cat] += max_ev
+        # Normalize by category size (average evidence per graph in category)
+        self.category_evidence = {
+            cat: cat_ev_sum[cat] / cat_count[cat]
+            for cat in cat_count
+            if cat_count[cat] > 0
+        }
+
+    def _apply_category_bias(self):
+        """Apply soft evidence bias toward graphs in the leading category.
+
+        After computing category evidence, boosts evidence for all hypotheses
+        of graphs in the top category. The boost is proportional to
+        category_bias_strength and the category's evidence share.
+
+        This creates a gentle positive feedback where same-category graphs
+        reinforce each other, without runaway effects (the boost is bounded
+        by the category share which is <= 1.0).
+        """
+        if not self.category_evidence or self.category_bias_strength <= 0:
+            return
+
+        total_cat_ev = sum(self.category_evidence.values())
+        if total_cat_ev <= 0:
+            return
+
+        for graph_id in self.get_all_known_object_ids():
+            ev_array = self.evidence.get(graph_id)
+            if ev_array is None or len(ev_array) == 0:
+                continue
+            cat = self.category_taxonomy.get(graph_id)
+            if cat is None:
+                continue
+            # Category share: fraction of total evidence in this category
+            cat_share = self.category_evidence.get(cat, 0) / total_cat_ev
+            # Bias: boost evidence proportional to category share and strength
+            # cat_share is in [0, 1], so max boost = category_bias_strength
+            bias = self.category_bias_strength * cat_share
+            self.evidence[graph_id] = ev_array + bias
+
+    def receive_context(self, **context_signal):
+        """Receive a context signal from a HippocampalModule or top-level LM.
+
+        Stores the signal and uses association_strengths to bias evidence
+        toward graphs associated with the HPC's active concepts. The bias
+        is proportional to the association strength and category_bias_strength.
+
+        Args:
+            **context_signal: Keys typically include context_vector,
+                active_concepts, association_strengths, episode_count.
+        """
+        self._hippocampal_context = context_signal
+        self._apply_hippocampal_bias()
+
+    def _apply_hippocampal_bias(self):
+        """Use hippocampal association strengths to bias evidence.
+
+        When the HPC reports strong associations for certain concept IDs,
+        boosts evidence for graphs whose IDs match or whose categories match
+        the associated concepts. The boost is proportional to:
+          category_bias_strength * association_strength_for_concept
+
+        This enables cross-episode priming: if the HPC has seen balls bounce
+        in previous episodes, it biases evidence toward ball graphs when the
+        bounce context is active.
+        """
+        if not self._hippocampal_context or self.category_bias_strength <= 0:
+            return
+
+        assoc = self._hippocampal_context.get("association_strengths", {})
+        if not assoc:
+            return
+
+        # Bias evidence for graphs that match associated concepts
+        for graph_id in self.get_all_known_object_ids():
+            ev_array = self.evidence.get(graph_id)
+            if ev_array is None or len(ev_array) == 0:
+                continue
+
+            # Direct match: graph_id appears in associations
+            strength = assoc.get(graph_id, 0.0)
+
+            # Category match: if graph's category matches any associated concept
+            if self.category_taxonomy and strength == 0:
+                graph_cat = self.category_taxonomy.get(graph_id)
+                if graph_cat:
+                    for concept, s in assoc.items():
+                        concept_cat = self.category_taxonomy.get(concept)
+                        if concept_cat == graph_cat and s > 0:
+                            strength = max(strength, s)
+
+            if strength > 0:
+                bias = self.category_bias_strength * strength
+                self.evidence[graph_id] = ev_array + bias
 
     def _update_possible_matches(
         self,
@@ -762,6 +899,9 @@ class EvidenceGraphLM(GraphLM):
                     # call this to prevent main thread from continuing in code
                     # before all evidences are updated.
                     thread.join()
+            # Online category readout and optional bias (T1.3 + T1.4a)
+            self._compute_category_evidence()
+            self._apply_category_bias()
             # NOTE: would not need to do this if we are still voting
             # Call this update in the step method?
             self.possible_matches = self._threshold_possible_matches()
@@ -1154,6 +1294,56 @@ class EvidenceGraphLM(GraphLM):
                     )
                     self.feature_weights[input_channel][key] = default_weights
 
+    def register_dynamic_feature(
+        self,
+        channel: str,
+        feature_name: str,
+        dim: int,
+        weight: float = 1.0,
+        tolerance: float = 0.2,
+    ) -> None:
+        """Register a new feature at runtime (T1.R2: CMP enrichment).
+
+        Enables LM outputs or hippocampal context to be injected as features
+        for evidence matching without config-time registration. Uses uniform
+        tolerance as the default; callers can refine via set_feature_weight().
+
+        Args:
+            channel: Input channel name (e.g., "patch", "lm_context").
+            feature_name: Feature key (e.g., "category_evidence", "context_vec").
+            dim: Dimensionality of the feature vector.
+            weight: Per-dimension weight for evidence computation.
+            tolerance: Per-dimension tolerance for feature matching.
+        """
+        if channel not in self.tolerances:
+            self.tolerances[channel] = {}
+        if channel not in self.feature_weights:
+            self.feature_weights[channel] = {}
+
+        self.tolerances[channel][feature_name] = np.ones(dim) * tolerance
+        self.feature_weights[channel][feature_name] = np.ones(dim) * weight
+
+        logger.info(
+            f"Registered dynamic feature {channel}.{feature_name} "
+            f"(dim={dim}, weight={weight}, tolerance={tolerance})"
+        )
+
+    def set_feature_weight(
+        self, channel: str, feature_name: str, weight
+    ) -> None:
+        """Update the weight for an existing feature at runtime.
+
+        Args:
+            channel: Input channel name.
+            feature_name: Feature key.
+            weight: New weight (scalar or array matching feature dimension).
+        """
+        if channel not in self.feature_weights:
+            self.feature_weights[channel] = {}
+        self.feature_weights[channel][feature_name] = np.atleast_1d(
+            np.asarray(weight, dtype=np.float64)
+        )
+
     def _threshold_possible_matches(self, x_percent_scale_factor=1.0):
         """Return possible matches based on evidence threshold.
 
@@ -1231,6 +1421,12 @@ class EvidenceGraphLM(GraphLM):
     def _calculate_most_likely_hypothesis(self, graph_id=None):
         """Return pose with highest evidence count.
 
+        When category_taxonomy and category_bias_strength are set, uses a
+        two-stage selection: first determine the most likely category (by
+        aggregated evidence), then pick the best graph within that category.
+        This prevents cross-category errors when the category signal is strong
+        but no single same-category graph has the global highest evidence.
+
         Args:
             graph_id: If provided, find mlh pose for this object. If graph_id is None
                 look through all objects and finds most likely one.
@@ -1244,12 +1440,42 @@ class EvidenceGraphLM(GraphLM):
                 mlh_id = np.argmax(graph_evidence)
                 mlh = self._get_mlh_dict_from_id(graph_id, mlh_id)
         else:
+            # Determine which graphs to consider
+            use_category_filter = (
+                self.category_taxonomy
+                and self.category_bias_strength > 0
+                and self.category_evidence
+            )
+
+            if use_category_filter:
+                # Two-stage: find top category, then best graph in that category
+                top_category = max(
+                    self.category_evidence, key=self.category_evidence.get
+                )
+                candidate_graphs = [
+                    gid for gid in self.get_all_known_object_ids()
+                    if self.category_taxonomy.get(gid) == top_category
+                ]
+                # Fallback: if no candidates (taxonomy mismatch), use all graphs
+                if not candidate_graphs:
+                    candidate_graphs = list(self.get_all_known_object_ids())
+            else:
+                candidate_graphs = list(self.get_all_known_object_ids())
+
             highest_evidence_so_far = -np.inf
-            for next_graph_id in self.get_all_known_object_ids():
+            for next_graph_id in candidate_graphs:
                 graph_evidence = self.evidence[next_graph_id]
                 if len(graph_evidence):
                     mlh_id = np.argmax(graph_evidence)
                     evidence = graph_evidence[mlh_id]
+
+                    # Normalize by graph size to correct for larger-graph bias
+                    if self.evidence_size_norm_power > 0:
+                        n_nodes = len(graph_evidence)
+                        if n_nodes > 1:
+                            evidence = evidence / (n_nodes
+                                                   ** self.evidence_size_norm_power)
+
                     if evidence > highest_evidence_so_far:
                         mlh = self._get_mlh_dict_from_id(next_graph_id, mlh_id)
                         highest_evidence_so_far = evidence

@@ -1,6 +1,15 @@
-# Full-System Roadmap
+# Full-System Roadmap (v1 — Superseded)
 
-## Purpose
+> **This document has been superseded by
+> [full-system-roadmap-v2.md](full-system-roadmap-v2.md)**, which reorganizes the
+> program from 10 sequential phases into 4 parallel research tracks based on
+> empirical results from Phases 0-2. All operational rules, safety protocols, and
+> policies have been carried forward into v2.
+>
+> This document is retained as historical reference for the original phase
+> definitions and the v1→v2 mapping rationale documented in the v2 roadmap.
+
+## Purpose (Historical)
 
 This document turns the broad discussion about Monty's current limits into a concrete
 development roadmap.

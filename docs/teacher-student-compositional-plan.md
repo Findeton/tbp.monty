@@ -1,5 +1,9 @@
 # Phase 1: Make Composition Real
 
+> **Track**: [Track 1: Multi-Column Intelligence](track-1-multi-column-intelligence.md)
+> **Status**: Completed (negative result on primary criterion)
+> **Roadmap**: [full-system-roadmap-v2.md](full-system-roadmap-v2.md)
+
 ## Purpose
 
 This document captures the full plan behind the current work in `tbp.monty`.

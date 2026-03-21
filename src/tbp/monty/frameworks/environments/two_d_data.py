@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import PIL
 import quaternion as qt
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 from tbp.monty.frameworks.actions.actions import Action
 from tbp.monty.frameworks.agents import AgentID
@@ -244,6 +244,122 @@ class OmniglotEnvironment(SimulatedEnvironment):
 
     def close(self) -> None:
         self._current_state = None
+
+
+class OmniglotEnvironment3D(OmniglotEnvironment):
+    """Omniglot with distance-transform extrusion for genuine 3D geometry.
+
+    Instead of a flat depth map (gaussian blur of the binary image), uses a
+    distance transform to create dome-shaped 3D letters. Thick strokes produce
+    high ridges with large curvature; thin strokes produce low ridges. Junctions
+    where strokes meet create distinctive curvature profiles that vary across
+    alphabets.
+
+    Args:
+        patch_size: height and width of patch in pixels.
+        data_path: path to the omniglot dataset.
+        extrusion_scale: height of the tallest point relative to the base
+            depth (1.2). Higher values create more pronounced 3D structure.
+        smooth_sigma: gaussian smoothing applied after distance transform
+            to create continuous curvature. 0 = no smoothing.
+    """
+
+    def __init__(self, patch_size=10, data_path=None, extrusion_scale=0.3,
+                 smooth_sigma=1.0):
+        self.extrusion_scale = extrusion_scale
+        self.smooth_sigma = smooth_sigma
+        super().__init__(patch_size=patch_size, data_path=data_path)
+        # Precompute the full-image depth map for the current character
+        self._full_depth = self._compute_3d_depth(self.current_image)
+
+    def _compute_3d_depth(self, binary_image):
+        """Compute distance-transform based depth map from binary character image.
+
+        Returns a depth array where strokes are raised (lower depth values)
+        with height proportional to distance from stroke edges.
+
+        All stroke pixels get depth < 1.0 (well below the 1.1 clip threshold).
+        Background pixels stay at 1.2 (above clip). The distance transform
+        creates curvature variation: stroke centers are highest (lowest depth),
+        stroke edges are lower (higher depth but still below clip).
+        """
+        # binary_image: True = background, False = stroke (PIL convention)
+        stroke_mask = ~binary_image
+        if not stroke_mask.any():
+            return np.full_like(binary_image, 1.2, dtype=float)
+
+        # Distance transform: each stroke pixel gets distance to nearest edge
+        dt = distance_transform_edt(stroke_mask.astype(float))
+
+        # Normalize to [0, 1]
+        max_dt = dt.max()
+        if max_dt > 0:
+            dt = dt / max_dt
+
+        # Apply smoothing for continuous curvature
+        if self.smooth_sigma > 0:
+            dt = gaussian_filter(dt, sigma=self.smooth_sigma)
+            # Re-normalize after smoothing
+            dt_max = dt.max()
+            if dt_max > 0:
+                dt = dt / dt_max
+
+        # Two-component depth:
+        # Background: 1.2 (above clip_value=1.1, treated as off-object)
+        # Stroke base: 1.0 (below clip, on-object)
+        # Stroke center: 1.0 - extrusion_scale (highest point)
+        # This guarantees ALL stroke pixels pass the depth clip
+        depth = np.where(
+            stroke_mask,
+            1.0 - self.extrusion_scale * dt,  # stroke: 0.7 to 1.0
+            1.2,  # background
+        )
+        return depth
+
+    def switch_to_object(self, alphabet_id, character_id, version_id):
+        super().switch_to_object(alphabet_id, character_id, version_id)
+        self._full_depth = self._compute_3d_depth(self.current_image)
+
+    def _observations(self) -> Observations:
+        query_loc = self.locations[self.step_num % self.max_steps]
+        patch = self.get_image_patch(
+            self.current_image, query_loc, self.patch_size,
+        )
+        # Use the precomputed 3D depth map instead of flat gaussian blur
+        depth_patch = self.get_image_patch(
+            self._full_depth, query_loc, self.patch_size,
+        )
+        # Ensure correct dtype
+        depth_patch = np.array(depth_patch, dtype=float)
+
+        return Observations(
+            {
+                AgentID("agent_id_0"): AgentObservations(
+                    {
+                        SensorID("patch"): SensorObservation(
+                            {
+                                "depth": depth_patch,
+                                "semantic": np.array(~patch, dtype=int),
+                                "rgba": np.stack(
+                                    [depth_patch, depth_patch, depth_patch], axis=2
+                                ),
+                            }
+                        ),
+                        SensorID("view_finder"): SensorObservation(
+                            {
+                                "depth": self._full_depth,
+                                "semantic": np.array(~patch, dtype=int),
+                            }
+                        ),
+                    }
+                )
+            }
+        )
+
+    def reset(self) -> tuple[Observations, ProprioceptiveState]:
+        self.step_num = 0
+        self._full_depth = self._compute_3d_depth(self.current_image)
+        return self._observations(), self.get_state()
 
 
 class SaccadeOnImageEnvironment(SimulatedEnvironment):

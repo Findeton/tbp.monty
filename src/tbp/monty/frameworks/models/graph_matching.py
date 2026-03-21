@@ -191,6 +191,16 @@ class MontyForGraphMatching(MontyBase):
 
     # ------------------ Logging & Saving ----------------------
     def load_state_dict_from_parallel(self, parallel_dirs, save=False):
+        if len(parallel_dirs) == 1:
+            state_dict = torch.load(parallel_dirs[0] / "model.pt")
+            load_dir = parallel_dirs[0].parent
+
+            if save:
+                torch.save(state_dict, load_dir / "model.pt")
+
+            self.load_state_dict(state_dict)
+            return
+
         lm_dict = {}
         for pdir in parallel_dirs:
             state_dict = torch.load(pdir / "model.pt")
@@ -271,6 +281,28 @@ class MontyForGraphMatching(MontyBase):
                 self.learning_modules[i].stepwise_targets_list.append(
                     self.learning_modules[i].stepwise_target_object
                 )
+
+        # After all LMs have stepped, dispatch context signals from any
+        # HippocampalModule (or any LM with get_context_signal) to all others.
+        self._dispatch_context_signals()
+
+    def _dispatch_context_signals(self):
+        """Broadcast context signals from hippocampal/top-level LMs downward.
+
+        Any LM that implements ``get_context_signal()`` and returns a non-None
+        dict will have its signal broadcast to all other LMs via their
+        ``receive_context()`` method.
+        """
+        for i, lm in enumerate(self.learning_modules):
+            if not hasattr(lm, "get_context_signal"):
+                continue
+            signal = lm.get_context_signal()
+            if signal is None:
+                continue
+            # Broadcast to all other LMs
+            for j, target_lm in enumerate(self.learning_modules):
+                if j != i:
+                    target_lm.receive_context(**signal)
 
     def _combine_votes(self, votes_per_lm):
         """Combine outgoing votes using lm_to_lm_vote_matrix matrix.
@@ -1300,6 +1332,8 @@ class GraphMemory(LMMemory):
             )
         else:
             for key in feature_keys:
+                if key not in graph.feature_mapping:
+                    continue
                 key_ids = graph.feature_mapping[key]
                 feature = graph.x[node_id, key_ids[0] : key_ids[1]]
                 node_features[key] = feature

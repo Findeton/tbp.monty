@@ -1,0 +1,19 @@
+defaults:
+  - base_config_10distinctobj_surf_agent
+  - config/logging/clear_logging@config
+  - config/logging/csv@config.logging
+  - config/environment_interface/clear_eval_env_interface_args@config
+  - config/environment_interface/per_object@config.eval_env_interface_args
+  - config/environment_interface/ycb/extended_holdout_objects@config.eval_env_interface_args.object_names
+  - config/monty/learning_modules/ablation_no_curvature_1lm@config.monty_config.learning_module_configs
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/extended_ycb_train/pretrained/}
+  n_eval_epochs: ${benchmarks.rotations_all_count}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: extended_ycb_eval_holdout_no_curvature
+  eval_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}

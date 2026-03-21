@@ -1,0 +1,18 @@
+defaults:
+  - base_config_10distinctobj_surf_agent
+  - config/logging/clear_logging@config
+  - config/logging/csv@config.logging
+  - config/environment_interface/clear_eval_env_interface_args@config
+  - config/environment_interface/per_object@config.eval_env_interface_args
+  - config/environment_interface/ycb/phase2_category_holdout_objects@config.eval_env_interface_args.object_names
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_v2/augmented_checkpoint/pretrained/}
+  n_eval_epochs: ${benchmarks.rotations_all_count}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_v2}
+    run_name: phase2_v2_category_subgraph_eval_holdout
+  eval_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}

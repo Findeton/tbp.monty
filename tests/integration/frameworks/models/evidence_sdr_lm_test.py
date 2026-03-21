@@ -181,6 +181,7 @@ class EvidenceSDRIntegrationTest(BaseGraphTest):
                 sdr_on_bits=41,  # Number of active bits in the SDRs
                 sdr_lr=1e-2,  # Learning rate of the encoding algorithm
                 n_sdr_epochs=1000,  # Number of training epochs per episode
+                train_sdr_on_eval=True,  # This toy test fits SDRs during eval episodes
                 sdr_log_flag=True,  # log the output of the module
             ),
         )
@@ -300,6 +301,33 @@ class EvidenceSDRIntegrationTest(BaseGraphTest):
         overlaps = sdrs @ sdrs.T
         self.assertTrue(
             overlaps[1, 2] > overlaps[0, 2] and overlaps[1, 2] > overlaps[0, 1]
+        )
+
+    def test_sdr_state_round_trips_through_state_dict(self):
+        """Saving and loading should preserve trained SDR encoder state."""
+        lm = self.get_eslm()
+        self.learn_obj(lm, self.get_rectangle_obs(), "rectangle")
+        self.learn_obj(lm, self.get_rectangle_long_obs(), "rectangle_long")
+        self.learn_obj(lm, self.get_triangle_obs(), "triangle")
+
+        state_dict = lm.state_dict()
+
+        reloaded_lm = self.get_eslm()
+        reloaded_lm.load_state_dict(state_dict)
+
+        self.assertEqual(reloaded_lm.obj2id, lm.obj2id)
+        self.assertEqual(reloaded_lm.id2obj, lm.id2obj)
+        np.testing.assert_array_equal(
+            reloaded_lm.sdr_encoder.obj_sdrs,
+            lm.sdr_encoder.obj_sdrs,
+        )
+        np.testing.assert_array_equal(
+            reloaded_lm.target_overlaps._overlaps,
+            lm.target_overlaps._overlaps,
+        )
+        np.testing.assert_array_equal(
+            reloaded_lm._object_id_to_features("rectangle"),
+            lm._object_id_to_features("rectangle"),
         )
 
     def tearDown(self):

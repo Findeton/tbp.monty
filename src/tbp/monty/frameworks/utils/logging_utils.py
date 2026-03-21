@@ -788,6 +788,45 @@ def add_evidence_lm_episode_stats(lm, stats, consistent_child_objects):
         last_mlh["rotation"].inv().as_euler("xyz", degrees=True)
     )
     stats["highest_evidence"] = last_mlh["evidence"]
+
+    # Log per-graph max evidence for category-level analysis
+    if hasattr(lm, "get_evidence_for_each_graph"):
+        try:
+            graph_ids, graph_evidences = lm.get_evidence_for_each_graph()
+            if len(graph_ids) > 0:
+                stats["evidence_per_graph"] = {
+                    gid: float(ev) for gid, ev in zip(graph_ids, graph_evidences)
+                }
+                # Novelty detection: compute category evidence margin
+                if hasattr(lm, "category_taxonomy") and lm.category_taxonomy:
+                    from collections import defaultdict
+                    cat_ev = defaultdict(float)
+                    cat_count = defaultdict(int)
+                    for gid, ev in zip(graph_ids, graph_evidences):
+                        cat = lm.category_taxonomy.get(gid)
+                        if cat is not None and ev > 0:
+                            cat_ev[cat] += float(ev)
+                            cat_count[cat] += 1
+                    # Normalize by category size
+                    cat_ev_norm = {
+                        c: cat_ev[c] / cat_count[c]
+                        for c in cat_ev if cat_count[c] > 0
+                    }
+                    if len(cat_ev_norm) >= 2:
+                        sorted_cats = sorted(
+                            cat_ev_norm.items(), key=lambda x: x[1], reverse=True
+                        )
+                        best_cat, best_ev = sorted_cats[0]
+                        second_ev = sorted_cats[1][1]
+                        margin = best_ev - second_ev
+                        rel_margin = margin / best_ev if best_ev > 0 else 0.0
+                        stats["category_prediction"] = best_cat
+                        stats["category_margin"] = round(margin, 4)
+                        stats["category_relative_margin"] = round(rel_margin, 4)
+                        stats["category_novel"] = rel_margin < 0.3
+        except (IndexError, AttributeError):
+            pass  # No graphs learned yet (e.g., during early training)
+
     stats["episode_avg_prediction_error"] = np.mean(
         lm.buffer.stats["mlh_prediction_error"]
     )

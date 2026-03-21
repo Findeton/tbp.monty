@@ -1,0 +1,15 @@
+defaults:
+  - supervised_pre_training_objects_with_logos_lvl2_comp_models
+  - config/environment_interface/clear_train_env_interface_args@config
+  - config/environment_interface/per_object@config.train_env_interface_args
+  - config/environment_interface/logos_on_objs/phase2_comp_substitution_train_objects@config.train_env_interface_args.object_names
+
+config:
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: phase2_comp_substitution_comp_train
+    wandb_handlers: []
+  train_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}

@@ -41,6 +41,7 @@ class SDRFeatureEvidenceCalculator:
         if input_channel.startswith("learning_module"):
             return SDRFeatureEvidenceCalculator.calculate_feature_evidence_sdr_for_all_nodes(  # noqa: E501
                 channel_feature_array=channel_feature_array,
+                channel_feature_order=channel_feature_order,
                 channel_feature_weights=channel_feature_weights,
                 channel_query_features=channel_query_features,
                 channel_tolerances=channel_tolerances,
@@ -58,6 +59,7 @@ class SDRFeatureEvidenceCalculator:
     @staticmethod
     def calculate_feature_evidence_sdr_for_all_nodes(
         channel_feature_array: np.ndarray,
+        channel_feature_order: list[str] | None,
         channel_feature_weights: dict,
         channel_query_features: dict,
         channel_tolerances: dict,
@@ -88,13 +90,115 @@ class SDRFeatureEvidenceCalculator:
         Returns:
             The normalized overlaps.
         """
-        query_feat = np.expand_dims(channel_query_features["object_id"], 1)
-        tolerance = channel_tolerances["object_id"]
-        sdr_on_bits = query_feat.sum(axis=0)
+        if channel_feature_order is None:
+            channel_feature_order = list(channel_query_features.keys())
 
-        overlaps = channel_feature_array @ query_feat.squeeze(-1)
-        normalized_overlaps = (overlaps - tolerance) / (sdr_on_bits - tolerance)
+        start_idx = 0
+        feature_evidence = []
+        feature_weights = []
+        for feature in channel_feature_order:
+            if feature not in channel_query_features:
+                continue
+            query_feat = np.asarray(channel_query_features[feature], dtype=np.float64)
+            if query_feat.ndim == 0:
+                query_feat = query_feat.reshape(1)
+            else:
+                query_feat = query_feat.reshape(-1)
+
+            end_idx = start_idx + len(query_feat)
+            stored_feat = channel_feature_array[:, start_idx:end_idx]
+            tolerance = channel_tolerances[feature]
+
+            if feature == "object_id" or feature.startswith("object_id_"):
+                evidence = SDRFeatureEvidenceCalculator._calculate_object_id_evidence(
+                    stored_feat,
+                    query_feat,
+                    tolerance,
+                )
+            elif feature == "object_support":
+                evidence = (
+                    SDRFeatureEvidenceCalculator._calculate_object_support_evidence(
+                        stored_feat,
+                        query_feat,
+                        tolerance,
+                    )
+                )
+            else:
+                evidence = SDRFeatureEvidenceCalculator._calculate_dense_similarity(
+                    stored_feat,
+                    query_feat,
+                    tolerance,
+                )
+
+            feature_evidence.append(evidence)
+            feature_weights.append(channel_feature_weights[feature])
+            start_idx = end_idx
+
+        if len(feature_evidence) == 0:
+            return np.zeros(channel_feature_array.shape[0])
+
+        if len(feature_evidence) == 1:
+            return feature_evidence[0] * feature_weights[0]
+
+        stacked_evidence = np.vstack(feature_evidence)
+        return np.average(stacked_evidence, weights=feature_weights, axis=0)
+
+    @staticmethod
+    def _calculate_object_id_evidence(
+        stored_feat: np.ndarray,
+        query_feat: np.ndarray,
+        tolerance: float,
+    ) -> np.ndarray:
+        max_overlap = float(query_feat @ query_feat)
+        max_overlap = max(max_overlap, tolerance + np.finfo(np.float64).eps)
+
+        overlaps = stored_feat @ query_feat
+        normalized_overlaps = (overlaps - tolerance) / (max_overlap - tolerance)
         normalized_overlaps[normalized_overlaps < 0] = 0.0
-
-        normalized_overlaps *= channel_feature_weights["object_id"]
+        normalized_overlaps[normalized_overlaps > 1.0] = 1.0
         return normalized_overlaps
+
+    @staticmethod
+    def _calculate_object_support_evidence(
+        stored_feat: np.ndarray,
+        query_feat: np.ndarray,
+        tolerance: float,
+    ) -> np.ndarray:
+        query_norm = float(np.linalg.norm(query_feat))
+        if np.isclose(query_norm, 0.0):
+            return np.zeros(stored_feat.shape[0])
+
+        stored_norms = np.linalg.norm(stored_feat, axis=1)
+        similarities = np.zeros(stored_feat.shape[0], dtype=np.float64)
+        valid = stored_norms > 0
+        similarities[valid] = (stored_feat[valid] @ query_feat) / (
+            stored_norms[valid] * query_norm
+        )
+        return SDRFeatureEvidenceCalculator._normalize_similarity(
+            similarities,
+            tolerance,
+        )
+
+    @staticmethod
+    def _calculate_dense_similarity(
+        stored_feat: np.ndarray,
+        query_feat: np.ndarray,
+        tolerance: float,
+    ) -> np.ndarray:
+        differences = np.mean(np.abs(stored_feat - query_feat), axis=1)
+        similarities = 1.0 - differences
+        return SDRFeatureEvidenceCalculator._normalize_similarity(
+            similarities,
+            tolerance,
+        )
+
+    @staticmethod
+    def _normalize_similarity(
+        similarities: np.ndarray,
+        tolerance: float,
+    ) -> np.ndarray:
+        denominator = max(1.0 - tolerance, np.finfo(np.float64).eps)
+        normalized = (similarities - tolerance) / denominator
+        normalized[normalized < 0] = 0.0
+        normalized[normalized > 1.0] = 1.0
+        return normalized

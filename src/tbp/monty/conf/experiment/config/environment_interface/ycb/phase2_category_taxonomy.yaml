@@ -1,0 +1,25 @@
+object_to_category:
+  mug: cup
+  e_cups: cup
+  c_cups: cup
+  d_cups: cup
+  knife: utensil
+  fork: utensil
+  spoon: utensil
+  cracker_box: box
+  sugar_box: box
+  pudding_box: box
+
+train_objects:
+  - mug
+  - e_cups
+  - fork
+  - spoon
+  - cracker_box
+  - sugar_box
+
+holdout_objects:
+  - c_cups
+  - d_cups
+  - knife
+  - pudding_box

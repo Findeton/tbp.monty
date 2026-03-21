@@ -1,0 +1,21 @@
+defaults:
+  - phase2_ycb_category_control_eval_holdout
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_ycb_category_sdr_train/pretrained/}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: phase2_ycb_category_sdr_eval_holdout
+  monty_config:
+    learning_module_configs:
+      learning_module_0:
+        learning_module_class: ${monty.class:tbp.monty.frameworks.models.evidence_sdr_matching.EvidenceSDRGraphLM}
+        learning_module_args:
+          sdr_args:
+            log_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_ycb_category_sdr_eval_holdout/sdr_logs}
+            sdr_length: 2048
+            sdr_on_bits: 41
+            sdr_lr: 1e-2
+            n_sdr_epochs: 1000
+            stability: 0.0
+            sdr_log_flag: false

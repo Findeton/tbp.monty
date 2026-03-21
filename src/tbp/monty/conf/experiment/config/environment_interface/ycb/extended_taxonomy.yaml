@@ -1,0 +1,132 @@
+object_to_category:
+  # Fruits (round, organic shapes) - 8 objects
+  011_banana: fruit
+  012_strawberry: fruit
+  013_apple: fruit
+  014_lemon: fruit
+  015_peach: fruit
+  016_pear: fruit
+  017_orange: fruit
+  018_plum: fruit
+  # Balls (spherical) - 6 objects
+  053_mini_soccer_ball: ball
+  054_softball: ball
+  055_baseball: ball
+  056_tennis_ball: ball
+  057_racquetball: ball
+  058_golf_ball: ball
+  # Boxes (rectangular prisms) - 5 objects
+  003_cracker_box: box
+  004_sugar_box: box
+  008_pudding_box: box
+  009_gelatin_box: box
+  036_wood_block: box
+  # Cans (cylinders) - 4 objects
+  002_master_chef_can: can
+  005_tomato_soup_can: can
+  007_tuna_fish_can: can
+  010_potted_meat_can: can
+  # Cups (hollow cylinders) - 10 objects
+  025_mug: cup
+  065-a_cups: cup
+  065-b_cups: cup
+  065-c_cups: cup
+  065-d_cups: cup
+  065-e_cups: cup
+  065-f_cups: cup
+  065-g_cups: cup
+  065-h_cups: cup
+  065-i_cups: cup
+  # Utensils (elongated, thin) - 4 objects
+  030_fork: utensil
+  031_spoon: utensil
+  032_knife: utensil
+  033_spatula: utensil
+  # Tools (elongated with handles) - 5 objects
+  035_power_drill: tool
+  037_scissors: tool
+  042_adjustable_wrench: tool
+  043_phillips_screwdriver: tool
+  044_flat_screwdriver: tool
+  # Clamps (similar mechanical shapes) - 3 objects
+  050_medium_clamp: clamp
+  051_large_clamp: clamp
+  052_extra_large_clamp: clamp
+  # Toy airplanes (same shape, different variants) - 5 objects
+  072-a_toy_airplane: airplane
+  072-b_toy_airplane: airplane
+  072-c_toy_airplane: airplane
+  072-d_toy_airplane: airplane
+  072-e_toy_airplane: airplane
+
+train_objects:
+  # Fruits: 6 train, 2 holdout
+  - 011_banana
+  - 012_strawberry
+  - 013_apple
+  - 014_lemon
+  - 016_pear
+  - 017_orange
+  # Balls: 4 train, 2 holdout
+  - 053_mini_soccer_ball
+  - 054_softball
+  - 055_baseball
+  - 056_tennis_ball
+  # Boxes: 3 train, 2 holdout
+  - 003_cracker_box
+  - 004_sugar_box
+  - 008_pudding_box
+  # Cans: 3 train, 1 holdout
+  - 002_master_chef_can
+  - 005_tomato_soup_can
+  - 007_tuna_fish_can
+  # Cups: 7 train, 3 holdout
+  - 025_mug
+  - 065-a_cups
+  - 065-b_cups
+  - 065-c_cups
+  - 065-d_cups
+  - 065-e_cups
+  - 065-f_cups
+  # Utensils: 3 train, 1 holdout
+  - 030_fork
+  - 031_spoon
+  - 033_spatula
+  # Tools: 3 train, 2 holdout
+  - 035_power_drill
+  - 037_scissors
+  - 042_adjustable_wrench
+  # Clamps: 2 train, 1 holdout
+  - 050_medium_clamp
+  - 051_large_clamp
+  # Airplanes: 3 train, 2 holdout
+  - 072-a_toy_airplane
+  - 072-b_toy_airplane
+  - 072-c_toy_airplane
+
+holdout_objects:
+  # Fruits
+  - 015_peach
+  - 018_plum
+  # Balls
+  - 057_racquetball
+  - 058_golf_ball
+  # Boxes
+  - 009_gelatin_box
+  - 036_wood_block
+  # Cans
+  - 010_potted_meat_can
+  # Cups
+  - 065-g_cups
+  - 065-h_cups
+  - 065-i_cups
+  # Utensils
+  - 032_knife
+  # Tools
+  - 043_phillips_screwdriver
+  - 044_flat_screwdriver
+  # Clamps
+  - 052_extra_large_clamp
+  # Airplanes
+  - 072-d_toy_airplane
+  - 072-e_toy_airplane

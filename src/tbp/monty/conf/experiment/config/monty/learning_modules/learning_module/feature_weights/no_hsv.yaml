@@ -1,0 +1,5 @@
+# Ablation: zero HSV weights, keep geometry features only
+patch:
+  hsv: ${np.array:[0, 0, 0]}
+  pose_vectors: ${np.ones:3}
+  principal_curvatures_log: ${np.ones:2}

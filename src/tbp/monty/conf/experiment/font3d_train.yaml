@@ -1,0 +1,39 @@
+defaults:
+  - /experiment/config/supervised_pretraining@config
+  - /experiment/config/logging/pretrain@config.logging
+  - /experiment/config/monty/patch_and_view@config.monty_config
+  - /experiment/config/monty/motor_system/clear_motor_system_config@config.monty_config
+  - /experiment/config/monty/motor_system/informed_no_trans_step_s1@config.monty_config.motor_system_config
+  - /experiment/config/monty/sensor_modules/clear_sensor_module_configs@config.monty_config
+  - /experiment/config/environment/font3d@config.env_interface_config
+
+_target_: tbp.monty.frameworks.experiments.pretraining_experiments.MontySupervisedObjectPretrainingExperiment
+config:
+  n_train_epochs: 1
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_MODELS}/my_trained_models}
+    run_name: font3d_train
+  monty_config:
+    sensor_module_configs:
+      sensor_module_0:
+        sensor_module_class: ${monty.class:tbp.monty.frameworks.models.sensor_modules.CameraSM}
+        sensor_module_args:
+          sensor_module_id: patch
+          features:
+            - pose_vectors
+            - pose_fully_defined
+            - on_object
+            - principal_curvatures_log
+          save_raw_obs: false
+          pc1_is_pc2_threshold: 1
+      sensor_module_1:
+        sensor_module_class: ${monty.class:tbp.monty.frameworks.models.sensor_modules.Probe}
+        sensor_module_args:
+          sensor_module_id: view_finder
+          save_raw_obs: false
+  # Train on 10 chars x 3 fonts = 30 objects (font indices 0,1,2)
+  train_env_interface_class: ${monty.class:tbp.monty.frameworks.environments.embodied_data.Font3DEnvironmentInterface}
+  train_env_interface_args:
+    # 10 chars each in 3 fonts = 30 training objects
+    char_indices:  [0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9]
+    font_indices:  [0,0,0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,1,1, 2,2,2,2,2,2,2,2,2,2]

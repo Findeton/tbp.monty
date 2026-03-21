@@ -345,7 +345,7 @@ class EnvironmentInterfacePerObject(EnvironmentInterface):
         Args:
             idx: Index of the new object and its parameters in object_params
         """
-        assert idx <= self.n_objects, "idx must be <= self.n_objects"
+        assert idx < self.n_objects, "idx must be < self.n_objects"
         self.env.remove_all_objects()
 
         # Specify config for the primary target object and then add it
@@ -656,7 +656,7 @@ class OmniglotEnvironmentInterface(EnvironmentInterfacePerObject):
         Args:
             idx: Index of the new object and ints parameters in object params
         """
-        assert idx <= self.n_objects, "idx must be <= self.n_objects"
+        assert idx < self.n_objects, "idx must be < self.n_objects"
         self.env.switch_to_object(
             self.alphabets[idx], self.characters[idx], self.versions[idx]
         )
@@ -751,7 +751,7 @@ class SaccadeOnImageEnvironmentInterface(EnvironmentInterfacePerObject):
         Args:
             idx: Index of the new object and ints parameters in object params
         """
-        assert idx <= self.n_versions, "idx must be <= self.n_versions"
+        assert idx < self.n_versions, "idx must be < self.n_versions"
         logger.info(
             f"changing to obj {idx} -> scene {self.scenes[idx]}, version "
             f"{self.versions[idx]}"
@@ -846,6 +846,85 @@ class SaccadeOnImageFromStreamEnvironmentInterface(SaccadeOnImageEnvironmentInte
         # targets corresponding to the current scene ?
         self.primary_target = {
             "object": "no_label",
+            "rotation": qt.quaternion(0, 0, 0, 1),
+            "euler_rotation": np.array([0, 0, 0]),
+            "quat_rotation": [0, 0, 0, 1],
+            "position": np.array([0, 0, 0]),
+            "scale": [1.0, 1.0, 1.0],
+        }
+
+
+class Font3DEnvironmentInterface(EnvironmentInterfacePerObject):
+    """Environment interface for 3D font character recognition.
+
+    Each object is a character+font combination. Characters are the categories,
+    fonts are the instances.
+
+    Args:
+        char_indices: List of character indices (into env.characters).
+        font_indices: List of font indices (into env._fonts).
+        env: A Font3DEnvironment instance.
+        motor_system: The motor system.
+        rng: Random number generator.
+        transform: Optional observation transform.
+    """
+
+    def __init__(
+        self,
+        char_indices,
+        font_indices,
+        env,
+        motor_system,
+        rng,
+        transform=None,
+        parent_to_child_mapping=None,
+        *_args,
+        **_kwargs,
+    ):
+        if not isinstance(motor_system, MotorSystem):
+            raise TypeError(
+                f"motor_system must be an instance of MotorSystem, got {motor_system}"
+            )
+        self.env = env
+        self.rng = rng
+        self.motor_system = motor_system
+        self.transform = transform
+        self._observations, self._proprioceptive_state = self.reset(self.rng)
+        self.motor_system._state = MotorSystemState(self._proprioceptive_state)
+
+        self.char_indices = char_indices
+        self.font_indices = font_indices
+        self.current_object = 0
+        self.n_objects = len(char_indices)
+        self.episodes = 0
+        self.epochs = 0
+        self.primary_target = None
+        self.object_names = [
+            f"{env.characters[char_indices[i]]}_{env.font_names[font_indices[i]]}"
+            for i in range(self.n_objects)
+        ]
+        self.consistent_child_objects = None
+        self.parent_to_child_mapping = (
+            parent_to_child_mapping if parent_to_child_mapping else {}
+        )
+
+    def post_episode(self):
+        self.cycle_object()
+        self.episodes += 1
+
+    def post_epoch(self):
+        self.epochs += 1
+
+    def cycle_object(self):
+        next_object = (self.current_object + 1) % self.n_objects
+        self.change_object_by_idx(next_object)
+
+    def change_object_by_idx(self, idx):
+        assert idx < self.n_objects, "idx must be < self.n_objects"
+        self.env.switch_to_object(self.char_indices[idx], self.font_indices[idx])
+        self.current_object = idx
+        self.primary_target = {
+            "object": self.object_names[idx],
             "rotation": qt.quaternion(0, 0, 0, 1),
             "euler_rotation": np.array([0, 0, 0]),
             "quat_rotation": [0, 0, 0, 1],

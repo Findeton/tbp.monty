@@ -287,6 +287,18 @@ class LearningModule(metaclass=abc.ABCMeta):
         """Return learning module output (same format as input)."""
         pass
 
+    def receive_context(self, **context_signal):
+        """Receive a context signal broadcast from a higher-level module.
+
+        Default implementation is a no-op.  Subclasses may override to
+        incorporate the context signal into their inference or learning.
+
+        Args:
+            **context_signal: Keyword arguments describing the context
+                (e.g. context_vector, active_concepts).
+        """
+        pass
+
     ###
     # Saving, loading
     ###

@@ -1,0 +1,18 @@
+defaults:
+  - infer_comp_lvl2_with_monolithic_models
+  - config/environment_interface/clear_eval_env_interface_args@config
+  - config/environment_interface/per_object@config.eval_env_interface_args
+  - config/environment_interface/logos_on_objs/phase2_comp_substitution_holdout_objects@config.eval_env_interface_args.object_names
+  - config/environment_interface/clear_parent_to_child_mapping@config.eval_env_interface_args
+  - config/environment_interface/logos_on_objs/parent_to_child_mapping@config.eval_env_interface_args.parent_to_child_mapping
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/phase2_comp_substitution_control_train/pretrained/}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: phase2_comp_substitution_control_eval_holdout
+    wandb_handlers: []
+  eval_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}
