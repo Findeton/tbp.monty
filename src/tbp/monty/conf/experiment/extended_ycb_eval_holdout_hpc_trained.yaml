@@ -1,0 +1,75 @@
+defaults:
+  - base_config_10distinctobj_surf_agent
+  - config/logging/clear_logging@config
+  - config/logging/csv@config.logging
+  - config/environment_interface/clear_eval_env_interface_args@config
+  - config/environment_interface/per_object@config.eval_env_interface_args
+  - config/environment_interface/ycb/extended_holdout_objects@config.eval_env_interface_args.object_names
+
+config:
+  # Load from HPC-trained model (has both LM + HPC state)
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/extended_ycb_train_hpc/pretrained/}
+  n_eval_epochs: ${benchmarks.rotations_all_count}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: extended_ycb_eval_holdout_hpc_trained
+  eval_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}
+  monty_config:
+    learning_module_configs:
+      learning_module_0:
+        learning_module_args:
+          category_bias_strength: 0.3
+          category_taxonomy:
+            # 34 training objects -> 9 categories
+            011_banana: fruit
+            012_strawberry: fruit
+            013_apple: fruit
+            014_lemon: fruit
+            016_pear: fruit
+            017_orange: fruit
+            053_mini_soccer_ball: ball
+            054_softball: ball
+            055_baseball: ball
+            056_tennis_ball: ball
+            003_cracker_box: box
+            004_sugar_box: box
+            008_pudding_box: box
+            002_master_chef_can: can
+            005_tomato_soup_can: can
+            007_tuna_fish_can: can
+            025_mug: cup
+            065-a_cups: cup
+            065-b_cups: cup
+            065-c_cups: cup
+            065-d_cups: cup
+            065-e_cups: cup
+            065-f_cups: cup
+            030_fork: utensil
+            031_spoon: utensil
+            033_spatula: utensil
+            035_power_drill: tool
+            037_scissors: tool
+            042_adjustable_wrench: tool
+            050_medium_clamp: clamp
+            051_large_clamp: clamp
+            072-a_toy_airplane: airplane
+            072-b_toy_airplane: airplane
+            072-c_toy_airplane: airplane
+      # HPC loads learned state from training — no initial_associations needed
+      learning_module_1:
+        learning_module_class: ${monty.class:tbp.monty.frameworks.models.hippocampal_module.HippocampalModule}
+        learning_module_args:
+          context_dim: 32
+          max_episodes: 500
+          min_confidence_to_bind: 0.5
+    # Connectivity: SM0 -> LM0, LM0 -> LM1 (HPC)
+    sm_to_lm_matrix:
+      - [0]
+      - []
+    lm_to_lm_matrix:
+      - []
+      - [0]
+    lm_to_lm_vote_matrix: null

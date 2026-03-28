@@ -1,0 +1,31 @@
+defaults:
+  - base_config_10distinctobj_surf_agent
+  - config/logging/clear_logging@config
+  - config/logging/csv@config.logging
+  - config/environment_interface/clear_eval_env_interface_args@config
+  - config/environment_interface/per_object@config.eval_env_interface_args
+  - config/environment_interface/ycb/extended_holdout_objects@config.eval_env_interface_args.object_names
+
+config:
+  model_name_or_path: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs/extended_ycb_train/pretrained/}
+  n_eval_epochs: ${benchmarks.rotations_all_count}
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: extended_ycb_eval_holdout_scale
+  eval_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}
+  monty_config:
+    learning_module_configs:
+      learning_module_0:
+        learning_module_args:
+          scale_invariant_matching: true
+          # Stays in meters. Multi-scale grid cell modules handle scale
+          # by testing 5 scale factors (0.39, 0.625, 1.0, 1.6, 2.56).
+          max_match_distance: 0.01
+          feature_weights:
+            patch:
+              hsv: [1.0, 2.0, 0.5]  # up-weight saturation to break ball/fruit tie
+              pose_vectors: [1.0, 1.0, 1.0]
+              principal_curvatures_log: [1.0, 1.0]

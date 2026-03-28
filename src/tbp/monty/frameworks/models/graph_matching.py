@@ -55,7 +55,43 @@ class MontyForGraphMatching(MontyBase):
     }
 
     def __init__(self, *args, **kwargs):
-        """Initialize and reset LM."""
+        """Initialize and reset LM.
+
+        Extra kwargs consumed here (not passed to super):
+            conditional_voting: If True, only send votes from confident LMs
+                to stuck LMs, avoiding echo-chamber effects when multiple
+                LMs share a sensor.  Default False (original behaviour).
+            vote_confident_threshold: Maximum number of possible matches for
+                an LM to be considered "confident" and allowed to send votes.
+                Default 2.
+            vote_after_steps: Minimum matching steps before conditional voting
+                can fire.  All LMs must have run at least this many steps
+                independently before any votes are exchanged.  Higher values
+                give each LM more time to form an independent opinion.
+                Default 100.
+            temporal_voting: If True, also apply temporal prediction voting.
+                LMs that correctly predicted the current state vote to help
+                LMs whose temporal predictions failed.  Default False.
+        """
+        self.conditional_voting = kwargs.pop("conditional_voting", False)
+        self.vote_confident_threshold = kwargs.pop(
+            "vote_confident_threshold", 2
+        )
+        self.vote_after_steps = kwargs.pop("vote_after_steps", 100)
+        self.temporal_voting = kwargs.pop("temporal_voting", False)
+        # T6.5: Unified predictive voting. When True, replaces both
+        # conditional_voting and temporal_voting with a single pass that
+        # uses: confused = (high TM surprise OR high spatial cardinality),
+        # confident = (low TM surprise AND low spatial cardinality).
+        # When both conditional_voting=False and temporal_voting=False,
+        # reduces to original unconditional behavior.
+        self.predictive_voting = kwargs.pop("predictive_voting", False)
+        # T6.5: Surprise threshold for temporal confusion classification.
+        # LMs with mean TM surprise above this threshold are temporally
+        # confused and eligible to receive votes.
+        self.temporal_confusion_threshold = kwargs.pop(
+            "temporal_confusion_threshold", 0.7
+        )
         super().__init__(*args, **kwargs)
 
     # =============== Public Interface Functions ===============
@@ -422,19 +458,34 @@ class MontyForGraphMatching(MontyBase):
         return combined_votes
 
     def _vote(self):
-        """Use lm_to_lm_vote_matrix to transmit votes between LMs."""
-        if self.lm_to_lm_vote_matrix is not None:
-            # Send out votes
-            votes_per_lm = []
-            for i in range(len(self.learning_modules)):
-                votes_per_lm.append(self.learning_modules[i].send_out_vote())
+        """Use lm_to_lm_vote_matrix to transmit votes between LMs.
 
-            combined_votes = self._combine_votes(votes_per_lm)
-            # Receive votes
-            for i in range(len(self.learning_modules)):
-                logger.debug(f"------ Sending votes to LM {i} -------")
-                self.send_vote_to_lm(self.learning_modules[i], i, combined_votes)
-                self.update_stats_after_vote(self.learning_modules[i])
+        When ``conditional_voting`` is enabled, votes are only sent from
+        *confident* LMs (≤ ``vote_confident_threshold`` possible matches) to
+        *confused* LMs (> ``vote_confident_threshold`` possible matches and
+        past ``min_eval_steps``).  This prevents the echo-chamber effect where
+        LMs sharing the same sensor amplify early noise via per-step voting.
+        It mirrors the biological principle that cortical columns process
+        independently and only exchange lateral signals when local predictions
+        are ambiguous.
+        """
+        if self.lm_to_lm_vote_matrix is not None:
+            use_predictive = getattr(self, "predictive_voting", False)
+
+            if use_predictive:
+                # T6.5: Unified predictive voting replaces both conditional
+                # and temporal voting in a single pass.
+                self._vote_predictive()
+            else:
+                use_conditional = getattr(self, "conditional_voting", False)
+                if use_conditional:
+                    self._vote_conditional()
+                else:
+                    self._vote_unconditional()
+
+                # Temporal prediction voting runs alongside spatial voting
+                if getattr(self, "temporal_voting", False):
+                    self._vote_temporal()
 
         # Log possible matches
         for lm in self.learning_modules:
@@ -444,6 +495,270 @@ class MontyForGraphMatching(MontyBase):
                 else []
             )
             logger.info(f"Possible matches for {lm.learning_module_id}: {pm}")
+
+    def _vote_unconditional(self):
+        """Original per-step voting: every LM votes to every connected LM."""
+        votes_per_lm = []
+        for i in range(len(self.learning_modules)):
+            votes_per_lm.append(self.learning_modules[i].send_out_vote())
+
+        combined_votes = self._combine_votes(votes_per_lm)
+        for i in range(len(self.learning_modules)):
+            logger.debug(f"------ Sending votes to LM {i} -------")
+            self.send_vote_to_lm(self.learning_modules[i], i, combined_votes)
+            self.update_stats_after_vote(self.learning_modules[i])
+
+    def _vote_conditional(self):
+        """Vote only from confident LMs to confused LMs, once all have settled.
+
+        Waits until every LM with observations has reached a settled state:
+        either *confident* (≤ ``vote_confident_threshold`` possible matches)
+        or *stuck* (still many matches after ``min_eval_steps``).  Only then
+        are votes sent, one-directionally from confident → stuck.
+
+        This prevents premature voting where a single early-confident LM
+        corrupts others before they've formed independent opinions.  It
+        mirrors the biological principle that cortical columns complete their
+        own local processing before engaging in lateral communication.
+        """
+        threshold = self.vote_confident_threshold
+        n_lms = len(self.learning_modules)
+
+        # Classify each LM
+        confident = set()
+        stuck = set()
+        undecided = set()
+        for i in range(n_lms):
+            lm = self.learning_modules[i]
+            n_matches = len(lm.get_possible_matches())
+            has_observations = lm.buffer.get_num_observations_on_object() > 0
+
+            if not has_observations:
+                continue  # LM hasn't started yet, skip
+
+            if 0 < n_matches <= threshold:
+                confident.add(i)
+            elif (
+                n_matches > threshold
+                and self.matching_steps > self.vote_after_steps
+            ):
+                stuck.add(i)
+            else:
+                # Still has many matches but hasn't had enough steps yet
+                undecided.add(i)
+
+        # Wait for ALL LMs to settle (no undecided remaining)
+        if undecided or not confident or not stuck:
+            return  # Not ready yet
+
+        logger.info(
+            f"Conditional vote: confident={sorted(confident)}, "
+            f"stuck={sorted(stuck)}"
+        )
+
+        # Collect votes from ALL LMs that have observations (needed for
+        # sensed_pose_rel_body in _combine_votes, which accesses both
+        # sender and receiver pose data for spatial transforms).
+        votes_per_lm = []
+        for i in range(n_lms):
+            votes_per_lm.append(self.learning_modules[i].send_out_vote())
+
+        # Build a temporary vote matrix: each stuck LM receives from
+        # confident LMs that are in its original lm_to_lm_vote_matrix.
+        # Non-stuck LMs receive nothing.
+        saved_matrix = self.lm_to_lm_vote_matrix
+        temp_matrix = []
+        for i in range(n_lms):
+            if i in stuck:
+                senders = [
+                    j for j in saved_matrix[i]
+                    if j in confident and votes_per_lm[j] is not None
+                ]
+                temp_matrix.append(senders)
+            else:
+                temp_matrix.append([])  # Non-stuck LMs receive nothing
+
+        # Temporarily swap the vote matrix for _combine_votes
+        self.lm_to_lm_vote_matrix = temp_matrix
+        try:
+            combined_votes = self._combine_votes(votes_per_lm)
+            for i in stuck:
+                logger.debug(
+                    f"------ Conditional vote to LM {i} -------"
+                )
+                self.send_vote_to_lm(
+                    self.learning_modules[i], i, combined_votes
+                )
+                self.update_stats_after_vote(self.learning_modules[i])
+        finally:
+            self.lm_to_lm_vote_matrix = saved_matrix
+
+    def _vote_temporal(self):
+        """Vote from temporally confident LMs to temporally confused ones.
+
+        Analogous to ``_vote_conditional``, but triggered by temporal
+        prediction error rather than spatial hypothesis count.  LMs that
+        correctly predicted the current state (via their model's transition
+        sequence) vote to help LMs whose temporal predictions failed.
+
+        This mirrors the biological burst/sparse distinction: correct
+        dendritic predictions produce sparse (confident) responses, wrong
+        predictions produce burst (confused) responses that propagate
+        laterally to neighboring columns.
+        """
+        n_lms = len(self.learning_modules)
+        confident = set()
+        confused = set()
+
+        for i in range(n_lms):
+            lm = self.learning_modules[i]
+            if not hasattr(lm, "get_temporal_prediction_status"):
+                continue
+            status = lm.get_temporal_prediction_status()
+            if status == "confident":
+                confident.add(i)
+            elif status == "confused":
+                confused.add(i)
+
+        if not confident or not confused:
+            return  # Nothing to do
+
+        logger.info(
+            f"Temporal vote: confident={sorted(confident)}, "
+            f"confused={sorted(confused)}"
+        )
+
+        # Collect votes from all LMs
+        votes_per_lm = []
+        for i in range(n_lms):
+            votes_per_lm.append(self.learning_modules[i].send_out_vote())
+
+        # Build temporary vote matrix: confused LMs receive only from
+        # confident LMs that are in their original vote matrix.
+        saved_matrix = self.lm_to_lm_vote_matrix
+        temp_matrix = []
+        for i in range(n_lms):
+            if i in confused:
+                senders = [
+                    j for j in saved_matrix[i]
+                    if j in confident and votes_per_lm[j] is not None
+                ]
+                temp_matrix.append(senders)
+            else:
+                temp_matrix.append([])
+
+        self.lm_to_lm_vote_matrix = temp_matrix
+        try:
+            combined_votes = self._combine_votes(votes_per_lm)
+            for i in confused:
+                logger.debug(
+                    f"------ Temporal vote to LM {i} -------"
+                )
+                self.send_vote_to_lm(
+                    self.learning_modules[i], i, combined_votes
+                )
+                self.update_stats_after_vote(self.learning_modules[i])
+        finally:
+            self.lm_to_lm_vote_matrix = saved_matrix
+
+    def _vote_predictive(self):
+        """T6.5: Unified predictive voting — single pass, single matrix.
+
+        Merges spatial cardinality (from conditional voting) and temporal
+        prediction error (from temporal voting) into one classification:
+
+        - **Confused** = high TM surprise OR high spatial cardinality
+        - **Confident** = low TM surprise AND low spatial cardinality
+
+        This mirrors the biological distinction between burst firing (all
+        cells in a minicolumn activate = confused) and sparse firing (only
+        predicted cells fire = confident). Both spatial ambiguity and
+        temporal prediction failure trigger the same "burst" response:
+        the LM needs help from peers.
+
+        Backward compatible: when no LM has temporal memory (all return
+        None from get_temporal_prediction_status), this reduces to
+        pure spatial conditional voting behavior.
+        """
+        threshold = self.vote_confident_threshold
+        confusion_threshold = self.temporal_confusion_threshold
+        n_lms = len(self.learning_modules)
+
+        confident = set()
+        confused = set()
+
+        for i in range(n_lms):
+            lm = self.learning_modules[i]
+            has_observations = lm.buffer.get_num_observations_on_object() > 0
+            if not has_observations:
+                continue
+
+            n_matches = len(lm.get_possible_matches())
+
+            # Spatial classification
+            spatially_confident = 0 < n_matches <= threshold
+            spatially_confused = (
+                n_matches > threshold
+                and self.matching_steps > self.vote_after_steps
+            )
+
+            # Temporal classification (if available)
+            temporally_confused = False
+            if hasattr(lm, "get_temporal_surprise"):
+                tm_surprise = lm.get_temporal_surprise()
+                temporally_confused = tm_surprise > confusion_threshold
+
+            # Unified classification:
+            # Confused = spatial OR temporal confusion
+            # Confident = spatially confident AND NOT temporally confused
+            is_confused = spatially_confused or temporally_confused
+            is_confident = spatially_confident and not temporally_confused
+
+            if is_confident:
+                confident.add(i)
+            elif is_confused:
+                confused.add(i)
+            # else: undecided — skip
+
+        if not confident or not confused:
+            return  # Nothing to do
+
+        logger.info(
+            f"Predictive vote: confident={sorted(confident)}, "
+            f"confused={sorted(confused)}"
+        )
+
+        # Collect votes from all LMs
+        votes_per_lm = []
+        for i in range(n_lms):
+            votes_per_lm.append(self.learning_modules[i].send_out_vote())
+
+        # Build temporary vote matrix: confused receive from confident
+        saved_matrix = self.lm_to_lm_vote_matrix
+        temp_matrix = []
+        for i in range(n_lms):
+            if i in confused:
+                senders = [
+                    j for j in saved_matrix[i]
+                    if j in confident and votes_per_lm[j] is not None
+                ]
+                temp_matrix.append(senders)
+            else:
+                temp_matrix.append([])
+
+        self.lm_to_lm_vote_matrix = temp_matrix
+        try:
+            combined_votes = self._combine_votes(votes_per_lm)
+            for i in confused:
+                logger.debug(
+                    f"------ Predictive vote to LM {i} -------"
+                )
+                self.send_vote_to_lm(
+                    self.learning_modules[i], i, combined_votes
+                )
+                self.update_stats_after_vote(self.learning_modules[i])
+        finally:
+            self.lm_to_lm_vote_matrix = saved_matrix
 
     def _pass_infos_to_motor_system(self):
         """Pass input observations to the motor system.
@@ -728,11 +1043,34 @@ class GraphLM(LearningModule):
     def get_output(self):
         """Return the output of the learning module.
 
-        Is currently only implemented for the evidence LM since the other LM versions
-        do not have a notion of MLH and therefore can't produce an output until the last
-        step of the episode.
+        During supervised training, returns a high-confidence State with the
+        known target object identity. This enables downstream modules (e.g.,
+        HippocampalModule) to learn associations during training episodes.
+
+        During eval, subclasses (EvidenceGraphLM) override this with MLH-based
+        output. For LM types without MLH, returns None during eval.
         """
-        pass
+        if (
+            self.mode is ExperimentMode.TRAIN
+            and hasattr(self, "stepwise_target_object")
+            and self.stepwise_target_object is not None
+            and self.stepwise_target_object != "no_label"
+        ):
+            return State(
+                location=np.zeros(3),
+                morphological_features={
+                    "pose_vectors": np.eye(3),
+                    "pose_fully_defined": False,
+                },
+                non_morphological_features={
+                    "graph_id": self.stepwise_target_object,
+                },
+                confidence=1.0,
+                use_state=True,
+                sender_id=self.learning_module_id,
+                sender_type="LM",
+            )
+        return None
 
     def propose_goal_states(self) -> list[GoalState]:
         """Return the goal-states proposed by this LM's GSG.
@@ -1263,6 +1601,10 @@ class GraphMemory(LMMemory):
 
     def get_locations_in_graph(self, graph_id, input_channel):
         return self.get_graph(graph_id, input_channel).pos
+
+    def get_bbox_diagonal(self, graph_id, input_channel="first"):
+        """Return bounding box diagonal of a stored graph in meters."""
+        return self.get_graph(graph_id, input_channel).bbox_diagonal
 
     def get_all_models_in_memory(self):
         """Return models stored in memory."""

@@ -145,6 +145,15 @@ class DefaultHypothesesDisplacer:
     ) -> tuple[ChannelHypotheses, HypothesisDisplacerTelemetry]:
         # Have to do this for all hypotheses so we don't lose the path information
         rotated_displacements = possible_hypotheses.poses.dot(channel_displacement)
+        # Multi-scale grid cell matching: each hypothesis has a scale factor
+        # representing "query_size / stored_size". The displacement (in meters)
+        # is divided by scale to map into the stored graph's coordinate frame.
+        # scale=1 → same size, scale=2 → query is 2x larger → displacement
+        # covers less of the stored graph → divide by 2.
+        if possible_hypotheses.scales is not None:
+            rotated_displacements = (
+                rotated_displacements / possible_hypotheses.scales[:, None]
+            )
         search_locations = possible_hypotheses.locations + rotated_displacements
 
         # Get indices of hypotheses with evidence > threshold
@@ -159,15 +168,31 @@ class DefaultHypothesesDisplacer:
                 f"(evidence > {evidence_update_threshold})"
             )
 
-            # Get evidence update for all hypotheses with evidence > current
-            # _evidence_update_threshold
-            new_evidence = self._calculate_evidence_for_new_locations(
-                graph_id=graph_id,
-                input_channel=possible_hypotheses.input_channel,
-                search_locations=search_locations[hyp_ids_to_test],
-                channel_possible_poses=possible_hypotheses.poses[hyp_ids_to_test],
-                channel_features=channel_features,
+            # Check if hypotheses have states for per-state evidence computation
+            has_states = (
+                possible_hypotheses.states is not None
+                and len(np.unique(possible_hypotheses.states)) > 1
             )
+
+            if has_states:
+                new_evidence = self._calculate_evidence_per_state(
+                    graph_id=graph_id,
+                    input_channel=possible_hypotheses.input_channel,
+                    search_locations=search_locations[hyp_ids_to_test],
+                    channel_possible_poses=possible_hypotheses.poses[hyp_ids_to_test],
+                    channel_features=channel_features,
+                    state_ids=possible_hypotheses.states[hyp_ids_to_test],
+                )
+            else:
+                # Get evidence update for all hypotheses with evidence > current
+                # _evidence_update_threshold
+                new_evidence = self._calculate_evidence_for_new_locations(
+                    graph_id=graph_id,
+                    input_channel=possible_hypotheses.input_channel,
+                    search_locations=search_locations[hyp_ids_to_test],
+                    channel_possible_poses=possible_hypotheses.poses[hyp_ids_to_test],
+                    channel_features=channel_features,
+                )
             min_update = np.clip(np.min(new_evidence), 0, np.inf)
 
             # Alternatives (no update to other Hs or adding avg) left in
@@ -201,7 +226,42 @@ class DefaultHypothesesDisplacer:
             locations=search_locations,
             poses=possible_hypotheses.poses,
             possible=possible_hypotheses.possible,
+            scales=possible_hypotheses.scales,
+            states=possible_hypotheses.states,
         ), HypothesisDisplacerTelemetry(mlh_prediction_error=mlh_prediction_error)
+
+    def _calculate_evidence_per_state(
+        self,
+        graph_id: str,
+        input_channel: str,
+        search_locations: np.ndarray,
+        channel_possible_poses: np.ndarray,
+        channel_features: dict,
+        state_ids: np.ndarray,
+    ):
+        """Calculate evidence grouped by state for state-conditioned models.
+
+        Splits hypotheses by state, computes evidence for each group using that
+        state's sub-model, and merges results back in order.
+        """
+        unique_states = np.unique(state_ids)
+        evidence = np.zeros(len(search_locations))
+
+        for state_id in unique_states:
+            mask = state_ids == state_id
+            state_indices = np.where(mask)[0]
+
+            state_evidence = self._calculate_evidence_for_new_locations(
+                graph_id=graph_id,
+                input_channel=input_channel,
+                search_locations=search_locations[state_indices],
+                channel_possible_poses=channel_possible_poses[state_indices],
+                channel_features=channel_features,
+                state_id=int(state_id),
+            )
+            evidence[state_indices] = state_evidence
+
+        return evidence
 
     def _calculate_evidence_for_new_locations(
         self,
@@ -210,6 +270,7 @@ class DefaultHypothesesDisplacer:
         search_locations: np.ndarray,
         channel_possible_poses: np.ndarray,
         channel_features: dict,
+        state_id: int | None = None,
     ):
         """Use search locations, sensed features and graph model to calculate evidence.
 
@@ -223,11 +284,20 @@ class DefaultHypothesesDisplacer:
         We do this for every incoming input channel and its features if they are stored
         in the graph and take the average over the evidence from all input channels.
 
+        Args:
+            graph_id: The ID of the current graph.
+            input_channel: The input channel.
+            search_locations: Locations to search for nearest neighbors.
+            channel_possible_poses: Possible poses for the hypotheses.
+            channel_features: Sensed features.
+            state_id: Optional state ID for state-conditioned models.
+
         Returns:
             The location evidence.
         """
         logger.debug(
             f"Calculating evidence for {graph_id} using input from {input_channel}"
+            + (f" state={state_id}" if state_id is not None else "")
         )
 
         pose_transformed_features = rotate_pose_dependent_features(
@@ -235,9 +305,12 @@ class DefaultHypothesesDisplacer:
             channel_possible_poses,
         )
         # Get max_nneighbors nearest nodes to search locations.
-        nearest_node_ids = self.graph_memory.get_graph(
-            graph_id, input_channel
-        ).find_nearest_neighbors(
+        # Use state-specific sub-model if state_id is provided.
+        graph_model = self.graph_memory.get_graph(
+            graph_id, input_channel, state_id=state_id
+        ) if hasattr(self.graph_memory, "get_channel_model") and state_id is not None \
+            else self.graph_memory.get_graph(graph_id, input_channel)
+        nearest_node_ids = graph_model.find_nearest_neighbors(
             search_locations,
             num_neighbors=self.max_nneighbors,
         )
@@ -245,8 +318,12 @@ class DefaultHypothesesDisplacer:
             nearest_node_ids = np.expand_dims(nearest_node_ids, axis=1)
 
         nearest_node_locs = self.graph_memory.get_locations_in_graph(
-            graph_id, input_channel
-        )[nearest_node_ids]
+            graph_id, input_channel, state_id=state_id
+        ) if hasattr(self.graph_memory, "get_channel_model") and state_id is not None \
+            else self.graph_memory.get_locations_in_graph(
+                graph_id, input_channel
+            )
+        nearest_node_locs = nearest_node_locs[nearest_node_ids]
         max_abs_curvature = get_relevant_curvature(channel_features)
         custom_nearest_node_dists = get_custom_distances(
             nearest_node_locs,
@@ -261,12 +338,24 @@ class DefaultHypothesesDisplacer:
         # Get IDs where custom_nearest_node_dists > max_match_distance
         mask = node_distance_weights <= 0
 
-        new_pos_features = self.graph_memory.get_features_at_node(
-            graph_id,
-            input_channel,
-            nearest_node_ids,
-            feature_keys=["pose_vectors", "pose_fully_defined"],
-        )
+        # Get pose features — use state-specific methods if available
+        if state_id is not None and hasattr(
+            self.graph_memory, "get_features_at_node"
+        ):
+            new_pos_features = self.graph_memory.get_features_at_node(
+                graph_id,
+                input_channel,
+                nearest_node_ids,
+                feature_keys=["pose_vectors", "pose_fully_defined"],
+                state_id=state_id,
+            )
+        else:
+            new_pos_features = self.graph_memory.get_features_at_node(
+                graph_id,
+                input_channel,
+                nearest_node_ids,
+                feature_keys=["pose_vectors", "pose_fully_defined"],
+            )
         # Calculate the pose error for each hypothesis
         # shape=(H, K)
         radius_evidence = self._get_pose_evidence_matrix(
@@ -287,14 +376,24 @@ class DefaultHypothesesDisplacer:
         # If no feature weights are provided besides the ones for surface_normal
         # and curvature_directions we don't need to calculate feature evidence.
         if self.use_features_for_matching[input_channel]:
+            # Use state-specific feature arrays if available
+            if (
+                state_id is not None
+                and hasattr(self.graph_memory, "get_state_feature_array")
+                and graph_id
+                in getattr(self.graph_memory, "state_feature_arrays", {})
+            ):
+                fa, fo = self.graph_memory.get_state_feature_array(
+                    graph_id, input_channel, state_id
+                )
+            else:
+                fa = self.graph_memory.get_feature_array(graph_id)[input_channel]
+                fo = self.graph_memory.get_feature_order(graph_id)[input_channel]
+
             # add evidence if features match
             node_feature_evidence = self.feature_evidence_calculator.calculate(
-                channel_feature_array=self.graph_memory.get_feature_array(graph_id)[
-                    input_channel
-                ],
-                channel_feature_order=self.graph_memory.get_feature_order(graph_id)[
-                    input_channel
-                ],
+                channel_feature_array=fa,
+                channel_feature_order=fo,
                 channel_feature_weights=self.feature_weights[input_channel],
                 channel_query_features=channel_features,
                 channel_tolerances=self.tolerances[input_channel],

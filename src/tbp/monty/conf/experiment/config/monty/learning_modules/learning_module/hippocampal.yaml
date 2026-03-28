@@ -1,0 +1,5 @@
+learning_module_class: ${monty.class:tbp.monty.frameworks.models.hippocampal_module.HippocampalModule}
+learning_module_args:
+  context_dim: 32
+  max_episodes: 500
+  min_confidence_to_bind: 0.5

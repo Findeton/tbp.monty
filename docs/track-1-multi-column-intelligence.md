@@ -22,11 +22,18 @@ Updated 2026-03-20 with extended YCB evidence boundary analysis.
 - **Convergence speed**: 44% faster with 3 LMs vs 1 LM on YCB
 - **Category subgraph win rate**: 25% on Omniglot (highest of any benchmark)
 - **Extended YCB benchmark**: 67.9% overall, decomposed into:
-  - Shape-congruent categories: **93.2%** (near ceiling for geometry matching)
-  - Shape-incongruent categories: **15.7%** (irreducible by shape; requires Layer 2)
-- **Evidence margin signal**: Proven predictive of correctness (high margin → right,
-  low margin → wrong). Not yet exploited as a novelty detection mechanism.
-- Layer 1 ceiling empirically measured; priority shifts to Layer 1→2 boundary
+  - Shape-congruent categories: **92.2%** (near ceiling for geometry matching)
+  - Shape-incongruent categories: **14.3%** (irreducible by shape; requires Layer 2)
+- **Novelty detection (T1.N)**: Validated. Evidence margin separates confident
+  predictions (86.2% accuracy) from uncertain (50.4%), 35.8pp separation.
+- **Feature ablation (T1.FA)**: Complete. Curvature is the primary discriminative
+  feature. HSV has mixed effects. Pose vectors carry zero discriminative signal.
+  No ablation improves overall accuracy — baseline is near-optimal for Layer 1.
+- **Category bias (T1.4a)**: Tested and FAILED. Hurts overall (67.9% → 61.2%).
+  Destroys fruit (100→64%), only helps clamp and can slightly.
+- **CMP enrichment (T1.R2)**: `register_dynamic_feature()` and
+  `set_feature_weight()` implemented. Ready for use by Track 2.
+- Layer 1 ceiling empirically confirmed at 67.9%; priority shifts to Track 2.
 
 ## Milestone Tracker
 
@@ -34,14 +41,14 @@ Updated 2026-03-20 with extended YCB evidence boundary analysis.
 |---|---|---|---|
 | T1.1 | Static peer voting | None | **Done** |
 | T1.2 | Category-aggregated evidence readout (post-hoc) | None | **Done** |
-| T1.N | Novelty detection via evidence margin | None | **Next** |
-| T1.FA | Feature ablation (HSV/curvature contribution) | None | **Next** |
-| T1.3 | Online category readout during matching | None | After T1.N |
-| T1.4a | Category-biased evidence (single LM, self-bias) | None | After T1.FA (risk: see roadmap) |
-| T1.R2 | CMP enrichment (lifts Restriction 2) | — | After T1.4a |
-| T1.4b | Cross-LM category bias via enriched CMP | Restriction 2 | After T1.R2 |
-| T1.5 | Top-down biasing from parent to child LMs | Restriction 2 | After T1.R2 |
-| T1.6 | Attention-based dynamic routing | Restriction 2 | Planned |
+| T1.N | Novelty detection via evidence margin | None | **Done** (86.2% vs 50.4%) |
+| T1.FA | Feature ablation (HSV/curvature contribution) | None | **Done** (5 runs, 1120 eps) |
+| T1.4a | Category-biased evidence (single LM, self-bias) | None | **Done** (failed: -6.7pp) |
+| T1.3 | Online category readout during matching | None | Deprioritized |
+| T1.R2 | CMP enrichment (lifts Restriction 2) | — | **Done** (API added) |
+| T1.4b | Cross-LM category bias via enriched CMP | Restriction 2 | Deprioritized |
+| T1.5 | Top-down biasing from parent to child LMs | Restriction 2 | Planned → **Track 6** (T6.9–T6.12) |
+| T1.6 | Attention-based dynamic routing | Restriction 2 | Planned → **Track 6** (T6.13–T6.16) |
 | T1.7 | Learned routing from evidence statistics | Restriction 2 | Research |
 
 ## Investigation Registry
@@ -78,49 +85,58 @@ detail (benchmarks, execution registry, decision log, results).
    More columns = faster convergence via parallel hypothesis elimination.
 
 6. **Layer 1 has a measured ceiling (2026-03-20).** Extended YCB decomposes
-   into shape-congruent (93.2%, near ceiling) vs shape-incongruent (15.7%,
+   into shape-congruent (92.2%, near ceiling) vs shape-incongruent (14.3%,
    irreducible by geometry). Ball→fruit (0%), screwdriver→spatula, can→box
    confusions are geometrically correct — they mark the boundary where shape
    matching ends and behavioral/functional knowledge begins.
 
-7. **Evidence margin is an unexploited confidence signal.** High margin
-   (>6.0 per-object-normalized) → always correct. Low margin (<3.0) → always
-   wrong. The system has the information to detect novelty but no mechanism
-   to act on it.
+7. **Evidence margin IS a reliable confidence signal (2026-03-21, T1.N).**
+   Novelty detection validated: confident predictions (margin ≥ 0.65) achieve
+   86.2% accuracy vs 50.4% for uncertain predictions (35.8pp separation).
+   Implemented in `logging_utils.py` and `phase2_category_evidence_readout.py`.
 
-8. **Category bias is a double-edged sword.** It amplifies the strongest
-   category signal, which is WRONG for shape-incongruent categories (balls
-   → fruit bias gets reinforced). Any T1.4a experiment must measure both
-   regimes separately.
+8. **Category bias HURTS overall accuracy (2026-03-21, T1.4a).**
+   Prediction was: helps shape-congruent, hurts shape-incongruent. Actual
+   result: hurts BOTH. Overall: 67.9% → 61.2% (-6.7pp). Fruit destroyed
+   (100% → 64.3%). Only clamp (71→86%) and can (21→29%) improved. The
+   normalized category evidence creates misleading signals when categories
+   have different geometric distributions. T1.4a is a dead end on this
+   benchmark.
+
+9. **Feature ablation confirms curvature is king (2026-03-21, T1.FA).**
+   Five eval runs (1120 episodes total):
+   - Pose vectors alone: 0% (no discriminative signal for identity)
+   - No curvature: shape-incongruent drops 14.3% → 5.7%
+   - No HSV: mixed effects, net slightly negative
+   - Baseline (all features): 67.9% — already near-optimal
+   No ablation variant improves overall accuracy. The feature set is
+   at its ceiling.
+
+10. **CMP enrichment is ready (2026-03-21, T1.R2).**
+    `register_dynamic_feature()` and `set_feature_weight()` added to
+    EvidenceGraphLM. Runtime feature registration with auto-tolerance.
+    Ready for Track 2 to inject behavioral features.
 
 ## Next Steps
 
-Updated 2026-03-20 based on extended YCB evidence boundary analysis.
+Updated 2026-03-21. Track 1 Layer 1 work is complete. All milestones through
+T1.R2 are done. The remaining Track 1 milestones (T1.3, T1.4b, T1.5, T1.6,
+T1.7) are deprioritized because:
+- T1.4a proved that category bias hurts on extended YCB
+- T1.3 (online category readout) feeds into T1.4a which failed
+- T1.4b (cross-LM bias) depends on T1.4a which failed
+- The Layer 1 ceiling (67.9%) is confirmed by 5 ablation runs
 
-**T1.N: Novelty detection via evidence margin.**
-The extended YCB data proves evidence margin predicts correctness. Threshold on
-`(best_cat - second_cat) / best_cat` enables "novel object, category X,
-confidence high/low." ~10 lines in evidence readout. Tests on both Omniglot
-and extended YCB. Qualitatively new capability: the system knows what it
-doesn't know.
+**Priority shifts to Track 2** (cross-episode memory, behavioral concepts).
+The ball→fruit canary (0% across all ablations) is the primary gate metric.
+The HPC→evidence modulation is wired (`_apply_hippocampal_bias()`); the next
+step is creating a functional test with interaction episodes.
 
-**T1.FA: Feature ablation study.**
-Run eval with modified feature_weights: (a) all features (baseline), (b) no
-HSV, (c) HSV amplified, (d) no curvature. Measure impact on shape-congruent
-vs shape-incongruent categories separately. No retraining needed (graphs
-already contain all features). Directly informs T1.R2 design decisions.
-
-**T1.4a: Online category bias (with risk assessment).**
-Prediction: improves shape-congruent (93.2% → 96-98%), degrades shape-
-incongruent (15.7% → lower). If prediction holds, mechanism understood.
-Must measure both splits separately on extended YCB, not just overall.
-Also run on Omniglot for comparison.
-
-**Then T1.R2: CMP enrichment (lifts Restriction 2).** Small change (~20 lines):
-make feature_weights/tolerances updatable at runtime, inject LM outputs into
-observation dict. Informed by T1.FA (which features matter) and T1.4a (what
-signal to pass between LMs). Unlocks T1.4b (cross-LM bias), T1.5 (top-down),
-and hippocampal context → matching LMs.
+**Track 1 remaining value**: T1.5 (top-down biasing) and T1.6 (attention
+routing) are now planned in [Track 6](track-6-predictive-coding-heterarchy.md)
+as part of the unified predictive coding heterarchy design (T6.9–T6.12 for
+top-down prediction, T6.13–T6.16 for attention routing). T1.R2's dynamic
+feature registration enables this path.
 
 ## Extended YCB Evidence Boundary (2026-03-20)
 

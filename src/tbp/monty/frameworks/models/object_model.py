@@ -162,6 +162,23 @@ class GraphObjectModel(ObjectModel):
         return len(self._graph.pos)
 
     @property
+    def bbox_diagonal(self):
+        """Bounding box diagonal of the stored graph in meters.
+
+        Used for scale-invariant matching: dividing displacements by this
+        value normalizes them relative to the object's size. Cached after
+        first computation.
+        """
+        if self._graph is None:
+            return None
+        if not hasattr(self, "_bbox_diagonal") or self._bbox_diagonal is None:
+            pos = self._graph.pos
+            self._bbox_diagonal = float(
+                np.linalg.norm(pos.max(axis=0) - pos.min(axis=0))
+            )
+        return self._bbox_diagonal
+
+    @property
     def feature_ids_in_graph(self):
         if self._graph is not None:
             return self._graph.feature_mapping.keys()
@@ -169,6 +186,7 @@ class GraphObjectModel(ObjectModel):
     def set_graph(self, graph):
         """Set self._graph property with given graph (i.e. from pretraining)."""
         self._graph = graph
+        self._bbox_diagonal = None  # Reset cache
 
     def get_values_for_feature(self, feature):
         featue_idx = self.feature_mapping[feature]
@@ -464,7 +482,7 @@ class GridObjectModel(GraphObjectModel):
             search_locations,
             k=num_neighbors,
             p=2,  # euclidean distance
-            workers=1,  # using more than 1 worker slows down run on lambda.
+            workers=-1,  # T6.7: Use all cores. Was workers=1 for Lambda.: Use all cores. Was workers=1 for Lambda.
         )
         # else:
         #     # TODO: This is not done yet and doesn't work. It seems at the moment
@@ -482,8 +500,64 @@ class GridObjectModel(GraphObjectModel):
         return nearest_node_ids
 
     # ------------------ Getters & Setters ---------------------
+    @property
+    def bbox_diagonal(self):
+        """Bounding box diagonal of the stored graph in meters."""
+        if self._graph is None:
+            return None
+        if not hasattr(self, "_bbox_diagonal") or self._bbox_diagonal is None:
+            pos = self._graph.pos
+            self._bbox_diagonal = float(
+                np.linalg.norm(pos.max(axis=0) - pos.min(axis=0))
+            )
+        return self._bbox_diagonal
+
+    def normalize_positions(self):
+        """Normalize graph positions by bounding box diagonal.
+
+        Transforms positions from absolute meters to fractions of object
+        size [0, 1]. Stores the original bbox_diagonal as metadata so
+        curvature (which encodes absolute size) remains discriminative.
+
+        Also normalizes edge attributes (inter-node displacements) by
+        the same factor. Rebuilds the KDTree on normalized positions.
+
+        Call after loading a pretrained graph to enable scale-invariant
+        matching.
+        """
+        if self._graph is None:
+            return
+
+        # Compute bbox diagonal BEFORE normalization
+        pos = self._graph.pos
+        bbox = pos.max(axis=0) - pos.min(axis=0)
+        diag = float(np.linalg.norm(bbox))
+        if diag <= 0:
+            return
+
+        self._bbox_diagonal = diag
+
+        # Center and normalize positions
+        center = pos.mean(axis=0)
+        self._graph.pos = (pos - center) / diag
+
+        # Normalize edge displacements if present
+        if hasattr(self._graph, "edge_attr") and self._graph.edge_attr is not None:
+            self._graph.edge_attr = self._graph.edge_attr / diag
+
+        # Rebuild KDTree on normalized positions
+        self._location_tree = KDTree(
+            self._graph.pos,
+            leafsize=40,
+        )
+
+        logger.debug(
+            f"Normalized {self.object_id} positions by bbox_diagonal={diag:.4f}m"
+        )
+
     def set_graph(self, graph):
         """Set self._graph property and convert input graph to right format."""
+        self._bbox_diagonal = None  # Reset cache
         if type(graph) is not NumpyGraph:
             # could also check if is type torch_geometric.data.data.Data
             logger.debug(f"turning graph of type {type(graph)} into numpy graph")

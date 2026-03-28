@@ -215,6 +215,9 @@ class MontyBase(Monty):
             sensory_inputs = self._collect_inputs_to_lm(i)
             getattr(self.learning_modules[i], self.step_type)(ctx, sensory_inputs)
 
+        # Collect event/speed signals from LMs and pass to timer (Phase 7)
+        self._dispatch_timer_signals(ctx)
+
     def _collect_inputs_to_lm(self, lm_id):
         """Use sm_to_lm_matrix and lm_to_lm_matrix to collect inputs to LM i.
 
@@ -239,14 +242,13 @@ class MontyBase(Monty):
     def _combine_inputs(self, inputs_from_sms, inputs_from_lms) -> dict | None:
         """Combine all inputs to an LM into one dict.
 
-        An LM only receives input from another LM if it also receives input from
-        an SM. This makes sure that we keep a coarser resolution in the higher
-        level LM.
-        TODO H: Is this how we want to solve this? May want to change this in the future
-        allowing high-level LMs that are not connected to SMs.
+        For LMs with SM connections, sensory input gates LM input: an LM only
+        receives LM-to-LM input if it also has active sensory input. This keeps
+        a coarser resolution in higher-level LMs.
 
-        TODO H: Take into account distance from center of receiving LMs RF. To do that
-        in a good way, combine_input or LM selection may have to become part of LM class
+        For LMs with NO SM connections (e.g., HippocampalModule), LM-to-LM
+        input is used directly. This enables top-level modules that aggregate
+        outputs from lower LMs without requiring direct sensor access.
 
         Args:
             inputs_from_sms: List of dicts of SM outputs.
@@ -262,14 +264,47 @@ class MontyBase(Monty):
             for i in range(len(inputs_from_sms))
             if inputs_from_sms[i].use_state
         ]
-        if len(combined_inputs) == 0:
-            # If we have no sensory input, we also don't use LM input
+
+        if len(combined_inputs) == 0 and len(inputs_from_sms) > 0:
+            # Has SM connections but no active sensory input -> skip LM input
             return None
 
+        # Add LM-to-LM inputs (skip None outputs from LMs that don't
+        # produce output in the current mode, e.g. training)
         for lm_input in inputs_from_lms:
-            if lm_input.use_state:
+            if lm_input is not None and lm_input.use_state:
                 combined_inputs.append(lm_input)
-        return combined_inputs
+
+        return combined_inputs if len(combined_inputs) > 0 else None
+
+    def _dispatch_timer_signals(self, ctx: RuntimeContext):
+        """Collect event/speed signals from LMs and apply to timer.
+
+        After all LMs have been stepped, each LM may have detected a state
+        transition (event) or computed a speed correction. These signals
+        are forwarded to the global interval timer for consensus-based
+        application.
+        """
+        if not hasattr(ctx, "timer") or ctx.timer is None:
+            return
+
+        timer = ctx.timer
+
+        for lm in self.learning_modules:
+            lm_id = getattr(lm, "learning_module_id", str(id(lm)))
+
+            # Check for event (state transition) signal
+            if hasattr(lm, "get_event_signal") and lm.get_event_signal():
+                timer.receive_reset_signal(lm_id)
+
+            # Check for speed correction signal
+            if hasattr(lm, "get_speed_signal"):
+                speed = lm.get_speed_signal()
+                if speed is not None:
+                    timer.receive_speed_adjustment(lm_id, speed)
+
+        # Apply accumulated signals
+        timer.apply_pending_signals()
 
     def _vote(self):
         if self.lm_to_lm_vote_matrix is not None:
@@ -359,21 +394,100 @@ class MontyBase(Monty):
             sm.pre_episode()
 
     def post_episode(self):
+        # Report motor action summary to any HPC modules before they
+        # finalize the episode (so the transition gets action-annotated).
+        action_summary = self._summarize_motor_actions()
+        if action_summary:
+            for lm in self.learning_modules:
+                if hasattr(lm, "record_action"):
+                    lm.record_action(action_summary)
+
         for lm in self.learning_modules:
             lm.post_episode()
         # for sm in self.sensor_modules: sm.post_episode() unused & removed
+
+    def _summarize_motor_actions(self) -> str | None:
+        """Summarize the motor system's action sequence into a compact label.
+
+        Returns the dominant action type from the episode, or None if no
+        actions were taken. This summary is reported to HippocampalModules
+        for action-conditioned temporal prediction.
+
+        Returns:
+            Action label string (e.g. "move_tangentially") or None.
+        """
+        if not hasattr(self, "motor_system") or self.motor_system is None:
+            return None
+        seq = getattr(self.motor_system, "action_sequence", None)
+        if not seq:
+            return None
+
+        # Count action types across the episode
+        action_counts = {}
+        for actions, _state in seq:
+            for action in actions:
+                name = getattr(action, "action_name", None)
+                if callable(name):
+                    name = name()
+                if name:
+                    action_counts[name] = action_counts.get(name, 0) + 1
+
+        if not action_counts:
+            return None
+
+        # Return the most frequent action type
+        return max(action_counts, key=action_counts.get)
 
     ###
     # Methods for saving and loading
     ###
 
     def load_state_dict(self, state_dict):
-        assert len(state_dict["lm_dict"]) == len(self.learning_modules)
-        lm_counter = 0
+        import copy
+
         lm_dict = state_dict["lm_dict"]
+        n_saved = len(lm_dict)
+        n_current = len(self.learning_modules)
+
+        if n_saved > n_current:
+            raise ValueError(
+                f"Model has {n_saved} LMs but config only has {n_current}. "
+                f"Cannot load extra LMs."
+            )
+
+        # Load saved LM states into the first n_saved learning modules.
+        lm_counter = 0
         for lm_key in lm_dict:
             self.learning_modules[lm_counter].load_state_dict(lm_dict[lm_key])
             lm_counter = lm_counter + 1
+
+        if n_saved == 1 and n_current > 1:
+            # Replicate: single saved LM shared with additional LMs of the
+            # same type.  Supports multi-LM eval (e.g. diverse scale factors)
+            # from single-LM training.  Graphs are in absolute meters so the
+            # same state works regardless of per-LM scale configuration.
+            saved_state = lm_dict[next(iter(lm_dict))]
+            source_class = type(self.learning_modules[0])
+            for i in range(1, n_current):
+                if isinstance(self.learning_modules[i], source_class):
+                    self.learning_modules[i].load_state_dict(
+                        copy.deepcopy(saved_state)
+                    )
+                    logger.info(
+                        f"Replicated saved LM state to learning_module_{i}"
+                    )
+                else:
+                    logger.info(
+                        f"learning_module_{i} is "
+                        f"{type(self.learning_modules[i]).__name__}, "
+                        f"not {source_class.__name__}; starting fresh."
+                    )
+        elif n_saved < n_current:
+            logger.info(
+                f"Loaded {n_saved} LMs from checkpoint; "
+                f"{n_current - n_saved} additional LM(s) starting fresh "
+                f"(e.g., HippocampalModule)."
+            )
 
     def state_dict(self):
         lm_dict = {

@@ -51,8 +51,15 @@ class State:
         use_state,
         sender_id,
         sender_type,
+        inferred_state=None,
     ):
-        """Initialize a state."""
+        """Initialize a state.
+
+        Args:
+            inferred_state: Optional integer identifying the inferred behavioral
+                or morphological state of the object (e.g., 0="closed",
+                1="open"). None means no state information (backward compat).
+        """
         self.location = location
         # QUESTION: Divide into pose_dependent and pose_independent features instead?
         self.morphological_features = morphological_features
@@ -61,6 +68,7 @@ class State:
         self.use_state = use_state
         self.sender_id = sender_id
         self.sender_type = sender_type
+        self.inferred_state = inferred_state
         self._set_allowable_sender_types()
         if self.use_state:
             self._check_all_attributes()
@@ -95,6 +103,8 @@ class State:
             f"   Use State: {self.use_state}\n"
             f"   Sender Type: {self.sender_type}\n"
         )
+        if self.inferred_state is not None:
+            repr_string += f"   Inferred State: {self.inferred_state}\n"
         return repr_string
 
     def _set_allowable_sender_types(self):

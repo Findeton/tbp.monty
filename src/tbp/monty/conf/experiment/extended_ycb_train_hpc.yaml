@@ -1,0 +1,33 @@
+defaults:
+  - only_surf_agent_training_10obj
+  - config/logging/clear_logging@config
+  - config/logging/pretrain@config.logging
+  - config/environment_interface/clear_train_env_interface_args@config
+  - config/environment_interface/per_object@config.train_env_interface_args
+  - config/environment_interface/ycb/extended_train_objects@config.train_env_interface_args.object_names
+
+config:
+  logging:
+    output_dir: ${path.expanduser:${oc.env:MONTY_LOGS}/projects/phase2_review_runs}
+    run_name: extended_ycb_train_hpc
+  train_env_interface_args:
+    object_init_sampler:
+      _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+      rotations: ${benchmarks.rotations_all}
+  monty_config:
+    # Add HPC as second LM — learns associations during training
+    learning_module_configs:
+      learning_module_1:
+        learning_module_class: ${monty.class:tbp.monty.frameworks.models.hippocampal_module.HippocampalModule}
+        learning_module_args:
+          context_dim: 32
+          max_episodes: 500
+          min_confidence_to_bind: 0.5
+    # Connectivity: SM0 -> LM0, LM0 -> LM1 (HPC)
+    sm_to_lm_matrix:
+      - [0]
+      - []
+    lm_to_lm_matrix:
+      - []
+      - [0]
+    lm_to_lm_vote_matrix: null

@@ -1,0 +1,24 @@
+{
+  "total_steps": 105,
+  "total_surprise_entries": 11,
+  "mean_surprise": 0.8545454545454546,
+  "final_surprise": 0.75,
+  "min_surprise": 0.7,
+  "steps_with_use_state": 11,
+  "mean_surprise_first": 0.975,
+  "mean_surprise_final": 0.7625,
+  "usable_states": 11,
+  "n_animation_frames": 35,
+  "n_repetitions": 3,
+  "surprise_history": [
+    0.925,
+    0.925,
+    0.7,
+    1.0,
+    0.8,
+    0.825,
+    0.775,
+    0.7,
+    0.75
+  ]
+}

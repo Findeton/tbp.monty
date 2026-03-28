@@ -1,0 +1,15 @@
+{
+  "step": 638,
+  "surprise": null,
+  "action": "orbital_step_638",
+  "use_state": false,
+  "location": [
+    -1.0551877315580165,
+    1.5216499544737914,
+    -1.641417941179954
+  ],
+  "morphological_features": {
+    "on_object": 0.0
+  },
+  "confidence": 1.0
+}

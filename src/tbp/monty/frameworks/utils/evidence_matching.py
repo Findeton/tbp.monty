@@ -188,12 +188,18 @@ class ChannelMapper:
         Returns:
             The hypotheses corresponding to the given channel.
         """
+        scales = (
+            self.extract(hypotheses.scales, channel)
+            if hypotheses.scales is not None
+            else None
+        )
         return ChannelHypotheses(
             input_channel=channel,
             evidence=self.extract(hypotheses.evidence, channel),
             locations=self.extract(hypotheses.locations, channel),
             poses=self.extract(hypotheses.poses, channel),
             possible=self.extract(hypotheses.possible, channel),
+            scales=scales,
         )
 
     def update(

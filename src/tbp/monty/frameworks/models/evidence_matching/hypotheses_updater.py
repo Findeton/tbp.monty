@@ -106,6 +106,7 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
         max_nneighbors: int = 3,
         past_weight: float = 1,
         present_weight: float = 1,
+        scale_factors: list[float] | None = None,
         umbilical_num_poses: int = 8,
     ):
         """Initializes the DefaultHypothesesUpdater.
@@ -157,10 +158,16 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
                 efficient policy and better parameters, that may be possible to use and
                 could help when moving from one object to another and generally make
                 setting thresholds more intuitive.
+            scale_factors: Scale factors for multi-scale matching (grid cell
+                modules). Each factor represents a hypothesized ratio of
+                query_size / stored_size. E.g., [0.5, 1.0, 2.0] tests whether
+                the query is half, same, or double the stored object's size.
+                None means single-scale (scale=1.0 only). Defaults to None.
             umbilical_num_poses: Number of sampled rotations in the direction of
                 the plane perpendicular to the surface normal. These are sampled at
                 umbilical points (i.e., points where PC directions are undefined).
         """
+        self.scale_factors = scale_factors
         self.feature_evidence_calculator = feature_evidence_calculator
         self.feature_evidence_increment = feature_evidence_increment
         self.feature_weights = feature_weights
@@ -295,7 +302,11 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
         return hypotheses_updates, telemetry
 
     def _get_all_informed_possible_poses(
-        self, graph_id: str, sensed_channel_features: dict, input_channel: str
+        self,
+        graph_id: str,
+        sensed_channel_features: dict,
+        input_channel: str,
+        state_id=None,
     ):
         """Initialize hypotheses on possible rotations for each location.
 
@@ -322,7 +333,7 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
 
         logger.debug(f"Determining possible poses using input from {input_channel}")
         node_directions = self.graph_memory.get_rotation_features_at_all_nodes(
-            graph_id, input_channel
+            graph_id, input_channel, state_id=state_id
         )
         sensed_directions = sensed_channel_features["pose_vectors"]
         # Check if PCs in patch are similar -> need to sample more directions
@@ -346,7 +357,7 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
                     all_possible_locations,
                     np.array(
                         self.graph_memory.get_locations_in_graph(
-                            graph_id, input_channel
+                            graph_id, input_channel, state_id=state_id
                         )
                     ),
                 ]
@@ -358,19 +369,50 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
     def _get_initial_hypothesis_space(
         self, channel_features: dict, graph_id: str, input_channel: str
     ) -> ChannelHypotheses:
+        # Check if this model is state-conditioned
+        states_in_graph = None
+        if hasattr(self.graph_memory, "get_states_in_graph"):
+            states_in_graph = self.graph_memory.get_states_in_graph(
+                graph_id, input_channel
+            )
+
+        if states_in_graph is not None and len(states_in_graph) > 1:
+            return self._get_initial_hypothesis_space_with_states(
+                channel_features, graph_id, input_channel, states_in_graph
+            )
+
+        return self._get_initial_hypothesis_space_single(
+            channel_features, graph_id, input_channel
+        )
+
+    def _get_initial_hypothesis_space_single(
+        self,
+        channel_features: dict,
+        graph_id: str,
+        input_channel: str,
+        state_id=None,
+    ) -> ChannelHypotheses:
+        """Initialize hypotheses for a single state (or stateless model).
+
+        Args:
+            channel_features: Sensed features for this input channel.
+            graph_id: Graph ID.
+            input_channel: Input channel name.
+            state_id: Optional state ID for state-conditioned models.
+        """
         if self.initial_possible_poses is None:
             # Get initial poses for all locations informed by pose features
             (
                 initial_possible_channel_locations,
                 initial_possible_channel_rotations,
             ) = self._get_all_informed_possible_poses(
-                graph_id, channel_features, input_channel
+                graph_id, channel_features, input_channel, state_id=state_id
             )
         else:
             initial_possible_channel_locations = []
             initial_possible_channel_rotations = []
             all_channel_locations = self.graph_memory.get_locations_in_graph(
-                graph_id, input_channel
+                graph_id, input_channel, state_id=state_id
             )
             # Initialize fixed possible poses (without using pose features)
             for rotation in self.initial_possible_poses:
@@ -392,14 +434,29 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
         # currently be achieved in two ways. Either we don't specify tolerances
         # and feature_weights or we set the global feature_evidence_increment to 0.
         if self.use_features_for_matching[input_channel]:
+            # Get feature array — use state-specific if available
+            if (
+                state_id is not None
+                and hasattr(self.graph_memory, "state_feature_arrays")
+                and graph_id in getattr(self.graph_memory, "state_feature_arrays", {})
+                and input_channel
+                in self.graph_memory.state_feature_arrays.get(graph_id, {})
+                and state_id
+                in self.graph_memory.state_feature_arrays[graph_id].get(
+                    input_channel, {}
+                )
+            ):
+                fa, fo = self.graph_memory.get_state_feature_array(
+                    graph_id, input_channel, state_id
+                )
+            else:
+                fa = self.graph_memory.get_feature_array(graph_id)[input_channel]
+                fo = self.graph_memory.get_feature_order(graph_id)[input_channel]
+
             # Get real valued features match for each node
             node_feature_evidence = self.feature_evidence_calculator.calculate(
-                channel_feature_array=self.graph_memory.get_feature_array(graph_id)[
-                    input_channel
-                ],
-                channel_feature_order=self.graph_memory.get_feature_order(graph_id)[
-                    input_channel
-                ],
+                channel_feature_array=fa,
+                channel_feature_order=fo,
                 channel_feature_weights=self.feature_weights[input_channel],
                 channel_query_features=channel_features,
                 channel_tolerances=self.tolerances[input_channel],
@@ -419,12 +476,71 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
         # New hypotheses cannot be possible
         initial_possible_hyps = np.zeros_like(evidence, dtype=np.bool_)
 
+        # Multi-scale grid cell modules: replicate hypotheses at each scale
+        if self.scale_factors is not None and len(self.scale_factors) > 1:
+            n_base = len(evidence)
+            k = len(self.scale_factors)
+            initial_possible_channel_locations = np.tile(
+                initial_possible_channel_locations, (k, 1)
+            )
+            initial_possible_channel_rotations = np.tile(
+                initial_possible_channel_rotations, (k, 1, 1)
+            )
+            evidence = np.tile(evidence, k)
+            initial_possible_hyps = np.tile(initial_possible_hyps, k)
+            scales = np.repeat(self.scale_factors, n_base)
+        else:
+            scales = np.ones(len(evidence))
+
         return ChannelHypotheses(
             input_channel=input_channel,
             evidence=evidence,
             locations=initial_possible_channel_locations,
             poses=initial_possible_channel_rotations,
             possible=initial_possible_hyps,
+            scales=scales,
+        )
+
+    def _get_initial_hypothesis_space_with_states(
+        self,
+        channel_features: dict,
+        graph_id: str,
+        input_channel: str,
+        states: list,
+    ) -> ChannelHypotheses:
+        """Initialize hypotheses replicated across multiple states.
+
+        For each state, builds a full hypothesis space (all locations x poses),
+        then concatenates them with state IDs.
+        """
+        all_locations = []
+        all_rotations = []
+        all_evidence = []
+        all_possible = []
+        all_scales = []
+        all_states = []
+
+        for state_id in states:
+            state_hyps = self._get_initial_hypothesis_space_single(
+                channel_features, graph_id, input_channel, state_id=state_id
+            )
+            n = len(state_hyps.evidence)
+            all_locations.append(state_hyps.locations)
+            all_rotations.append(state_hyps.poses)
+            all_evidence.append(state_hyps.evidence)
+            all_possible.append(state_hyps.possible)
+            if state_hyps.scales is not None:
+                all_scales.append(state_hyps.scales)
+            all_states.append(np.full(n, state_id, dtype=np.int64))
+
+        return ChannelHypotheses(
+            input_channel=input_channel,
+            evidence=np.concatenate(all_evidence),
+            locations=np.vstack(all_locations),
+            poses=np.concatenate(all_rotations),
+            possible=np.concatenate(all_possible),
+            scales=np.concatenate(all_scales) if all_scales else None,
+            states=np.concatenate(all_states),
         )
 
 

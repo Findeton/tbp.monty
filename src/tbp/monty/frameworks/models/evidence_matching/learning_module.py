@@ -11,8 +11,8 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import numpy.typing as npt
@@ -172,6 +172,7 @@ class EvidenceGraphLM(GraphLM):
         max_nodes_per_graph=2000,
         num_model_voxels_per_dim=50,  # -> voxel size = 6mm3 (0.006)
         use_multithreading=True,
+        max_evidence_workers: int | None = None,
         gsg: EvidenceGoalStateGenerator | None = None,
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
@@ -181,6 +182,19 @@ class EvidenceGraphLM(GraphLM):
         *args,
         **kwargs,
     ) -> None:
+        # Pop custom kwargs before passing to super
+        scale_invariant = kwargs.pop("scale_invariant_matching", False)
+        scale_factors_seed = kwargs.pop("scale_factors_seed", None)
+        temporal_memory_config = kwargs.pop("temporal_memory", None)
+        surprise_boost = kwargs.pop("surprise_boost", 0.0)
+        surprise_penalty = kwargs.pop("surprise_penalty", 0.0)
+        # T6.6: Surprise-gated upward messaging. When enabled, get_output()
+        # returns a minimal confirmation State when TM surprise is below
+        # threshold, reducing inter-LM bandwidth for predicted observations.
+        self._surprise_gated_output = kwargs.pop("surprise_gated_output", False)
+        self._output_surprise_threshold = kwargs.pop(
+            "output_surprise_threshold", 0.3
+        )
         kwargs["initialize_base_modules"] = False
         super().__init__(*args, **kwargs)
         # --- LM components ---
@@ -215,6 +229,10 @@ class EvidenceGraphLM(GraphLM):
         self.max_graph_size = max_graph_size
         # --- Debugging Params ---
         self.use_multithreading = use_multithreading
+        # T6.8: Reusable thread pool eliminates per-step thread creation
+        # overhead. max_evidence_workers=None lets ThreadPoolExecutor auto-size.
+        self._max_evidence_workers = max_evidence_workers
+        self._evidence_pool: ThreadPoolExecutor | None = None
         # --- Category Bias Params ---
         # category_taxonomy maps graph_id -> category_name. When set, enables
         # online category-aggregated evidence readout and optional evidence bias.
@@ -227,6 +245,33 @@ class EvidenceGraphLM(GraphLM):
         # this bias. 0 = no normalization, 0.5 = sqrt, 0.75 = empirically best
         # for alphabet accuracy on Omniglot, 1.0 = full normalization.
         self.evidence_size_norm_power = evidence_size_norm_power
+        # Multi-scale matching: when True, initializes hypotheses at multiple
+        # scale factors (like grid cell modules at different spacings). Enables
+        # matching across different object sizes without knowing query size.
+        self.scale_invariant_matching = scale_invariant
+
+        # --- Surprise modulation (predictive coding) ---
+        # When temporal memory is enabled, surprise (prediction error)
+        # modulates evidence accumulation. Low surprise boosts current MLH
+        # evidence (predicted input = confident). High surprise penalizes
+        # (unexpected input = current hypotheses may be wrong).
+        self._surprise_boost = surprise_boost
+        self._surprise_penalty = surprise_penalty
+
+        # --- Within-episode temporal memory (optional) ---
+        # Learns temporal patterns in the raw observation stream via
+        # SDR encoding + Hebbian association. Provides surprise signal
+        # and predictions for how sensory features change over time.
+        self._temporal_memory = None
+        if temporal_memory_config is not None:
+            from tbp.monty.frameworks.models.temporal_memory import TemporalMemory
+
+            if isinstance(temporal_memory_config, TemporalMemory):
+                self._temporal_memory = temporal_memory_config
+            elif isinstance(temporal_memory_config, dict):
+                self._temporal_memory = TemporalMemory(**temporal_memory_config)
+            else:
+                self._temporal_memory = TemporalMemory()
 
         # TODO make sure we always extract pose features and remove this
         self.tolerances = add_pose_features_to_tolerances(tolerances)
@@ -249,6 +294,13 @@ class EvidenceGraphLM(GraphLM):
         # and stores which hypotheses are "possible" for symmetry checks.
         self.possible_hyps: dict[str, npt.NDArray[np.bool_]] = {}
 
+        # self.possible_scales stores per-hypothesis scale factors (grid cell modules).
+        self.possible_scales: dict[str, npt.NDArray[np.float64] | None] = {}
+
+        # self.possible_states stores per-hypothesis state IDs for state-conditioned
+        # models. None for plain (stateless) models.
+        self.possible_states: dict[str, npt.NDArray[np.int64] | None] = {}
+
         # A dictionary from graph_id to instances of `ChannelMapper`.
         self.channel_hypothesis_mapping: dict[str, ChannelMapper] = {}
 
@@ -257,6 +309,7 @@ class EvidenceGraphLM(GraphLM):
             "location": [0, 0, 0],
             "rotation": Rotation.from_euler("xyz", [0, 0, 0]),
             "scale": 1,
+            "state": None,
             "evidence": 0,
         }
         self.previous_mlh = self.current_mlh
@@ -269,6 +322,17 @@ class EvidenceGraphLM(GraphLM):
 
         # Make hypotheses_updater_args a dict from a DictConfig, so we can edit it.
         hypotheses_updater_args = dict(hypotheses_updater_args)
+        # Multi-scale grid cell modules: 5 modules with geometric spacing.
+        # Biologically, each cortical column has slightly different grid cell
+        # configurations due to developmental noise. The scale_factors_seed
+        # parameter introduces per-LM variability in the center (bias) and
+        # spacing (spread) of the modules. With multiple LMs + voting, this
+        # diversity gives robust scale coverage without manual tuning.
+        if scale_invariant:
+            if "scale_factors" not in hypotheses_updater_args:
+                hypotheses_updater_args["scale_factors"] = (
+                    self._generate_scale_factors(scale_factors_seed)
+                )
         hypotheses_updater_args.update(
             evidence_threshold_config=self.evidence_threshold_config,
             feature_evidence_increment=self.feature_evidence_increment,
@@ -282,7 +346,62 @@ class EvidenceGraphLM(GraphLM):
         self.hypotheses_updater = hypotheses_updater_class(**hypotheses_updater_args)
         self.hypotheses_updater_telemetry: HypothesesUpdaterTelemetry = {}
 
+    def __del__(self):
+        if self._evidence_pool is not None:
+            self._evidence_pool.shutdown(wait=False)
+            self._evidence_pool = None
+
+    @staticmethod
+    def _generate_scale_factors(seed=None, n_modules=5):
+        """Generate grid cell scale factors with optional random variability.
+
+        With no seed (or seed=None), returns the default modules centered at
+        1.0 with 1.6x spacing. With a seed, introduces random jitter to the
+        center (log-bias) and spacing (log-spread), simulating developmental
+        variability across cortical columns.
+
+        Args:
+            seed: Random seed for variability. None = default (no jitter).
+            n_modules: Number of grid cell modules. Defaults to 5.
+
+        Returns:
+            List of scale factors (sorted ascending).
+        """
+        base_ratio = 1.6  # spacing ratio between adjacent modules
+        base_center = 0.0  # log-center (1.0 in linear)
+
+        if seed is not None:
+            rng = np.random.RandomState(seed)
+            # Jitter the center by ±0.3 in log space (factor of ~1.35x)
+            log_center_jitter = rng.uniform(-0.3, 0.3)
+            # Jitter the spacing ratio by ±15%
+            ratio_jitter = rng.uniform(0.85, 1.15)
+            base_center += log_center_jitter
+            base_ratio *= ratio_jitter
+
+        log_ratio = np.log(base_ratio)
+        half = (n_modules - 1) / 2
+        factors = [
+            float(np.exp(base_center + (i - half) * log_ratio))
+            for i in range(n_modules)
+        ]
+        return sorted(factors)
+
     # =============== Public Interface Functions ===============
+
+    def state_dict(self):
+        """Get state dict including temporal memory if present."""
+        sd = super().state_dict()
+        if self._temporal_memory is not None:
+            sd["temporal_memory"] = self._temporal_memory.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict):
+        """Load state dict including temporal memory if present."""
+        super().load_state_dict(state_dict)
+        tm_state = state_dict.get("temporal_memory")
+        if tm_state is not None and self._temporal_memory is not None:
+            self._temporal_memory.load_state_dict(tm_state)
 
     # ------------------- Main Algorithm -----------------------
     def reset(self):
@@ -303,6 +422,7 @@ class EvidenceGraphLM(GraphLM):
         self.current_mlh["location"] = [0, 0, 0]
         self.current_mlh["rotation"] = Rotation.from_euler("xyz", [0, 0, 0])
         self.current_mlh["scale"] = 1
+        self.current_mlh["state"] = None
         self.current_mlh["evidence"] = 0
 
     def receive_votes(self, vote_data):
@@ -320,31 +440,32 @@ class EvidenceGraphLM(GraphLM):
         if (vote_data is not None) and (
             self.buffer.get_num_observations_on_object() > 0
         ):
-            thread_list = []
-            for graph_id in self.get_all_known_object_ids():
-                if graph_id in vote_data:
-                    if self.use_multithreading:
-                        t = threading.Thread(
-                            target=self._update_evidence_with_vote,
-                            args=(
-                                vote_data[graph_id],
-                                graph_id,
-                            ),
-                        )
-                        thread_list.append(t)
-                    else:  # This can be useful for debugging.
-                        self._update_evidence_with_vote(
-                            vote_data[graph_id],
-                            graph_id,
-                        )
-            if self.use_multithreading:
-                for thread in thread_list:
-                    # start executing _update_evidence in each thread.
-                    thread.start()
-                for thread in thread_list:
-                    # call this to prevent main thread from continuing in code
-                    # before all evidences are updated.
-                    thread.join()
+            vote_graph_ids = [
+                gid for gid in self.get_all_known_object_ids()
+                if gid in vote_data
+            ]
+            if self.use_multithreading and len(vote_graph_ids) > 1:
+                # T6.8: Reuse thread pool for vote updates
+                if self._evidence_pool is None:
+                    self._evidence_pool = ThreadPoolExecutor(
+                        max_workers=self._max_evidence_workers,
+                    )
+                futures = [
+                    self._evidence_pool.submit(
+                        self._update_evidence_with_vote,
+                        vote_data[graph_id],
+                        graph_id,
+                    )
+                    for graph_id in vote_graph_ids
+                ]
+                for future in futures:
+                    future.result()
+            else:
+                for graph_id in vote_graph_ids:
+                    self._update_evidence_with_vote(
+                        vote_data[graph_id],
+                        graph_id,
+                    )
             logger.debug("Updating possible matches after vote")
             self.possible_matches = self._threshold_possible_matches()
             self.current_mlh = self._calculate_most_likely_hypothesis()
@@ -399,6 +520,12 @@ class EvidenceGraphLM(GraphLM):
                 if len(interesting_hyp[0]) > 0:
                     possible_states[graph_id] = []
                     for hyp_id in interesting_hyp[0]:
+                        # Get inferred state for this hypothesis if available
+                        hyp_state = None
+                        states = self.possible_states.get(graph_id)
+                        if states is not None and len(states) > hyp_id:
+                            hyp_state = int(states[hyp_id])
+
                         vote = State(
                             location=self.possible_locations[graph_id][
                                 hyp_id
@@ -414,6 +541,7 @@ class EvidenceGraphLM(GraphLM):
                             use_state=True,
                             sender_id=self.learning_module_id,
                             sender_type="LM",
+                            inferred_state=hyp_state,
                         )
                         possible_states[graph_id].append(vote)
 
@@ -432,8 +560,54 @@ class EvidenceGraphLM(GraphLM):
 
         If the evidence for mlh is < object_evidence_threshold,
         interesting_features == False
+
+        T6.6: When surprise_gated_output is enabled, returns a minimal
+        confirmation State (use_state=False, confidence=1.0) when TM surprise
+        is below threshold. This reduces bandwidth: predicted observations
+        don't need to send full content upward. Parent LMs skip hypothesis
+        update for confirmed children. Analogous to the biological principle
+        that only prediction errors propagate upward — correct predictions
+        are suppressed.
+
+        During supervised training, delegates to the parent GraphLM.get_output()
+        which returns a high-confidence State with the known target identity.
+        This enables downstream modules (e.g., HippocampalModule) to learn
+        associations during training.
         """
+        # During supervised training, use the parent's training-mode output
+        # which provides the known target identity to downstream modules.
+        parent_output = super().get_output()
+        if parent_output is not None:
+            return parent_output
+
         mlh = self.get_current_mlh()
+
+        # T6.6: Surprise-gated output. When enabled and surprise is low,
+        # return a minimal confirmation State. The parent LM can skip
+        # updating for this child, saving computation.
+        if self._surprise_gated_output:
+            surprise = self.get_temporal_surprise()
+            if surprise < self._output_surprise_threshold:
+                return State(
+                    location=self.buffer.get_current_location(
+                        input_channel="first"
+                    ),
+                    morphological_features={
+                        "pose_vectors": np.eye(3),
+                        "pose_fully_defined": True,
+                        "on_object": self.buffer.get_currently_on_object(),
+                    },
+                    non_morphological_features={
+                        "confirmed": True,
+                        "surprise": surprise,
+                        "graph_id": mlh["graph_id"],
+                    },
+                    confidence=1.0,
+                    use_state=False,  # Signal: no update needed
+                    sender_id=self.learning_module_id,
+                    sender_type="LM",
+                )
+
         pose_features = self._object_pose_to_features(mlh["rotation"].inv())
         object_id_features = self._object_id_to_features(mlh["graph_id"])
         # Pass object ID to next LM if:
@@ -452,44 +626,22 @@ class EvidenceGraphLM(GraphLM):
             if len(self.buffer) == 0
             else np.clip(mlh["evidence"] / len(self.buffer), 0, 1)
         )
-        # TODO H1: update this to send detected object location
-        # Use something like this + incorporate mlh location. -> while on same object,
-        # this should not change, even when moving over the object. Would also have to
-        # update mlh during exploration (just add displacements).
-        # Discuss this first before implementing. This would make higher level models
-        # much simpler but also require some arbitrary object center and give less
-        # resolution of where on a compositional object we are (in this lm). Would
-        # also require update in terminal condition re. path_similarity_th.
-        # object_loc_rel_body = (
-        #     self.buffer.get_current_location(input_channel="first") - mlh["location"]
-        # )
         return State(
-            # Same as input location from patch (rel body)
-            # NOTE: Just for common format at the moment, movement information will be
-            # taken from the sensor. For higher level LMs, we may want to transmit the
-            # motor efference copy here.
-            # TODO: get motor efference copy here. Need to refactor motor command
-            # selection for this.
-            # location rel. body -> same as sensor input to higher LM (assuming they are
-            # colocated) so it is not used.
             location=self.buffer.get_current_location(input_channel="first"),
             morphological_features={
                 "pose_vectors": pose_features,
                 "pose_fully_defined": not self._enough_symmetry_evidence_accumulated(),
-                # on_object is also same as sensor input to higher LM (assuming they are
-                # colocated) so not used.
                 "on_object": self.buffer.get_currently_on_object(),
             },
             non_morphological_features={
                 "object_id": object_id_features,
-                # TODO H: test if it makes sense to communicate mlh["location"] as a
-                # non-morphological feature as well (would be kind of like the inverse
-                # of top-down connections).
+                "graph_id": mlh["graph_id"],
             },
             confidence=confidence,
             use_state=use_state,
             sender_id=self.learning_module_id,
             sender_type="LM",
+            inferred_state=mlh.get("state"),
         )
 
     # ------------------ Getters & Setters ---------------------
@@ -822,12 +974,18 @@ class EvidenceGraphLM(GraphLM):
         toward graphs associated with the HPC's active concepts. The bias
         is proportional to the association strength and category_bias_strength.
 
+        T6.6a: Also derives context weights for burst sampling. Graphs with
+        association strength > 0 get weight = strength (clamped to [0, 1]).
+        Non-associated graphs get a small exploration budget so unexpected
+        objects can still be discovered.
+
         Args:
             **context_signal: Keys typically include context_vector,
                 active_concepts, association_strengths, episode_count.
         """
         self._hippocampal_context = context_signal
         self._apply_hippocampal_bias()
+        self._apply_context_to_burst_sampling()
 
     def _apply_hippocampal_bias(self):
         """Use hippocampal association strengths to bias evidence.
@@ -870,6 +1028,358 @@ class EvidenceGraphLM(GraphLM):
                 bias = self.category_bias_strength * strength
                 self.evidence[graph_id] = ev_array + bias
 
+    def _apply_context_to_burst_sampling(self):
+        """T6.6a: Derive burst sampling weights from HPC association strengths.
+
+        Translates association_strengths into per-graph weights for
+        BurstSamplingHypothesesUpdater.  Graphs associated with the HPC's
+        active concepts get proportionally more informed hypotheses during
+        bursts.  Non-associated graphs get a small exploration budget so
+        unexpected objects can still be discovered.
+        """
+        if not hasattr(self.hypotheses_updater, "set_context_weights"):
+            return
+
+        assoc = (self._hippocampal_context or {}).get("association_strengths", {})
+        if not assoc:
+            self.hypotheses_updater.clear_context_weights()
+            return
+
+        # Build weight dict: direct + category matches, clamped to [0, 1]
+        weights = {}
+        for graph_id in self.get_all_known_object_ids():
+            strength = assoc.get(graph_id, 0.0)
+
+            if self.category_taxonomy and strength == 0:
+                graph_cat = self.category_taxonomy.get(graph_id)
+                if graph_cat:
+                    for concept, s in assoc.items():
+                        concept_cat = self.category_taxonomy.get(concept)
+                        if concept_cat == graph_cat and s > 0:
+                            strength = max(strength, s)
+
+            if strength > 0:
+                weights[graph_id] = min(strength, 1.0)
+
+        if weights:
+            self.hypotheses_updater.set_context_weights(weights)
+        else:
+            self.hypotheses_updater.clear_context_weights()
+
+    # --- Within-episode temporal memory hooks ---
+
+    def pre_episode(self, primary_target):
+        """Reset LM and temporal memory for new episode."""
+        super().pre_episode(primary_target)
+        if self._temporal_memory is not None:
+            self._temporal_memory.reset_episode()
+
+    def _feed_temporal_memory(self, observations):
+        """Feed the primary SM observation to temporal memory.
+
+        Called from both exploratory_step (training) and matching_step (eval)
+        so temporal memory learns during training and provides predictions
+        during eval.
+        """
+        if self._temporal_memory is None:
+            return
+        for obs in observations:
+            if hasattr(obs, "sender_type") and obs.sender_type == "SM":
+                learn = self.mode is ExperimentMode.TRAIN
+                self._temporal_memory.step(obs, learn=learn)
+                break  # one observation per step
+
+    def exploratory_step(self, ctx, observations):
+        """Step without matching, but still feed temporal memory."""
+        super().exploratory_step(ctx, observations)
+        self._feed_temporal_memory(observations)
+
+    def matching_step(self, ctx, observations):
+        """Run evidence matching, temporal memory, and event detection."""
+        # Snapshot evidence before matching to compute delta
+        evidence_before = None
+        if self._temporal_memory is not None and (
+            self._surprise_boost > 0 or self._surprise_penalty > 0
+        ):
+            evidence_before = {
+                gid: ev.copy() for gid, ev in self.evidence.items()
+                if ev is not None and len(ev) > 0
+            }
+
+        super().matching_step(ctx, observations)
+
+        self._feed_temporal_memory(observations)
+
+        if self._temporal_memory is not None:
+            # Surprise modulation: scale the evidence delta from this step
+            self._apply_surprise_modulation(evidence_before)
+
+        # Event detection and timer speed adjustment (Phase 7)
+        self._event_signal = self._detect_event()
+        self._speed_signal = self._adjust_timer_speed(ctx)
+
+        # Temporal prediction voting (T2.10):
+        # 1. Check previous prediction against current reality
+        self._temporal_prediction_status = self._check_temporal_prediction()
+        # 2. Make prediction for next step (will be checked next step)
+        self._predicted_next_state = self._predict_next_state()
+
+    def post_episode(self):
+        """Update memory and consolidate temporal patterns via replay."""
+        super().post_episode()
+        if self._temporal_memory is not None:
+            if self.mode is ExperimentMode.TRAIN:
+                self._temporal_memory.replay_episode(n_replays=2)
+
+    def get_temporal_surprise(self):
+        """Return current temporal surprise level.
+
+        Returns the mean surprise over recent observations, or 1.0 if
+        temporal memory is not enabled or no predictions have been made.
+        """
+        if self._temporal_memory is None:
+            return 1.0
+        return self._temporal_memory.get_mean_surprise(last_n=5)
+
+    def get_temporal_context(self):
+        """Return temporal memory's prediction context.
+
+        Returns dict with predicted_sdr, mean_surprise, etc., or None.
+        """
+        if self._temporal_memory is None:
+            return None
+        return self._temporal_memory.get_temporal_context()
+
+    def _apply_surprise_modulation(self, evidence_before):
+        """Modulate evidence delta based on temporal prediction surprise.
+
+        Implements the predictive coding loop: prediction error from the
+        temporal memory scales the evidence change from this matching step.
+
+        Biological basis: In cortical columns, dendritic predictions on
+        pyramidal cells prime expected inputs. When predictions match
+        (low surprise), only predicted cells fire (sparse activation) —
+        the evidence signal is sharp and amplified. When predictions fail
+        (high surprise), all cells in the minicolumn fire (burst) — the
+        signal is noisy and the evidence delta should be dampened.
+
+        - Low surprise → amplify evidence delta by (1 + boost * (1 - 2*surprise))
+        - High surprise → dampen evidence delta by (1 - penalty * (2*surprise - 1))
+
+        Both parameters default to 0, so this is a no-op unless explicitly
+        enabled. This ensures zero impact on existing pipelines.
+
+        Args:
+            evidence_before: Dict of {graph_id: evidence_array} snapshot
+                taken before matching_step ran, or None.
+        """
+        if self._surprise_boost == 0 and self._surprise_penalty == 0:
+            return
+        if evidence_before is None:
+            return
+
+        surprise = self.get_temporal_surprise()
+
+        # Compute scale factor based on surprise
+        # surprise ∈ [0, 1]. At surprise=0.5, scale=1.0 (neutral).
+        if surprise < 0.5:
+            # Low surprise: amplify. At surprise=0, scale = 1 + boost.
+            scale = 1.0 + self._surprise_boost * (1.0 - 2.0 * surprise)
+        else:
+            # High surprise: dampen. At surprise=1, scale = 1 - penalty.
+            scale = 1.0 - self._surprise_penalty * (2.0 * surprise - 1.0)
+            scale = max(scale, 0.0)  # don't invert sign
+
+        if abs(scale - 1.0) < 1e-10:
+            return
+
+        # Scale the evidence DELTA for all graphs
+        for graph_id, ev_array in self.evidence.items():
+            if ev_array is None or len(ev_array) == 0:
+                continue
+            prev = evidence_before.get(graph_id)
+            if prev is None or len(prev) != len(ev_array):
+                continue
+            delta = ev_array - prev
+            # Apply scaled delta: evidence = before + delta * scale
+            self.evidence[graph_id] = prev + delta * scale
+
+    # --- Event Detection and Timer Speed Adjustment (Phase 7) ---
+
+    def _detect_event(self):
+        """Detect a state transition event (behavioral state change).
+
+        An event is detected when the MLH state changes between consecutive
+        steps and the evidence for the new state exceeds a threshold.
+        This corresponds to the theory's prediction that LMs detect events
+        when prediction error spikes at the current state and evidence rises
+        for a different state.
+
+        Returns:
+            True if an event (state transition) was detected.
+        """
+        if not hasattr(self, "previous_mlh") or self.previous_mlh is None:
+            return False
+
+        current_state = self.current_mlh.get("state")
+        previous_state = self.previous_mlh.get("state")
+
+        # No state tracking → no event detection
+        if current_state is None and previous_state is None:
+            return False
+
+        # State changed and current hypothesis has reasonable evidence
+        if current_state != previous_state:
+            current_ev = self.current_mlh.get("evidence", 0)
+            if current_ev > 0:
+                logger.debug(
+                    f"LM {self.learning_module_id}: event detected, "
+                    f"state {previous_state} → {current_state} "
+                    f"(evidence={current_ev:.2f})"
+                )
+                return True
+
+        return False
+
+    def _adjust_timer_speed(self, ctx):
+        """Compute timer speed correction from model timing expectations.
+
+        Compares the expected time cell (from the model's transition
+        sequence) with the actual time cell from the timer. If the
+        model expects a transition at tick T but the timer reads T',
+        the correction factor is T/T'.
+
+        Returns:
+            Speed correction factor (float), or None if no correction.
+        """
+        if not hasattr(ctx, "timer") or ctx.timer is None:
+            return None
+
+        timer = ctx.timer
+        current_state = self.current_mlh.get("state")
+        if current_state is None:
+            return None
+
+        # Check if the current graph has state transition data
+        graph_id = self.current_mlh.get("graph_id", "")
+        if graph_id not in self.graph_memory.models_in_memory:
+            return None
+
+        # Get the model for current object
+        models = self.graph_memory.models_in_memory.get(graph_id, {})
+        for channel_model in models.values():
+            if hasattr(channel_model, "get_transition_sequence"):
+                transitions = channel_model.get_transition_sequence()
+                if not transitions:
+                    continue
+
+                # Find expected interval for current state
+                actual_tick = timer.get_current_tick()
+                if actual_tick <= 0:
+                    continue
+
+                for from_s, to_s, expected_duration in transitions:
+                    if to_s == current_state and expected_duration > 0:
+                        # Compare expected vs actual timing
+                        factor = expected_duration / actual_tick
+                        # Clamp to reasonable range
+                        factor = max(0.5, min(2.0, factor))
+                        return factor
+
+        return None
+
+    def get_event_signal(self):
+        """Return whether this LM detected an event this step.
+
+        Called by Monty after stepping all LMs, to collect signals
+        for the timer.
+        """
+        return getattr(self, "_event_signal", False)
+
+    def get_speed_signal(self):
+        """Return this LM's speed correction factor, or None.
+
+        Called by Monty after stepping all LMs, to collect signals
+        for the timer.
+        """
+        return getattr(self, "_speed_signal", None)
+
+    # --- Temporal Prediction Voting (T2.10) ---
+
+    def _predict_next_state(self):
+        """Predict what state should come next based on transition sequence.
+
+        Uses the model's learned transitions: if the current MLH state is A
+        and the model has a transition A→B, predict B. This mirrors dendritic
+        prediction in cortical pyramidal cells — the apical dendrite is primed
+        for the expected next input before it arrives.
+
+        Returns:
+            Predicted next state (int), or None if no prediction possible.
+        """
+        current_state = self.current_mlh.get("state")
+        if current_state is None:
+            return None
+
+        graph_id = self.current_mlh.get("graph_id", "")
+        if graph_id not in self.graph_memory.models_in_memory:
+            return None
+
+        models = self.graph_memory.models_in_memory.get(graph_id, {})
+        for channel_model in models.values():
+            if hasattr(channel_model, "get_next_state"):
+                next_state = channel_model.get_next_state(current_state)
+                if next_state is not None:
+                    return next_state
+        return None
+
+    def _check_temporal_prediction(self):
+        """Compare predicted next state with actual observed state.
+
+        Called after evidence update. Compares the prediction made at the
+        end of the previous step with the current step's MLH state.
+
+        This implements the burst/sparse distinction: correct predictions
+        produce sparse (confident) responses, wrong predictions produce
+        burst (confused) responses that trigger lateral voting.
+
+        Returns:
+            "confident" if prediction matched reality.
+            "confused" if prediction was wrong (prediction error).
+            None if no prediction was made (no state-conditioned model).
+        """
+        predicted = getattr(self, "_predicted_next_state", None)
+        if predicted is None:
+            return None
+
+        actual = self.current_mlh.get("state")
+        if actual is None:
+            return None
+
+        if actual == predicted:
+            logger.debug(
+                f"LM {self.learning_module_id}: temporal prediction correct "
+                f"(predicted={predicted}, actual={actual})"
+            )
+            return "confident"
+        else:
+            logger.debug(
+                f"LM {self.learning_module_id}: temporal prediction ERROR "
+                f"(predicted={predicted}, actual={actual})"
+            )
+            return "confused"
+
+    def get_temporal_prediction_status(self):
+        """Return this LM's temporal prediction status.
+
+        Called by Monty after stepping all LMs, to determine which LMs
+        should send or receive temporal votes.
+
+        Returns:
+            "confident", "confused", or None.
+        """
+        return getattr(self, "_temporal_prediction_status", None)
+
     def _update_possible_matches(
         self,
         ctx: RuntimeContext,  # noqa: ARG002
@@ -877,28 +1387,29 @@ class EvidenceGraphLM(GraphLM):
     ):
         """Update evidence for each hypothesis instead of removing them."""
         with self.hypotheses_updater:
-            thread_list = []
-            for graph_id in self.get_all_known_object_ids():
-                if self.use_multithreading:
-                    # assign separate thread on same CPU to each objects update.
-                    # Since the updates of different objects are independent of
-                    # each other we can do this.
-                    t = threading.Thread(
-                        target=self._update_evidence,
-                        args=(query[0], query[1], graph_id),
+            graph_ids = self.get_all_known_object_ids()
+            if self.use_multithreading and len(graph_ids) > 1:
+                # T6.8: Use a reusable ThreadPoolExecutor instead of creating
+                # and joining raw threads every step. The pool is lazily
+                # initialized and reused across steps, eliminating per-step
+                # thread creation overhead. Numpy/scipy C extensions release
+                # the GIL, so threads DO achieve true parallelism for the
+                # numerical heavy lifting.
+                if self._evidence_pool is None:
+                    self._evidence_pool = ThreadPoolExecutor(
+                        max_workers=self._max_evidence_workers,
                     )
-                    thread_list.append(t)
-                else:  # This can be useful for debugging.
+                futures = [
+                    self._evidence_pool.submit(
+                        self._update_evidence, query[0], query[1], graph_id
+                    )
+                    for graph_id in graph_ids
+                ]
+                for future in futures:
+                    future.result()  # Re-raises any exception from worker
+            else:
+                for graph_id in graph_ids:
                     self._update_evidence(query[0], query[1], graph_id)
-            if self.use_multithreading:
-                # TODO: deal with keyboard interrupt
-                for thread in thread_list:
-                    # start executing _update_evidence in each thread.
-                    thread.start()
-                for thread in thread_list:
-                    # call this to prevent main thread from continuing in code
-                    # before all evidences are updated.
-                    thread.join()
             # Online category readout and optional bias (T1.3 + T1.4a)
             self._compute_category_evidence()
             self._apply_category_bias()
@@ -937,6 +1448,8 @@ class EvidenceGraphLM(GraphLM):
             self.possible_locations[graph_id] = np.array([])
             self.possible_poses[graph_id] = np.array([])
             self.possible_hyps[graph_id] = np.array([])
+            self.possible_scales[graph_id] = np.array([])
+            self.possible_states[graph_id] = None
 
         # Calculate the evidence_update_threshold
         update_threshold = evidence_update_threshold(
@@ -953,6 +1466,8 @@ class EvidenceGraphLM(GraphLM):
                     locations=self.possible_locations[graph_id],
                     poses=self.possible_poses[graph_id],
                     possible=self.possible_hyps[graph_id],
+                    scales=self.possible_scales.get(graph_id),
+                    states=self.possible_states.get(graph_id),
                 ),
                 features=features,
                 displacements=displacements,
@@ -1023,6 +1538,11 @@ class EvidenceGraphLM(GraphLM):
                 self.possible_poses[graph_id] = np.empty((0, 3, 3))
                 self.evidence[graph_id] = np.empty((0,))
                 self.possible_hyps[graph_id] = np.empty((0,), dtype=np.bool_)
+                self.possible_scales[graph_id] = np.empty((0,))
+                if new_hypotheses.states is not None:
+                    self.possible_states[graph_id] = np.empty(
+                        (0,), dtype=np.int64
+                    )
 
             # If there exists other channels, add current mean evidence to give the
             # new hypotheses a fighting chance.
@@ -1062,18 +1582,44 @@ class EvidenceGraphLM(GraphLM):
             new_hypotheses.input_channel,
             new_hypotheses.possible,
         )
+        if new_hypotheses.scales is not None:
+            if graph_id not in self.possible_scales:
+                self.possible_scales[graph_id] = np.empty((0,))
+            self.possible_scales[graph_id] = mapper.update(
+                self.possible_scales[graph_id],
+                new_hypotheses.input_channel,
+                new_hypotheses.scales,
+            )
+        if new_hypotheses.states is not None:
+            if graph_id not in self.possible_states:
+                self.possible_states[graph_id] = np.empty((0,), dtype=np.int64)
+            self.possible_states[graph_id] = mapper.update(
+                self.possible_states[graph_id],
+                new_hypotheses.input_channel,
+                new_hypotheses.states,
+            )
 
         mapper.resize_channel_to(new_hypotheses.input_channel, len(new_evidence))
 
     def _update_evidence_with_vote(self, state_votes, graph_id):
-        """Use incoming votes to update all hypotheses."""
+        """Use incoming votes to update all hypotheses.
+
+        When hypotheses have states (state-conditioned model) and votes carry
+        inferred_state, only votes whose state matches the hypothesis state
+        are applied. Votes with inferred_state=None apply to all hypotheses
+        (backward compatible).
+        """
         # Extract information from list of State classes into np.arrays for efficient
         # matrix operations and KDTree search.
         graph_location_vote = np.zeros((len(state_votes), 3))
         vote_evidences = np.zeros(len(state_votes))
+        # Extract inferred_state from each vote (-1 = no state / apply to all)
+        vote_states = np.full(len(state_votes), -1, dtype=np.int64)
         for n, vote in enumerate(state_votes):
             graph_location_vote[n] = vote.location
             vote_evidences[n] = vote.confidence
+            if getattr(vote, "inferred_state", None) is not None:
+                vote_states[n] = vote.inferred_state
 
         vote_location_tree = KDTree(
             graph_location_vote,
@@ -1087,7 +1633,7 @@ class EvidenceGraphLM(GraphLM):
             self.possible_locations[graph_id],
             k=vote_nn,
             p=2,
-            workers=1,
+            workers=-1,  # T6.7: Use all cores for vote queries.
         )
         if vote_nn == 1:
             radius_node_dists = np.expand_dims(radius_node_dists, axis=1)
@@ -1096,7 +1642,20 @@ class EvidenceGraphLM(GraphLM):
         # Check that nearest node are in the radius
         node_distance_weights = self._get_node_distance_weights(radius_node_dists)
         too_far_away = node_distance_weights <= 0
-        # Mask the votes which are too far away
+
+        # State-aware vote filtering: only apply votes whose state matches
+        # the hypothesis state. Votes with no state (-1) apply to all.
+        hyp_states = self.possible_states.get(graph_id)
+        if hyp_states is not None and np.any(vote_states >= 0):
+            nearest_vote_states = vote_states[radius_node_ids]  # (H, K)
+            # Match if: vote has same state as hypothesis, or vote has no state
+            state_match = (
+                (nearest_vote_states == hyp_states[:, None])
+                | (nearest_vote_states == -1)
+            )
+            too_far_away = too_far_away | ~state_match
+
+        # Mask the votes which are too far away (or state-mismatched)
         all_radius_evidence = np.ma.array(radius_evidences, mask=too_far_away)
         # Get the highest vote in the radius. Currently unweighted but using
         # np.ma.average and the node_distance_weights also works reasonably well.
@@ -1410,11 +1969,26 @@ class EvidenceGraphLM(GraphLM):
         Returns:
             The most likely hypothesis dictionary.
         """
+        # Report the per-hypothesis scale factor if available
+        scales = self.possible_scales.get(graph_id)
+        if scales is not None and len(scales) > mlh_id:
+            mlh_scale = float(scales[mlh_id])
+        else:
+            mlh_scale = self.get_object_scale(graph_id)
+
+        # Report the per-hypothesis state if available
+        states = self.possible_states.get(graph_id)
+        if states is not None and len(states) > mlh_id:
+            mlh_state = int(states[mlh_id])
+        else:
+            mlh_state = None
+
         return {
             "graph_id": graph_id,
             "location": self.possible_locations[graph_id][mlh_id],
             "rotation": Rotation.from_matrix(self.possible_poses[graph_id][mlh_id]),
-            "scale": self.get_object_scale(graph_id),
+            "scale": mlh_scale,
+            "state": mlh_state,
             "evidence": self.evidence[graph_id][mlh_id],
         }
 
@@ -1483,8 +2057,11 @@ class EvidenceGraphLM(GraphLM):
         if not mlh:  # No objects in memory
             mlh = self.current_mlh
             mlh["graph_id"] = "new_object0"
+        state_info = ""
+        if mlh.get("state") is not None:
+            state_info = f" state={mlh['state']}"
         logger.info(
-            f"current most likely hypothesis: {mlh['graph_id']} "
+            f"current most likely hypothesis: {mlh['graph_id']}{state_info} "
             f"with evidence {np.round(mlh['evidence'], 2)}"
         )
         return mlh

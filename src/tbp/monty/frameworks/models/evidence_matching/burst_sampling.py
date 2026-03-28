@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -55,6 +56,8 @@ from tbp.monty.frameworks.utils.spatial_arithmetics import (
     align_multiple_orthonormal_vectors,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ChannelHypothesesBurstSamplingTelemetry(ChannelHypothesesUpdateTelemetry):
@@ -74,6 +77,10 @@ class ChannelHypothesesBurstSamplingTelemetry(ChannelHypothesesUpdateTelemetry):
     evidence_slopes: npt.NDArray[np.float64]
     removed_ids: npt.NDArray[np.int_]
     max_slope: float
+    # T6.13: Burst ranking quality instrumentation. Populated during bursts
+    # when include_telemetry=True for post-hoc recall@K analysis.
+    burst_node_evidence: npt.NDArray[np.float64] | None = None
+    burst_top_k_indices: npt.NDArray[np.int_] | None = None
 
 
 class BurstSamplingHypothesesUpdater:
@@ -137,7 +144,13 @@ class BurstSamplingHypothesesUpdater:
         max_nneighbors: int = 3,
         past_weight: float = 1,
         present_weight: float = 1,
+        scale_factors: list[float] | None = None,
         umbilical_num_poses: int = 8,
+        offspring_enabled: bool = False,
+        offspring_count: int = 10,
+        offspring_location_jitter: float = 0.005,
+        offspring_rotation_jitter_deg: float = 5.0,
+        offspring_evidence_threshold: float = 5.0,
     ):
         """Initializes the BurstSamplingHypothesesUpdater.
 
@@ -194,9 +207,23 @@ class BurstSamplingHypothesesUpdater:
                 efficient policy and better parameters, that may be possible to use and
                 could help when moving from one object to another and generally make
                 setting thresholds more intuitive.
+            scale_factors: Scale factors for multi-scale matching (grid cell
+                modules). Passed through to _sample_informed for burst sampling.
+                None means single-scale. Defaults to None.
             umbilical_num_poses: Number of sampled rotations in the direction of
                 the plane perpendicular to the surface normal. These are sampled at
                 umbilical points (i.e., points where PC directions are undefined).
+            offspring_enabled: T6.13a: Enable offspring/refinement hypotheses.
+                When True, creates jittered copies of high-evidence hypotheses
+                to sharpen pose estimates. Defaults to False.
+            offspring_count: Max offspring hypotheses per graph per step.
+                Defaults to 10.
+            offspring_location_jitter: Standard deviation of Gaussian location
+                perturbation in model units. Defaults to 0.005 (5mm).
+            offspring_rotation_jitter_deg: Standard deviation of Gaussian
+                rotation perturbation in degrees per axis. Defaults to 5.0.
+            offspring_evidence_threshold: Minimum evidence of a hypothesis
+                for it to spawn offspring. Defaults to 5.0.
 
         Raises:
             ValueError: If the sampling_multiplier is less than 0
@@ -210,6 +237,7 @@ class BurstSamplingHypothesesUpdater:
                 "'all' for `BurstSamplingHypothesesUpdater`"
             )
 
+        self.scale_factors = scale_factors
         self.feature_evidence_calculator = feature_evidence_calculator
         self.feature_evidence_increment = feature_evidence_increment
         self.feature_weights = feature_weights
@@ -223,6 +251,13 @@ class BurstSamplingHypothesesUpdater:
         self.initial_possible_poses = get_initial_possible_poses(initial_possible_poses)
         self.tolerances = tolerances
         self.umbilical_num_poses = umbilical_num_poses
+
+        # T6.13a: Offspring/refinement hypothesis parameters
+        self.offspring_enabled = offspring_enabled
+        self.offspring_count = offspring_count
+        self.offspring_location_jitter = offspring_location_jitter
+        self.offspring_rotation_jitter_deg = offspring_rotation_jitter_deg
+        self.offspring_evidence_threshold = offspring_evidence_threshold
 
         self.use_features_for_matching = self.features_for_matching_selector.select(
             feature_evidence_increment=self.feature_evidence_increment,
@@ -245,6 +280,13 @@ class BurstSamplingHypothesesUpdater:
         if self.sampling_multiplier < 0:
             raise ValueError("sampling_multiplier should be >= 0")
 
+        # T6.6a: Context biasing for burst sampling. When set, graphs with
+        # higher context weights get proportionally more informed hypotheses
+        # during bursts. Graphs not in the context dict get
+        # context_exploration_budget (default 0.1) as their weight.
+        self.context_graph_weights: dict[str, float] | None = None
+        self.context_exploration_budget: float = 0.1
+
         self.reset()
 
     def reset(self) -> None:
@@ -252,6 +294,30 @@ class BurstSamplingHypothesesUpdater:
 
         # Dictionary of slope trackers, one for each graph_id
         self.evidence_slope_trackers: dict[str, EvidenceSlopeTracker] = {}
+
+        # T6.13: Per-step burst ranking data, keyed by (graph_id, channel).
+        # Populated by _sample_informed, consumed by telemetry in update_hypotheses.
+        self._burst_ranking: dict[tuple[str, str], dict] = {}
+
+    def set_context_weights(self, weights, exploration_budget=0.1):
+        """T6.6a: Set context-based graph weights for burst sampling.
+
+        When set, graphs with higher weights get proportionally more informed
+        hypotheses during bursts. This narrows the search space based on
+        scene/task priors from the HPC.
+
+        Args:
+            weights: Mapping of graph_id to weight (0–1). Graphs not in
+                the dict get ``exploration_budget`` as their weight.
+            exploration_budget: Weight for graphs not in context. Must be
+                > 0 to allow discovering unexpected objects.
+        """
+        self.context_graph_weights = dict(weights) if weights else None
+        self.context_exploration_budget = max(exploration_budget, 1e-6)
+
+    def clear_context_weights(self):
+        """Remove context biasing, restoring uniform sampling across graphs."""
+        self.context_graph_weights = None
 
     def __enter__(self) -> Self:
         """Enter context manager, runs before updating the hypotheses.
@@ -317,6 +383,11 @@ class BurstSamplingHypothesesUpdater:
                 - removed_ids: IDs of hypotheses removed. Note that these IDs can only
                     be used to index hypotheses from the previous timestep.
         """
+        # T6.13: Clear per-call ranking data
+        for key in list(self._burst_ranking):
+            if key[0] == graph_id:
+                del self._burst_ranking[key]
+
         # Initialize a `EvidenceSlopeTracker` to keep track of evidence slopes
         # for hypotheses of a specific graph_id
         if graph_id not in self.evidence_slope_trackers:
@@ -359,6 +430,15 @@ class BurstSamplingHypothesesUpdater:
                 tracker=tracker,
             )
 
+            # T6.13a: Spawn offspring near high-evidence hypotheses for pose
+            # refinement (only when not bursting and offspring_enabled=True).
+            offspring_hypotheses = self._sample_offspring(
+                hypotheses=hypotheses,
+                input_channel=input_channel,
+                mapper=mapper,
+                tracker=tracker,
+            )
+
             # We only displace existing hypotheses since the newly sampled hypotheses
             # should not be affected by the displacement from the last sensory input.
             if len(hypotheses_selection.maintain_ids):
@@ -373,19 +453,29 @@ class BurstSamplingHypothesesUpdater:
                     )
                 )
 
-            # Concatenate and rebuild channel hypotheses
+            # Concatenate existing + informed + offspring hypotheses
+            all_parts = [existing_hypotheses, informed_hypotheses, offspring_hypotheses]
+
+            # Handle scales: concatenate if any part has scales, otherwise None
+            scale_parts = []
+            has_any_scales = any(p.scales is not None for p in all_parts)
+            if has_any_scales:
+                for p in all_parts:
+                    if p.scales is not None:
+                        scale_parts.append(p.scales)
+                    else:
+                        scale_parts.append(np.ones(len(p.evidence)))
+                combined_scales = np.hstack(scale_parts)
+            else:
+                combined_scales = None
+
             channel_hypotheses = ChannelHypotheses(
                 input_channel=input_channel,
-                locations=np.vstack(
-                    [existing_hypotheses.locations, informed_hypotheses.locations]
-                ),
-                poses=np.vstack([existing_hypotheses.poses, informed_hypotheses.poses]),
-                evidence=np.hstack(
-                    [existing_hypotheses.evidence, informed_hypotheses.evidence]
-                ),
-                possible=np.hstack(
-                    [existing_hypotheses.possible, informed_hypotheses.possible]
-                ),
+                locations=np.vstack([p.locations for p in all_parts]),
+                poses=np.vstack([p.poses for p in all_parts]),
+                evidence=np.hstack([p.evidence for p in all_parts]),
+                possible=np.hstack([p.possible for p in all_parts]),
+                scales=combined_scales,
             )
             hypotheses_updates.append(channel_hypotheses)
 
@@ -393,20 +483,34 @@ class BurstSamplingHypothesesUpdater:
             tracker.update(channel_hypotheses.evidence, input_channel)
 
             # Telemetry update
+            n_new = len(informed_hypotheses.evidence) + len(offspring_hypotheses.evidence)
             burst_sampling_telemetry[input_channel] = asdict(
                 ChannelHypothesesBurstSamplingTelemetry(
                     channel_hypothesis_displacer_telemetry=channel_hypothesis_displacer_telemetry,
                     added_ids=(
-                        np.arange(len(channel_hypotheses.evidence))[
-                            -len(informed_hypotheses.evidence) :
-                        ]
-                        if len(informed_hypotheses.evidence) > 0
+                        np.arange(len(channel_hypotheses.evidence))[-n_new:]
+                        if n_new > 0
                         else np.array([], dtype=np.int_)
                     ),
                     ages=tracker.hyp_ages(input_channel),
                     evidence_slopes=tracker.calculate_slopes(input_channel),
                     removed_ids=hypotheses_selection.remove_ids,
                     max_slope=self.max_slope,
+                    # T6.13: Include burst ranking data when available
+                    burst_node_evidence=(
+                        self._burst_ranking[(graph_id, input_channel)][
+                            "node_evidence"
+                        ]
+                        if (graph_id, input_channel) in self._burst_ranking
+                        else None
+                    ),
+                    burst_top_k_indices=(
+                        self._burst_ranking[(graph_id, input_channel)][
+                            "top_k_indices"
+                        ]
+                        if (graph_id, input_channel) in self._burst_ranking
+                        else None
+                    ),
                 )
             )
 
@@ -492,6 +596,15 @@ class BurstSamplingHypothesesUpdater:
             # informed hypotheses
             sampling_multiplier = min(self.sampling_multiplier, num_hyps_per_node)
 
+            # T6.6a: Context biasing — scale sampling_multiplier by the graph's
+            # context weight. Graphs associated with the HPC's active concepts
+            # get the full multiplier; non-context graphs get a reduced budget.
+            if self.context_graph_weights is not None:
+                context_weight = self.context_graph_weights.get(
+                    graph_id, self.context_exploration_budget
+                )
+                sampling_multiplier *= context_weight
+
             # Calculate the total number of informed hypotheses to be sampled
             new_informed = round(graph_num_points * sampling_multiplier)
 
@@ -552,18 +665,21 @@ class BurstSamplingHypothesesUpdater:
                 poses=np.zeros((0, 3, 3)),
                 evidence=np.zeros(0),
                 possible=np.zeros(0, dtype=np.bool_),
+                scales=np.zeros(0),
             )
 
         # Update tracker by removing the remove_ids
         tracker.remove_hyp(hypotheses_selection.remove_ids, input_channel)
 
         channel_hypotheses = mapper.extract_hypotheses(hypotheses, input_channel)
+        ch_scales = channel_hypotheses.scales
         return ChannelHypotheses(
             input_channel=channel_hypotheses.input_channel,
             locations=channel_hypotheses.locations[maintain_ids],
             poses=channel_hypotheses.poses[maintain_ids],
             evidence=channel_hypotheses.evidence[maintain_ids],
             possible=channel_hypotheses.possible[maintain_ids],
+            scales=ch_scales[maintain_ids] if ch_scales is not None else None,
         )
 
     def _sample_informed(
@@ -615,6 +731,7 @@ class BurstSamplingHypothesesUpdater:
                 poses=np.zeros((0, 3, 3)),
                 evidence=np.zeros(0),
                 possible=np.zeros(0, dtype=np.bool_),
+                scales=np.zeros(0),
             )
 
         num_hyps_per_node = self._num_hyps_per_node(channel_features)
@@ -648,6 +765,22 @@ class BurstSamplingHypothesesUpdater:
                 : int(informed_count // num_hyps_per_node)
             ]
             node_feature_evidence_filtered = np.zeros(len(top_indices))
+
+        # T6.13: Store burst ranking data for telemetry and logging.
+        if self.use_features_for_matching.get(input_channel, False):
+            self._burst_ranking[(graph_id, input_channel)] = dict(
+                node_evidence=node_feature_evidence,
+                top_k_indices=top_indices,
+            )
+            k = len(top_indices)
+            n = len(node_feature_evidence)
+            logger.debug(
+                "Burst ranking: graph=%s channel=%s top-%d/%d nodes, "
+                "max_ev=%.3f min_top_ev=%.3f",
+                graph_id, input_channel, k, n,
+                node_feature_evidence.max() if n > 0 else 0,
+                node_feature_evidence[top_indices].min() if k > 0 else 0,
+            )
 
         selected_feature_evidence = np.tile(
             node_feature_evidence_filtered, num_hyps_per_node
@@ -695,6 +828,18 @@ class BurstSamplingHypothesesUpdater:
         # Newly sampled hypotheses cannot be marked as possible
         possible_hyp = np.zeros_like(selected_feature_evidence, dtype=np.bool_)
 
+        # Multi-scale: replicate burst-sampled hypotheses at each scale factor
+        if self.scale_factors is not None and len(self.scale_factors) > 1:
+            n_base = len(selected_feature_evidence)
+            k = len(self.scale_factors)
+            selected_locations = np.tile(selected_locations, (k, 1))
+            selected_rotations = np.tile(selected_rotations, (k, 1, 1))
+            selected_feature_evidence = np.tile(selected_feature_evidence, k)
+            possible_hyp = np.tile(possible_hyp, k)
+            scales = np.repeat(self.scale_factors, n_base)
+        else:
+            scales = np.ones(len(selected_feature_evidence))
+
         # Add hypotheses to slope trackers
         tracker.add_hyp(selected_feature_evidence.shape[0], input_channel)
 
@@ -704,6 +849,115 @@ class BurstSamplingHypothesesUpdater:
             poses=selected_rotations,
             evidence=selected_feature_evidence,
             possible=possible_hyp,
+            scales=scales,
+        )
+
+    def _sample_offspring(
+        self,
+        hypotheses: Hypotheses,
+        input_channel: str,
+        mapper: ChannelMapper,
+        tracker: EvidenceSlopeTracker,
+    ) -> ChannelHypotheses:
+        """T6.13a: Create refinement hypotheses near high-evidence parents.
+
+        When not bursting and a hypothesis has evidence above threshold,
+        this creates jittered copies with small perturbations in location
+        and rotation. This is the particle-filter-like sharpening needed
+        for precise pose estimation once object ID is confident.
+
+        Args:
+            hypotheses: Current hypotheses for the graph.
+            input_channel: Channel to refine.
+            mapper: Channel mapper for the graph.
+            tracker: Slope tracker for this graph.
+
+        Returns:
+            ChannelHypotheses with offspring (may be empty).
+        """
+        empty = ChannelHypotheses(
+            input_channel=input_channel,
+            locations=np.zeros((0, 3)),
+            poses=np.zeros((0, 3, 3)),
+            evidence=np.zeros(0),
+            possible=np.zeros(0, dtype=np.bool_),
+            scales=np.zeros(0),
+        )
+
+        if not self.offspring_enabled or self.sampling_burst_steps > 0:
+            return empty
+
+        if input_channel not in mapper.channels:
+            return empty
+
+        ch_start, ch_end = mapper.channel_range(input_channel)
+        ch_evidence = hypotheses.evidence[ch_start:ch_end]
+        if len(ch_evidence) == 0:
+            return empty
+
+        # Find hypotheses above threshold
+        above_mask = ch_evidence >= self.offspring_evidence_threshold
+        if not above_mask.any():
+            return empty
+
+        # Select top parents by evidence, capped at offspring_count
+        above_indices = np.where(above_mask)[0]
+        n_parents = min(len(above_indices), self.offspring_count)
+        top_parents = above_indices[
+            np.argsort(ch_evidence[above_indices])[-n_parents:]
+        ]
+
+        # Get parent locations/poses in channel range
+        ch_locations = hypotheses.locations[ch_start:ch_end]
+        ch_poses = hypotheses.poses[ch_start:ch_end]
+        ch_scales = (
+            hypotheses.scales[ch_start:ch_end]
+            if hypotheses.scales is not None
+            else None
+        )
+
+        parent_locs = ch_locations[top_parents]
+        parent_poses = ch_poses[top_parents]
+        parent_evidence = ch_evidence[top_parents]
+        parent_scales = ch_scales[top_parents] if ch_scales is not None else None
+
+        # Jitter locations: Gaussian perturbation
+        rng = np.random.default_rng()
+        loc_noise = rng.normal(0, self.offspring_location_jitter, parent_locs.shape)
+        offspring_locs = parent_locs + loc_noise
+
+        # Jitter rotations: small random rotation composed with parent
+        jitter_rad = np.deg2rad(self.offspring_rotation_jitter_deg)
+        angle_noise = rng.normal(0, jitter_rad, (n_parents, 3))
+        offspring_poses = np.empty_like(parent_poses)
+        for i in range(n_parents):
+            parent_rot = Rotation.from_matrix(parent_poses[i])
+            jitter_rot = Rotation.from_rotvec(angle_noise[i])
+            offspring_poses[i] = (jitter_rot * parent_rot).as_matrix()
+
+        # Offspring start with parent's evidence (they refine, not discover)
+        offspring_evidence = parent_evidence.copy()
+        offspring_possible = np.zeros(n_parents, dtype=np.bool_)
+        offspring_scales = (
+            parent_scales.copy() if parent_scales is not None
+            else np.ones(n_parents)
+        )
+
+        tracker.add_hyp(n_parents, input_channel)
+
+        logger.debug(
+            "Offspring: channel=%s spawned %d from %d parents (max_ev=%.2f)",
+            input_channel, n_parents, len(above_indices),
+            parent_evidence.max(),
+        )
+
+        return ChannelHypotheses(
+            input_channel=input_channel,
+            locations=offspring_locs,
+            poses=offspring_poses,
+            evidence=offspring_evidence,
+            possible=offspring_possible,
+            scales=offspring_scales,
         )
 
     def _max_global_slope(self) -> float:

@@ -561,6 +561,9 @@ class DetailedGraphMatchingLogger(BasicGraphMatchingLogger):
 
         buffer_data = {}
         for i, lm in enumerate(model.learning_modules):
+            # Skip LMs without evidence-based matching (e.g., HippocampalModule)
+            if not hasattr(lm, "evidence"):
+                continue
             lm_dict = {}
             lm_dict.update(logger_args)
             lm_dict.update({"locations": lm.buffer.locations})
@@ -635,6 +638,9 @@ class SelectiveEvidenceLogger(BasicGraphMatchingLogger):
 
         buffer_data = {}
         for i, lm in enumerate(model.learning_modules):
+            # Skip LMs without evidence-based matching (e.g., HippocampalModule)
+            if not hasattr(lm, "evidence"):
+                continue
             lm_dict = {}
             lm_dict.update(
                 {

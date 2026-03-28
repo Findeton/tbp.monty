@@ -92,6 +92,95 @@ T1.4a) have diminishing returns. The highest-leverage work is at the
 Layer 1 → Layer 2 boundary: novelty detection, feature contribution analysis,
 and cross-episode memory.
 
+### Feature ablation + category bias results (2026-03-21)
+
+Five eval runs (224 episodes each, 1120 total) confirm the Layer 1 ceiling
+and reveal the contribution of each feature:
+
+```
+VARIANT             OVERALL  SHAPE-CONG  SHAPE-INC
+--------------------------------------------------
+baseline (all)        67.9%       92.2%      14.3%
+no_hsv                65.6%       90.9%      10.0%
+no_curvature          66.1%       93.5%       5.7%
+pose_only              0.0%        0.0%       0.0%
+catbias (0.1)         61.2%       84.4%      10.0%
+```
+
+Key findings:
+1. **Pose vectors carry zero discriminative signal** (0% across the board).
+   Essential for exploration but not identification.
+2. **Curvature is the primary discriminative feature.** Removing it drops
+   shape-incongruent from 14.3% → 5.7%. It's the main signal distinguishing
+   cans from boxes and tools from utensils.
+3. **HSV has mixed effects.** Helps utensils and fruits slightly, hurts cups.
+   Net contribution small but positive.
+4. **Category bias (T1.4a) HURTS overall** (67.9% → 61.2%). Exactly as
+   predicted: it destroys fruit accuracy (100% → 64.3%) by biasing toward
+   wrong categories. Only helps clamp (71% → 86%) and can (21% → 29%).
+5. **The baseline feature set is already near-optimal for Layer 1.** No
+   ablation or bias mechanism improves overall accuracy. The 67.9% ceiling
+   is the empirical limit of shape-based matching with current features.
+
+**Novelty detection (T1.N)** validated: evidence margin separates confident
+predictions (86.2% accuracy) from uncertain ones (50.4%), a 35.8pp split.
+
+### Root cause analysis (2026-03-21)
+
+First-principles analysis of the ball 0% failure mode revealed that the
+previous diagnosis ("balls need behavioral/non-geometric information") was
+**wrong**. The actual root cause is a scale mismatch in spatial matching:
+
+1. **No scale invariance.** (`detected_scale: 1, # TODO: scale doesn't work
+   yet`). All hypotheses are initialized at scale=1. Holdout balls (golf ball
+   4.3cm, racquetball 5.7cm) are smaller than all training balls (6.7-12.8cm).
+2. **Spatial gate blocks all evidence.** `max_match_distance = 0.01m` (1cm).
+   A golf ball surface point is 1.5cm away from a baseball surface point at
+   scale=1. This exceeds the threshold → zero spatial matches → zero evidence
+   for ALL spheres (balls AND fruits).
+3. **Large graphs win by accident.** With `evidence_size_norm_power = 0`, a
+   4894-node airplane has 8x more accidental spatial matches than a 427-node
+   orange, regardless of feature quality. Holdout balls match airplanes and
+   clamps, not fruits.
+4. **HSV saturation DOES distinguish balls from fruits** (0.35 vs 0.84, a
+   2.4x difference), but this signal never fires because the spatial gate
+   blocks evidence before features are compared.
+
+Analytical simulation (seconds, no Habitat) confirmed: at
+`max_match_distance = 0.02m`, baseball becomes #1 match for a golf-ball-sized
+query. With scale-invariant matching, baseball is #1 and ball/fruit separation
+is clear. The features were always sufficient — the matching pipeline
+couldn't access them.
+
+**The path forward is fixing the matching pipeline (scale invariance,
+evidence size normalization, feature weights), not Track 2 behavioral
+memory.** Track 2 remains important for genuine Layer 2 concepts (dangerous,
+useful, heavy) but is NOT needed for the ball→fruit canary.
+
+## Methodology: Analytical-First Testing
+
+**Every hypothesis MUST be tested analytically before running Habitat evals.**
+
+Full eval runs take 1-4 hours per variant. Analytical tests using stored graph
+data take seconds. The analytical-first methodology:
+
+1. **Load trained graphs** from `model.pt` (has node positions, features,
+   graph structure for all 34 objects)
+2. **Simulate the query** — generate synthetic observation points matching
+   the holdout object's geometry (sphere for balls, etc.)
+3. **Compute matching analytically** — for each training graph, find spatial
+   neighbors, compute feature similarity, sum evidence
+4. **Sweep parameters** — test different match distances, feature weights,
+   normalization powers in a loop
+5. **Only run Habitat eval for the winning config** — confirms that the
+   analytical prediction holds in the full iterative pipeline
+
+This methodology caught the scale mismatch root cause in seconds. Running
+5 Habitat ablation experiments (1120 episodes, hours) did NOT catch it
+because the experiments varied features, not matching parameters.
+
+**Rule: if you can test it with stored graph data, do that first.**
+
 ### Three fundamental restrictions
 All remaining cognitive capabilities are blocked by three restrictions in the
 current implementation. These are not bugs or missing features — they are
@@ -162,14 +251,18 @@ empirical boundary of Layer 1.
 Requires: sensors + graphs + multi-column voting + evidence readout.
 Heterarchy needed: static peer voting (already works).
 
-### Layer 1→2 boundary (empirically measured)
-The extended YCB results quantify the transition between layers. Categories
-defined by shape (airplane, cup, fruit) are near-solved by Layer 1. Categories
-defined by function (ball vs fruit, tool vs utensil) require interaction history
-— Layer 2 concepts. No amount of visual feature engineering will teach the
-system that a golf ball is not food. That requires "I threw it and it bounced"
-vs "I bit it and it was sweet." This boundary is the most important finding
-for roadmap prioritization.
+### Layer 1→2 boundary (revised 2026-03-21)
+The original analysis claimed that ball→fruit confusion marks the Layer 1→2
+boundary (needing behavioral memory). Root cause analysis proved this wrong:
+holdout balls fail because of **scale mismatch** (no scale hypotheses) and
+**evidence size bias** (large graphs win by node count), not because geometry
+is insufficient. HSV saturation (0.35 vs 0.84) already distinguishes balls
+from fruits — the spatial gate blocks this signal from ever being evaluated.
+
+The true Layer 1→2 boundary is NOT yet measured. It can only be measured
+after scale-invariant matching is implemented, which will raise the Layer 1
+ceiling above 67.9%. The remaining failures after that fix will mark the
+real boundary where behavioral/functional knowledge is needed.
 
 ### Layer 2: Behavioral/associative concepts (dangerous, useful, heavy, food)
 Associations between structural patterns and interaction outcomes.
@@ -340,10 +433,16 @@ scaffolding.
 | T4.1: Evidence logging | Per-graph evidence in eval stats | **Done** |
 | T4.2: Distance-aware metrics | Graded evaluation replacing binary accuracy | **Done** |
 | T4.3: Category readout tool | Post-hoc category-aggregated scoring | **Done** |
-| T4.4: Faster matching | Approximate nearest neighbor, GPU acceleration | Planned |
-| T4.5: Dynamic hypothesis management | Prune low-evidence hypotheses during matching | Planned |
+| T4.4: Faster matching | Approximate nearest neighbor, GPU acceleration | Planned (see [Track 6](track-6-predictive-coding-heterarchy.md) T6.7) |
+| T4.5: Dynamic hypothesis management | Prune low-evidence hypotheses during matching | Planned (see [Track 6](track-6-predictive-coding-heterarchy.md) T6.11–T6.16) |
 | T4.6: Checkpoint infrastructure | Reliable save/load/merge across experiments | Ongoing |
-| T4.7: Parallel execution | Multi-process LMs, distributed experiments | Planned |
+| T4.7: Parallel execution | Multi-process LMs, distributed experiments | Planned (see [Track 6](track-6-predictive-coding-heterarchy.md) T6.8) |
+
+Detailed plans for T4.4, T4.5, and T4.7 (including learned hypothesis
+proposal, KDTree/FAISS acceleration, and GIL-free parallelism) are in
+[Track 6: Predictive Coding Heterarchy](track-6-predictive-coding-heterarchy.md),
+which consolidates all inter-LM communication, error-modulated learning,
+and scalability work.
 
 ## Heterarchy Is Not A Phase
 
@@ -357,12 +456,17 @@ capabilities:
 | Level | Mechanism | What needs it | Status |
 |---|---|---|---|
 | Static peer voting | Fixed vote matrix, pose-space agreement | Categories (Layer 1) | **Working** |
-| Context-dependent routing | Dynamic who-talks-to-whom based on current evidence | Behavior, manipulation | Not started |
+| Conditional voting | Confidence/confusion-gated directed voting | Convergence speed | **Working** (Mode B) |
+| Temporal voting | Prediction-error-gated directed voting | Behavior, state tracking | **Working** (Mode C) |
+| Unified predictive voting | Combined surprise + cardinality gating | All tracks | Planned ([Track 6](track-6-predictive-coding-heterarchy.md) T6.5) |
+| Top-down prediction | Parent predicts child state, child sends errors | Composition, scalability | Planned ([Track 6](track-6-predictive-coding-heterarchy.md) T6.9–T6.12) |
 | Cross-modal routing | Visual ↔ text ↔ motor module communication | Language grounding | Not started |
 | Recursive composition | Modules chaining logical steps sequentially | Formal reasoning | Theoretical |
 
 Each level should be developed alongside the track that needs it, not as a
-separate phase.
+separate phase. The full predictive coding heterarchy plan (error-modulated
+learning, surprise-gated communication, top-down prediction, hypothesis
+proposal) is in [Track 6](track-6-predictive-coding-heterarchy.md).
 
 ## Hippocampal Integration: The Bridge To Higher Layers
 
@@ -459,83 +563,91 @@ For this roadmap, a "full system" means a system that can:
 
 ## Go/No-Go Gates
 
-### Gate 1: Novelty Detection (Track 1, T1.N)
-If the evidence margin does not reliably separate correct from incorrect
-category assignments across both YCB and Omniglot benchmarks, the confidence
-signal is not trustworthy and the system cannot know what it doesn't know.
-This would mean the evidence distribution is too flat to extract useful
-uncertainty information.
+### Gate 1: Novelty Detection (Track 1, T1.N) — PASSED (2026-03-21)
+Evidence margin reliably separates correct from incorrect: 86.2% accuracy
+on confident predictions vs 50.4% on uncertain (35.8pp separation).
+Implemented in `logging_utils.py` and `phase2_category_evidence_readout.py`.
 
-### Gate 2: Category Bias Double-Edge (Track 1, T1.4a)
-Before implementation, predict: T1.4a will improve shape-congruent accuracy
-and degrade shape-incongruent accuracy on extended YCB. If the prediction
-holds, the mechanism is understood (proceed to T1.R2). If it DOESN'T hold
-(e.g., both improve or both degrade), our model of the evidence dynamics is
-wrong and needs revision before building more complex mechanisms on top.
+### Gate 2: Category Bias Double-Edge (Track 1, T1.4a) — FAILED (2026-03-21)
+Prediction was: shape-congruent improves, shape-incongruent degrades. Actual
+result: BOTH degrade. Overall: 67.9% → 61.2% (-6.7pp). Fruit destroyed
+(100% → 64.3%). The normalized category evidence creates misleading signals.
+**Conclusion**: T1.4a is a dead end. Category bias should NOT be used for
+evidence accumulation on this benchmark. T1.4b (cross-LM bias) is also
+deprioritized as it depends on the same mechanism.
 
-### Gate 3: Ball→Fruit Canary (Track 2, T2.1-T2.2)
-The ball→fruit confusion (0% accuracy, margin 1.3) is the primary canary for
-Layer 2 capability. After wiring cross-episode memory, if the system still
-cannot distinguish balls from fruits given interaction episodes (bounce vs
-squish), the episodic memory design needs revision. Note: this is a HARDER
-test than the original cup state discrimination plan, and it directly tests
-whether Layer 2 concepts are forming.
+### Gate 3: Feature Ablation (Track 1, T1.FA) — PASSED (2026-03-21)
+Five runs (1120 episodes) confirm:
+- Curvature is the primary discriminative feature (removing it: 14.3% → 5.7%)
+- HSV has mixed effects (net slightly positive)
+- Pose vectors carry zero discriminative signal (0% across the board)
+- Baseline feature set is already near-optimal for Layer 1
+**Conclusion**: No feature engineering path improves the 67.9% ceiling.
+The path forward is Track 2 (behavioral memory).
 
-### Gate 4: CMP Enrichment (Track 1, T1.R2)
-If making LM outputs available as features to other LMs destabilizes the
-evidence matching pipeline or the auto-tolerance mechanism produces poor
-matches, a more constrained CMP protocol is needed. Test by comparing
-cross-LM category bias (T1.4b) against single-LM bias (T1.4a) — the cross-LM
-version should improve or at least not degrade.
+### Gate 4: Ball→Fruit Canary — REDIAGNOSED (2026-03-21)
+The ball 0% was originally attributed to the Layer 1→2 boundary (needing
+behavioral memory). First-principles root cause analysis proved this wrong:
+the actual cause is **scale mismatch + evidence size bias** in the matching
+pipeline. Analytical testing confirms that scale-invariant matching puts
+ball as #1 in seconds. This gate is now a **Layer 1 matching fix**, not a
+Layer 2 problem.
 
-### Gate 5: Hippocampal Replay (Restriction 1)
+### Gate 5: Hippocampal Replay (Restriction 1) — OPEN
 If replaying stored episodes to downstream LMs does not cause them to build
 useful non-sensory models, the reference-frame-reuse hypothesis may be wrong
 and abstract concepts may require genuinely different computational mechanisms.
 
 ## Immediate Priority Stack
 
-Updated 2026-03-20 based on extended YCB evidence boundary analysis.
+Updated 2026-03-21 based on root cause analysis of ball 0%.
 
-1. **T1.N**: Novelty detection via evidence margin.
-   Cheapest possible win (~10 lines). Teaches the system to say "I don't know
-   this exact object but it's most similar to category X." Tests on both
-   Omniglot and extended YCB. Unlocks a qualitatively new capability.
-2. **T1.FA**: Feature ablation study.
-   HSV on/off, curvature on/off. Understand what each feature contributes.
-   May reveal features adding noise. Directly informs T1.R2 design. Low cost
-   (re-run eval with modified configs, no retraining).
-3. **T1.4a**: Online category bias with split evaluation.
-   Predict before running: shape-congruent improves, shape-incongruent degrades.
-   Measure both on extended YCB and Omniglot. Result is informative regardless
-   of direction. Gated on Gate 2 prediction.
-4. **T2.1-T2.2**: Cross-episode memory + state discrimination + ball→fruit
-   canary.
-   Promoted from position 3 → 4 in execution (after T1.4a establishes Layer 1
-   ceiling precisely) but promoted in IMPORTANCE: this is the gate to Layer 2
-   and the only path to the remaining 30% of categories.
-5. **T1.R2**: CMP enrichment (lifts Restriction 2).
-   ~20 lines of core change. Informed by T1.FA (which features matter) and
-   T1.4a (what signal to pass between LMs).
-6. **T1.4b + T1.5 + HPC context**: Cross-LM category bias, top-down biasing,
-   hippocampal context reaching matching LMs. All enabled by T1.R2.
+The ball→fruit canary is NOT a Layer 2 problem — it's a Layer 1 matching
+pipeline bug (no scale invariance, no evidence size normalization). The
+67.9% ceiling is NOT the true Layer 1 ceiling; it's an artifact of the
+spatial matching gate blocking cross-scale evidence.
+
+1. **T1.S: Scale-invariant matching** — the #1 priority.
+   Add scale as a hypothesis dimension. Analytical test proves ball becomes #1
+   match. Expected impact: ball 0% → >0%, shape-incongruent improves broadly.
+   Also fixes any cross-scale confusion (small objects matching large objects
+   by accident).
+2. **T1.SN: Evidence size normalization** — complementary to T1.S.
+   Set `evidence_size_norm_power > 0`. Removes the advantage of large graphs
+   (4894-node airplane vs 427-node orange). Config-only change.
+3. **T1.SW: Saturation weight tuning** — use the signal that's already there.
+   Increase HSV saturation weight from 0.5 to 2.0. Saturation is the most
+   discriminative feature between balls (0.35) and fruits (0.84) but is
+   currently under-weighted. Config-only change.
+4. **T2.1-T2.2**: Cross-episode memory + genuine Layer 2 concepts.
+   Still important for real behavioral concepts (dangerous, useful, heavy),
+   but no longer needed for the ball canary. Deprioritized until T1.S proves
+   that the matching pipeline is working correctly.
+5. **T1.5**: Top-down biasing. After T1.S validates scale matching.
+6. **T3.3**: Spatial relation language.
 
 ## Scorecard
 
 | Area | Readiness | Evidence |
 |---|---|---|
 | Static grounded recognition | L4 | Robust YCB results |
-| Category gen. (shape-congruent) | L4 | 93.2% on ext. YCB (airplane, cup, fruit, utensil, box, clamp) |
-| Category gen. (shape-incongruent) | L1 | 15.7% on ext. YCB (ball, tool, can); requires Layer 2 |
+| Category gen. (shape-congruent) | L4 | 92.2% on ext. YCB; confirmed ceiling by 5 ablations |
+| Category gen. (shape-incongruent) | L1 | 14.3% on ext. YCB; ball 0% caused by scale mismatch not feature gap |
 | Category gen. (Omniglot) | L3 | +10pp cross-version; 70% ceiling from spatial features |
-| Novelty detection | L1 | Evidence margin signal proven informative but not exploited |
+| Novelty detection | L4 | 86.2% confident vs 50.4% uncertain (35.8pp separation) |
+| Feature contribution analysis | L4 | 5 runs, 1120 eps: curvature > HSV > pose (for identity) |
+| Category bias (T1.4a) | L4 | Tested, failed: -6.7pp overall (dead end on ext. YCB) |
+| CMP enrichment (T1.R2) | L3 | API implemented, ready for Track 2 integration |
 | Compositional part-whole | L2 | Prototype exists, negative result vs monolithic |
 | Lateral voting / heterarchy | L4 | 44% faster convergence, category subgraph wins |
 | Category subgraph extraction | L3 | 100% offline accuracy, 25% online win rate (Omniglot) |
 | Evidence-per-graph logging | L5 | Integrated into eval pipeline |
 | Distance-aware evaluation | L3 | Tool built, validated on YCB and Omniglot |
 | Extended YCB benchmark | L3 | 50 objects, 9 categories, decomposed metric, reproducible |
-| Hippocampal module | L2 | 665 lines, 31 tests, 4 memory systems, wired but not functional |
+| Hippocampal module | L3 | 700+ lines, 53 tests, 4 memory systems, wired + integration tested |
+| Scale-invariant matching | L1 | Root cause identified, analytical fix validated, code TODO |
+| Evidence size normalization | L1 | Confound identified, config-only fix ready |
+| Analytical-first testing | L5 | Methodology proven: seconds vs hours, caught root cause |
 | Time and state | L0 | No implementation |
 | Behavior learning | L0 | No implementation |
 | Prediction | L1 | Implicit in matching (hypothesis-conditioned expectations) |
@@ -563,8 +675,8 @@ is currently active.
 | Track | Index Document | Active Investigation |
 |---|---|---|
 | (pre-track) | — | [Phase 0: Baseline Discipline](phase-0-baseline-discipline.md) (completed) |
-| Track 1 | [track-1-multi-column-intelligence.md](track-1-multi-column-intelligence.md) | T1.N novelty detection (next) |
-| Track 2 | [track-2-temporal-world-model.md](track-2-temporal-world-model.md) | Infrastructure wired; ball→fruit canary defined |
+| Track 1 | [track-1-multi-column-intelligence.md](track-1-multi-column-intelligence.md) | **T1.S scale-invariant matching (#1 priority)** |
+| Track 2 | [track-2-temporal-world-model.md](track-2-temporal-world-model.md) | Mechanism complete (53 tests); deprioritized until T1.S done |
 | Track 3 | [track-3-grounding-bridge.md](track-3-grounding-bridge.md) | T3.1-T3.2 done (naming bridge) |
 | Track 4 | (in roadmap) | Cross-cutting engineering |
 
