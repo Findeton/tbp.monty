@@ -417,6 +417,7 @@ class CorticalColumn:
         self._activate_cells(active_segments, apical_active_segments)
 
         # 5. Attractor settling (if enabled)
+        settling_iterations = 0
         if self._use_attractor:
             settled, settled_mc, n_iters = self._recurrent.settle(
                 self._active_mask,
@@ -425,6 +426,7 @@ class CorticalColumn:
             )
             self._active_mask[:] = settled
             self._active_mc_mask[:] = settled_mc
+            settling_iterations = n_iters
 
         # 6. Surprise
         n_active = int(self._active_mc_mask.sum())
@@ -544,6 +546,7 @@ class CorticalColumn:
             "mlh": self._get_mlh(),
             "active_cells": set(np.where(self._active_mask)[0].tolist()),
             "motor_prediction_error": motor_pred_error,
+            "settling_iterations": settling_iterations,
         }
 
     # ------------------------------------------------------------------
@@ -1043,4 +1046,5 @@ class CorticalColumn:
             "mlh": {"graph_id": None, "evidence": 0.0},
             "active_cells": set(),
             "motor_prediction_error": 0.0,
+            "settling_iterations": 0,
         }

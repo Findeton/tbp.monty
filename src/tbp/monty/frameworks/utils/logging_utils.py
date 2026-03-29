@@ -797,9 +797,10 @@ def add_evidence_lm_episode_stats(lm, stats, consistent_child_objects):
         try:
             graph_ids, graph_evidences = lm.get_evidence_for_each_graph()
             if len(graph_ids) > 0:
-                stats["evidence_per_graph"] = {
+                import json
+                stats["evidence_per_graph"] = json.dumps({
                     gid: float(ev) for gid, ev in zip(graph_ids, graph_evidences)
-                }
+                })
                 # Novelty detection: compute category evidence margin
                 if hasattr(lm, "category_taxonomy") and lm.category_taxonomy:
                     from collections import defaultdict

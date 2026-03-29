@@ -492,6 +492,22 @@ class FeatureAtLocationBuffer:
             attr_name: Name of the feature.
             attr_value: Value of the feature.
         """
+        # String/non-numeric features (e.g. graph_id from LM outputs) are
+        # stored in a separate list-based buffer since they cannot be put
+        # into a float numpy array.
+        if isinstance(attr_value, str):
+            if attr_name not in self.features[input_channel]:
+                self.features[input_channel][attr_name] = (
+                    [None] * len(self) + [attr_value]
+                )
+            else:
+                existing = self.features[input_channel][attr_name]
+                # Pad if needed
+                while len(existing) < len(self):
+                    existing.append(None)
+                existing.append(attr_value)
+            return
+
         if isinstance(attr_value, (int, float, bool)):
             attr_shape = 1
         else:

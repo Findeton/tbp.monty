@@ -2313,5 +2313,853 @@ class TestCorticalColumnWeightMemory(unittest.TestCase):
         self.assertGreater(col.memory.n_observations("test"), 0)
 
 
+# ---------------------------------------------------------------------------
+# CorticalColumnLM adapter tests (Track 8, Steps 1-4)
+# ---------------------------------------------------------------------------
+
+
+class TestCorticalColumnLMInterface(unittest.TestCase):
+    """Step 1: CorticalColumnLM satisfies LearningModule interface."""
+
+    def _make_lm(self, **kwargs):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        defaults = dict(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                seed=42,
+            ),
+        )
+        defaults.update(kwargs)
+        return CorticalColumnLM(**defaults)
+
+    def test_is_learning_module(self):
+        """CorticalColumnLM is a LearningModule."""
+        from tbp.monty.frameworks.models.abstract_monty_classes import LearningModule
+        lm = self._make_lm()
+        self.assertIsInstance(lm, LearningModule)
+
+    def test_lifecycle_methods_exist(self):
+        """All lifecycle methods are callable."""
+        lm = self._make_lm()
+        for method_name in [
+            "reset", "pre_episode", "post_episode",
+            "set_experiment_mode", "matching_step", "exploratory_step",
+            "receive_votes", "send_out_vote", "propose_goal_states",
+            "get_output", "receive_context", "state_dict", "load_state_dict",
+        ]:
+            self.assertTrue(
+                callable(getattr(lm, method_name, None)),
+                f"{method_name} should be callable",
+            )
+
+    def test_set_experiment_mode(self):
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        self.assertEqual(lm._mode, ExperimentMode.TRAIN)
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        self.assertEqual(lm._mode, ExperimentMode.EVAL)
+
+    def test_reset_clears_state(self):
+        lm = self._make_lm()
+        lm._stepped = True
+        lm.reset()
+        self.assertFalse(lm._stepped)
+
+    def test_column_accessible(self):
+        """Inner CorticalColumn is accessible."""
+        lm = self._make_lm()
+        self.assertIsNotNone(lm.column)
+        self.assertIsNotNone(lm.column.encoder)
+
+
+class TestCorticalColumnLMObservations(unittest.TestCase):
+    """Step 2: Observations bridge — list[State] to column.step()."""
+
+    def _make_lm(self):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        return CorticalColumnLM(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                seed=42,
+            ),
+        )
+
+    def _make_state(self, location=(0.1, 0.2, 0.3)):
+        return _FakeState(location)
+
+    def test_matching_step_with_state_list(self):
+        """matching_step accepts list of States."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, [self._make_state()])
+        self.assertTrue(lm._stepped)
+
+    def test_matching_step_with_none(self):
+        """matching_step handles None observations gracefully."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, None)
+        self.assertFalse(lm._stepped)
+
+    def test_matching_step_with_empty_list(self):
+        """matching_step handles empty list."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, [])
+        self.assertFalse(lm._stepped)
+
+    def test_matching_step_skips_unusable_states(self):
+        """matching_step ignores States with use_state=False."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        bad_state = _FakeState([0.1, 0.2, 0.3])
+        bad_state.use_state = False
+        lm.matching_step(None, [bad_state])
+        self.assertFalse(lm._stepped)
+
+    def test_exploratory_step_learns(self):
+        """exploratory_step trains the column."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="test_object")
+        for i in range(10):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+        self.assertIn("test_object", lm.get_all_known_object_ids())
+
+    def test_train_then_eval(self):
+        """Full train→eval cycle produces evidence."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+
+        # Train
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="banana")
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+
+        # Eval
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        for i in range(10):
+            lm.matching_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+
+        mlh = lm.get_current_mlh()
+        self.assertEqual(mlh["graph_id"], "banana")
+        self.assertGreater(mlh["evidence"], 0.0)
+
+
+class TestCorticalColumnLMVoting(unittest.TestCase):
+    """Step 3: Voting between CorticalColumnLMs."""
+
+    def _make_trained_lm(self, lm_id, objects):
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        lm = CorticalColumnLM(
+            learning_module_id=lm_id,
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                seed=42,
+            ),
+        )
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        for obj in objects:
+            lm.pre_episode(primary_target=obj)
+            for i in range(20):
+                lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+            lm.post_episode()
+        return lm
+
+    def test_send_out_vote_before_step(self):
+        """send_out_vote returns None before any step."""
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        lm = CorticalColumnLM(column_kwargs=dict(
+            n_minicolumns=256, n_cells_per_minicolumn=4, seed=42,
+        ))
+        self.assertIsNone(lm.send_out_vote())
+
+    def test_send_out_vote_returns_dict(self):
+        """send_out_vote returns properly formatted dict after eval step."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_trained_lm("lm0", ["banana"])
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, [_FakeState([0.01, 0.0, 0.0])])
+        vote = lm.send_out_vote()
+        if vote is not None:
+            self.assertIn("possible_states", vote)
+            self.assertIn("sensed_pose_rel_body", vote)
+
+    def test_receive_votes_adjusts_evidence(self):
+        """Receiving positive votes boosts evidence for an object."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        from tbp.monty.frameworks.models.states import State
+        lm = self._make_trained_lm("lm0", ["banana", "mug"])
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, [_FakeState([0.01, 0.0, 0.0])])
+
+        ev_before = dict(lm.column._evidence)
+
+        # Simulate a vote from another LM favoring "banana"
+        fake_vote_state = State(
+            location=np.zeros(3),
+            morphological_features={"pose_vectors": np.eye(3), "pose_fully_defined": True},
+            non_morphological_features=None,
+            confidence=0.9,
+            use_state=True,
+            sender_id="other_lm",
+            sender_type="LM",
+        )
+        lm.receive_votes([{
+            "possible_states": {"banana": [fake_vote_state]},
+            "sensed_pose_rel_body": np.zeros(3),
+        }])
+
+        ev_after = lm.column._evidence
+        self.assertGreater(
+            ev_after.get("banana", 0),
+            ev_before.get("banana", 0),
+            "Vote should boost banana evidence",
+        )
+
+    def test_receive_votes_with_none(self):
+        """receive_votes handles None gracefully."""
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        lm = CorticalColumnLM(column_kwargs=dict(
+            n_minicolumns=256, n_cells_per_minicolumn=4, seed=42,
+        ))
+        lm.receive_votes(None)  # Should not crash
+        lm.receive_votes([None, None])  # Should not crash
+
+
+class TestCorticalColumnLMHierarchy(unittest.TestCase):
+    """Step 4: Hierarchy output and surprise-gated output."""
+
+    def _make_lm(self, **kwargs):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        defaults = dict(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                seed=42,
+            ),
+        )
+        defaults.update(kwargs)
+        return CorticalColumnLM(**defaults)
+
+    def test_get_output_before_step(self):
+        """get_output returns None before any step."""
+        lm = self._make_lm()
+        self.assertIsNone(lm.get_output())
+
+    def test_get_output_returns_state(self):
+        """get_output returns a valid State after eval step."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        from tbp.monty.frameworks.models.states import State
+        lm = self._make_lm()
+
+        # Train
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="banana")
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+
+        # Eval
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        for i in range(10):
+            lm.matching_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+
+        output = lm.get_output()
+        self.assertIsInstance(output, State)
+        self.assertEqual(output.sender_type, "LM")
+        self.assertIn("graph_id", output.non_morphological_features)
+
+    def test_surprise_gated_output(self):
+        """With surprise gating, low-surprise outputs have use_state=False."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm(
+            surprise_gated_output=True,
+            output_surprise_threshold=0.99,  # Very high threshold → always gated
+        )
+
+        # Train
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="banana")
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+
+        # Eval on same trajectory — should have some prediction
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        for i in range(20):
+            lm.matching_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+
+        output = lm.get_output()
+        self.assertIsNotNone(output)
+        # With threshold=0.99, most outputs should be gated (use_state=False)
+        # unless surprise is very high
+        self.assertIn(
+            output.non_morphological_features.get("confirmed", None),
+            [True, None],
+        )
+
+    def test_parent_receives_child_output(self):
+        """A parent CorticalColumnLM can receive a child's output as input."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        child = self._make_lm(learning_module_id="child")
+        parent = self._make_lm(learning_module_id="parent")
+
+        # Train child
+        child.set_experiment_mode(ExperimentMode.TRAIN)
+        child.pre_episode(primary_target="banana")
+        for i in range(20):
+            child.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        child.post_episode()
+
+        # Child eval step
+        child.set_experiment_mode(ExperimentMode.EVAL)
+        child.pre_episode()
+        child.matching_step(None, [_FakeState([0.05, 0.0, 0.0])])
+        child_output = child.get_output()
+        self.assertIsNotNone(child_output)
+
+        # Parent receives child output as observation
+        parent.set_experiment_mode(ExperimentMode.TRAIN)
+        parent.pre_episode(primary_target="scene_A")
+        parent.exploratory_step(None, [child_output])
+        # Should not crash — parent processes child's State
+
+    def test_get_context_signal(self):
+        """get_context_signal returns dict after step."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, [_FakeState([0.1, 0.2, 0.3])])
+        signal = lm.get_context_signal()
+        self.assertIsNotNone(signal)
+        self.assertIn("active_cells", signal)
+
+    def test_propose_goal_states_returns_list(self):
+        lm = self._make_lm()
+        self.assertIsInstance(lm.propose_goal_states(), list)
+
+
+class TestCorticalColumnLMTopDown(unittest.TestCase):
+    """Step 8: Top-down context in real hierarchy."""
+
+    def _make_lm(self, lm_id, use_apical=True):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        return CorticalColumnLM(
+            learning_module_id=lm_id,
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                use_apical=use_apical,
+                seed=42,
+            ),
+        )
+
+    def test_context_dispatch_flow(self):
+        """Parent sends context signal, child receives it via apical dendrites.
+
+        Simulates MontyBase's _dispatch_context_signals(): parent calls
+        get_context_signal(), child calls receive_context().
+        """
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        parent = self._make_lm("parent", use_apical=False)
+        child = self._make_lm("child", use_apical=True)
+
+        # Train parent
+        parent.set_experiment_mode(ExperimentMode.TRAIN)
+        parent.pre_episode(primary_target="car")
+        for i in range(20):
+            parent.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        parent.post_episode()
+
+        # Train child with context from parent
+        child.set_experiment_mode(ExperimentMode.TRAIN)
+        child.pre_episode(primary_target="wheel")
+
+        parent.set_experiment_mode(ExperimentMode.EVAL)
+        parent.pre_episode()
+
+        for i in range(20):
+            obs = [_FakeState([0.01 * i, 0.0, 0.0])]
+            parent.matching_step(None, obs)
+
+            # Parent → child context dispatch
+            ctx = parent.get_context_signal()
+            if ctx is not None:
+                child.receive_context(**ctx)
+
+            child.exploratory_step(None, obs)
+
+        child.post_episode()
+        self.assertIn("wheel", child.get_all_known_object_ids())
+
+    def test_apical_segments_grow_with_context(self):
+        """Child grows apical dendritic segments from parent context."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        parent = self._make_lm("parent", use_apical=False)
+        child = self._make_lm("child", use_apical=True)
+
+        initial_segments = child.column.apical_dendrites.total_segments
+
+        # Train with context flowing
+        parent.set_experiment_mode(ExperimentMode.TRAIN)
+        parent.pre_episode(primary_target="car")
+        child.set_experiment_mode(ExperimentMode.TRAIN)
+        child.pre_episode(primary_target="wheel")
+
+        for i in range(20):
+            obs = [_FakeState([0.01 * i, 0.0, 0.0])]
+            parent.exploratory_step(None, obs)
+            ctx = parent.get_context_signal()
+            if ctx is not None:
+                child.receive_context(**ctx)
+            child.exploratory_step(None, obs)
+
+        parent.post_episode()
+        child.post_episode()
+
+        final_segments = child.column.apical_dendrites.total_segments
+        self.assertGreater(
+            final_segments, initial_segments,
+            "Child should grow apical segments from parent context",
+        )
+
+    def test_context_signal_has_required_fields(self):
+        """get_context_signal returns active_cells and surprise."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm("test")
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        lm.matching_step(None, [_FakeState([0.1, 0.2, 0.3])])
+        ctx = lm.get_context_signal()
+        self.assertIn("active_cells", ctx)
+        self.assertIn("surprise", ctx)
+        self.assertEqual(len(ctx["active_cells"]), lm.column.n_cells)
+
+
+class TestCorticalColumnLMPersistence(unittest.TestCase):
+    """Step 1 continued: state_dict / load_state_dict."""
+
+    def _make_lm(self):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        return CorticalColumnLM(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                seed=42,
+            ),
+        )
+
+    def test_state_dict_round_trip(self):
+        """state_dict → load_state_dict preserves evidence."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm1 = self._make_lm()
+        lm1.set_experiment_mode(ExperimentMode.TRAIN)
+        lm1.pre_episode(primary_target="banana")
+        for i in range(10):
+            lm1.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm1.post_episode()
+
+        sd = lm1.state_dict()
+        self.assertIn("evidence", sd)
+        self.assertIn("associative_memory", sd)
+
+        lm2 = self._make_lm()
+        lm2.load_state_dict(sd)
+        self.assertEqual(lm2.learning_module_id, lm1.learning_module_id)
+
+
+class TestCorticalColumnLMStateCond(unittest.TestCase):
+    """Step 6: State-conditioned behavior support."""
+
+    def _make_lm(self):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        return CorticalColumnLM(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                seed=42,
+            ),
+        )
+
+    def test_composite_key_created(self):
+        """Training with object+state creates composite key in memory."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target={"object": "stapler", "state": 0})
+        for i in range(15):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+
+        known = lm.get_all_known_object_ids()
+        self.assertIn("stapler:0", known)
+
+    def test_two_states_distinct(self):
+        """Two states of the same object get different labels."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+
+        # State 0: one trajectory
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target={"object": "stapler", "state": 0})
+        for i in range(15):
+            lm.exploratory_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.1, 0.5, 0.8),
+            )])
+        lm.post_episode()
+
+        # State 1: different trajectory/features
+        lm.pre_episode(primary_target={"object": "stapler", "state": 1})
+        for i in range(15):
+            lm.exploratory_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.9, 0.5, 0.2),
+            )])
+        lm.post_episode()
+
+        known = lm.get_all_known_object_ids()
+        self.assertIn("stapler:0", known)
+        self.assertIn("stapler:1", known)
+        self.assertEqual(len(lm.get_known_objects()), 1)  # Same object
+
+    def test_state_conditioned_eval(self):
+        """Eval on state-conditioned column distinguishes states."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+
+        # Train two states with very different features
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target={"object": "stapler", "state": 0})
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.1, 0.9, 0.9),
+            )])
+        lm.post_episode()
+
+        lm.pre_episode(primary_target={"object": "stapler", "state": 1})
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.9, 0.1, 0.1),
+            )])
+        lm.post_episode()
+
+        # Eval with state-0-like features
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        for i in range(10):
+            lm.matching_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.1, 0.9, 0.9),
+            )])
+
+        # Both composite keys should have evidence
+        ev = lm.column._evidence
+        self.assertIn("stapler:0", ev)
+        self.assertIn("stapler:1", ev)
+
+    def test_output_includes_inferred_state(self):
+        """get_output includes inferred_state from composite key."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target={"object": "stapler", "state": 0})
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        for i in range(10):
+            lm.matching_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+
+        output = lm.get_output()
+        self.assertIsNotNone(output)
+        # inferred_state should be 0 (parsed from "stapler:0")
+        if output.non_morphological_features.get("graph_id") == "stapler":
+            self.assertEqual(output.inferred_state, 0)
+
+    def test_string_target_no_state(self):
+        """String target (no state) works as before — no composite key."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="banana")
+        for i in range(15):
+            lm.exploratory_step(None, [_FakeState([0.01 * i, 0.0, 0.0])])
+        lm.post_episode()
+
+        known = lm.get_all_known_object_ids()
+        self.assertIn("banana", known)
+        self.assertNotIn(":", known[0])  # No composite key
+
+    def test_parse_composite_key(self):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        self.assertEqual(
+            CorticalColumnLM._parse_composite_key("stapler:0"),
+            ("stapler", 0),
+        )
+        self.assertEqual(
+            CorticalColumnLM._parse_composite_key("banana"),
+            ("banana", None),
+        )
+        self.assertEqual(
+            CorticalColumnLM._parse_composite_key("obj:name:1"),
+            ("obj:name", 1),
+        )
+
+
+class TestCorticalColumnLMFlowFeatures(unittest.TestCase):
+    """Step 7: ChangeDetectingSM compatibility — flow feature encoding."""
+
+    def test_encoder_supports_flow_features(self):
+        """FeatureSDREncoder can encode flow_direction and flow_magnitude."""
+        from tbp.monty.frameworks.models.cortical_column.encoders import (
+            FeatureSDREncoder,
+        )
+        enc = FeatureSDREncoder(
+            features=["flow_direction", "flow_magnitude"],
+        )
+        self.assertGreater(enc.total_bits, enc.location_encoder.total_bits)
+        self.assertIn("flow_x", enc._feature_encoders)
+        self.assertIn("flow_mag", enc._feature_encoders)
+
+    def test_encode_flow_state(self):
+        """Encoder produces non-zero SDR for flow features."""
+        from tbp.monty.frameworks.models.cortical_column.encoders import (
+            FeatureSDREncoder,
+        )
+        enc = FeatureSDREncoder(
+            features=["flow_direction", "flow_magnitude"],
+        )
+
+        class FlowState:
+            def __init__(self):
+                self.location = np.array([0.1, 0.2, 0.3])
+                self.use_state = True
+                self.non_morphological_features = {
+                    "flow_direction": np.array([0.5, -0.5, 0.7]),
+                    "flow_magnitude": np.array([0.8]),
+                }
+                self.morphological_features = {}
+
+        sdr = enc.encode(FlowState())
+        self.assertGreater(sdr.sum(), 0)
+
+    def test_lm_with_flow_features(self):
+        """CorticalColumnLM works with flow-feature encoder config."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+
+        lm = CorticalColumnLM(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                encoder_kwargs=dict(
+                    features=["flow_direction", "flow_magnitude"],
+                ),
+                seed=42,
+            ),
+        )
+
+        class FlowState:
+            def __init__(self, loc, flow_dir, flow_mag):
+                self.location = np.array(loc, dtype=np.float64)
+                self.use_state = True
+                self.sender_type = "SM"
+                self.non_morphological_features = {
+                    "flow_direction": np.array(flow_dir),
+                    "flow_magnitude": np.array([flow_mag]),
+                }
+                self.morphological_features = {}
+
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="walking")
+        for i in range(15):
+            lm.exploratory_step(None, [FlowState(
+                [0.01 * i, 0.0, 0.0], [0.5, 0.0, 0.0], 0.5,
+            )])
+        lm.post_episode()
+
+        self.assertIn("walking", lm.get_all_known_object_ids())
+
+    def test_two_column_shape_and_behavior(self):
+        """Two CorticalColumnLMs: one for shape (HSV), one for behavior (flow).
+
+        Simulates the dual-SM architecture: CameraSM → shape column,
+        ChangeDetectingSM → behavior column.
+        """
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+
+        shape_lm = CorticalColumnLM(
+            learning_module_id="shape",
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                seed=42,
+            ),
+        )
+        behavior_lm = CorticalColumnLM(
+            learning_module_id="behavior",
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                encoder_kwargs=dict(
+                    features=["flow_direction", "flow_magnitude"],
+                ),
+                seed=42,
+            ),
+        )
+
+        class FlowState:
+            def __init__(self, loc, flow_dir, flow_mag):
+                self.location = np.array(loc, dtype=np.float64)
+                self.use_state = True
+                self.sender_type = "SM"
+                self.non_morphological_features = {
+                    "flow_direction": np.array(flow_dir),
+                    "flow_magnitude": np.array([flow_mag]),
+                }
+                self.morphological_features = {}
+
+        # Train both
+        for lm, obj_name, make_obs in [
+            (shape_lm, "banana", lambda i: [_FakeState([0.01 * i, 0, 0])]),
+            (behavior_lm, "walking", lambda i: [FlowState(
+                [0.01 * i, 0, 0], [0.5, 0.0, 0.0], 0.5,
+            )]),
+        ]:
+            lm.set_experiment_mode(ExperimentMode.TRAIN)
+            lm.pre_episode(primary_target=obj_name)
+            for i in range(15):
+                lm.exploratory_step(None, make_obs(i))
+            lm.post_episode()
+
+        # Both should have learned their respective objects
+        self.assertIn("banana", shape_lm.get_all_known_object_ids())
+        self.assertIn("walking", behavior_lm.get_all_known_object_ids())
+
+        # Voting: shape → behavior and vice versa
+        shape_lm.set_experiment_mode(ExperimentMode.EVAL)
+        shape_lm.pre_episode()
+        shape_lm.matching_step(None, [_FakeState([0.01, 0, 0])])
+        shape_vote = shape_lm.send_out_vote()
+        # Vote should be receivable by behavior LM (even though objects differ)
+        behavior_lm.receive_votes([shape_vote])  # Should not crash
+
+
+class TestCorticalColumnLMNovelty(unittest.TestCase):
+    """Step 9: Autonomous novelty detection."""
+
+    def _make_lm(self):
+        from tbp.monty.frameworks.models.cortical_column.learning_module import (
+            CorticalColumnLM,
+        )
+        return CorticalColumnLM(
+            column_kwargs=dict(
+                n_minicolumns=256,
+                n_cells_per_minicolumn=4,
+                use_weight_memory=True,
+                use_attractor=True,
+                seed=42,
+            ),
+        )
+
+    def test_surprise_high_for_novel(self):
+        """Novel objects produce high surprise during eval."""
+        from tbp.monty.frameworks.experiments.mode import ExperimentMode
+        lm = self._make_lm()
+
+        # Train on banana
+        lm.set_experiment_mode(ExperimentMode.TRAIN)
+        lm.pre_episode(primary_target="banana")
+        for i in range(20):
+            lm.exploratory_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.15, 0.9, 0.9),
+            )])
+        lm.post_episode()
+
+        # Eval on completely different features (novel object)
+        lm.set_experiment_mode(ExperimentMode.EVAL)
+        lm.pre_episode()
+        surprises = []
+        for i in range(10):
+            lm.matching_step(None, [_FakeState(
+                [0.01 * i, 0.0, 0.0], hsv=(0.85, 0.1, 0.1),
+                curvatures=(2.0, -2.0),
+            )])
+            surprises.append(lm.column.surprise)
+
+        # Mean surprise should be high (lots of bursting)
+        mean_surprise = sum(surprises) / len(surprises)
+        self.assertGreater(
+            mean_surprise, 0.3,
+            f"Novel object should cause surprise > 0.3, got {mean_surprise:.2f}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -97,18 +97,22 @@ class CorticalColumnEvalHarness:
         eval_rotations: list[tuple[float, float, float]] | None = None,
         train_steps: int = 40,
         eval_steps: int = 40,
+        train_episodes: int = 1,
         resolution: tuple[int, int] = (64, 64),
         fov: float = 90.0,
         orbit_radius: float = 0.5,
         column_kwargs: dict | None = None,
         sm_features: list[str] | None = None,
         evidence_threshold: float = 2.0,
+        eval_noise_level: float = 0.0,
         seed: int = 42,
     ):
         self._object_names = list(object_names)
         self._eval_rotations = eval_rotations or self._DEFAULT_ROTATIONS
         self._train_steps = train_steps
         self._eval_steps = eval_steps
+        self._train_episodes = train_episodes
+        self._eval_noise_level = eval_noise_level
         self._resolution = resolution
         self._fov = fov
         self._orbit_radius = orbit_radius
@@ -265,9 +269,20 @@ class CorticalColumnEvalHarness:
 
         self._column.pre_episode(mode="eval")
 
+        noise_rng = (
+            np.random.RandomState(self._seed + 7777)
+            if self._eval_noise_level > 0
+            else None
+        )
+
         steps_to_converge = None
+        settling_iters_list = []
         for i, s in enumerate(states):
+            # Inject noise into features during eval (Phase 7d)
+            if noise_rng is not None and self._eval_noise_level > 0:
+                s = self._add_noise_to_state(s, noise_rng)
             result = self._column.step(s)
+            settling_iters_list.append(result.get("settling_iterations", 0))
             mlh = result["mlh"]
             if (
                 mlh.get("graph_id") is not None
@@ -292,6 +307,12 @@ class CorticalColumnEvalHarness:
 
         elapsed = time.monotonic() - t0
 
+        mean_settling = (
+            sum(settling_iters_list) / len(settling_iters_list)
+            if settling_iters_list
+            else None
+        )
+
         result = EvalEpisodeResult(
             object_name=object_name,
             rotation=rotation_euler_deg,
@@ -301,6 +322,7 @@ class CorticalColumnEvalHarness:
             rotation_error_deg=None,  # CorticalColumn doesn't estimate rotation
             max_evidence=max_evidence,
             wall_clock_seconds=elapsed,
+            mean_settling_iterations=mean_settling,
         )
 
         logger.info(
@@ -330,12 +352,17 @@ class CorticalColumnEvalHarness:
 
         # --- Training phase ---
         logger.info(
-            "Training on %d objects (%d steps each)",
+            "Training on %d objects (%d steps each, %d episodes)",
             len(self._object_names),
             self._train_steps,
+            self._train_episodes,
         )
-        for name in self._object_names:
-            self._train_object(name)
+        for ep in range(self._train_episodes):
+            for name in self._object_names:
+                self._train_object(name)
+            if self._train_episodes > 1:
+                logger.info("Training episode %d/%d complete",
+                            ep + 1, self._train_episodes)
 
         known = self._column.get_all_known_object_ids()
         logger.info("Training complete. Known objects: %s", known)
@@ -375,6 +402,8 @@ class CorticalColumnEvalHarness:
             "sm_features": self._sm_features,
             "column_kwargs": self._column_kwargs,
             "evidence_threshold": self._evidence_threshold,
+            "train_episodes": self._train_episodes,
+            "eval_noise_level": self._eval_noise_level,
             "memory_bytes": (
                 self._column.associative_memory.memory_bytes()
                 if self._column.associative_memory is not None
@@ -397,6 +426,32 @@ class CorticalColumnEvalHarness:
         if self._column is None:
             raise RuntimeError("Harness not yet initialized. Call run() first.")
         return self._column
+
+    def _add_noise_to_state(self, state, rng: np.random.RandomState):
+        """Add Gaussian noise to a State's features for robustness testing.
+
+        Modifies the state's non_morphological_features in place. Noise level
+        is specified as a fraction of each feature's range.
+        """
+        level = self._eval_noise_level
+        if level <= 0 or not hasattr(state, "non_morphological_features"):
+            return state
+        nmf = state.non_morphological_features
+        if nmf is None:
+            return state
+
+        if "hsv" in nmf:
+            hsv = nmf["hsv"]
+            noise = rng.normal(0, level, size=hsv.shape)
+            nmf["hsv"] = np.clip(hsv + noise, 0.0, 1.0)
+
+        if "principal_curvatures_log" in nmf:
+            curv = nmf["principal_curvatures_log"]
+            # Curvature range is roughly [-5, 5], so noise is level * 10
+            noise = rng.normal(0, level * 10, size=curv.shape)
+            nmf["principal_curvatures_log"] = curv + noise
+
+        return state
 
     def close(self) -> None:
         """Release simulator resources."""

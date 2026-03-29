@@ -278,6 +278,24 @@ class FeatureSDREncoder:
                 n_bits=128, n_active=7, min_val=-5, max_val=5
             )
 
+        if "flow_direction" in features:
+            # 3D unit vector components in [-1, 1]
+            self._feature_encoders["flow_x"] = ScalarEncoder(
+                n_bits=128, n_active=7, min_val=-1, max_val=1
+            )
+            self._feature_encoders["flow_y"] = ScalarEncoder(
+                n_bits=128, n_active=7, min_val=-1, max_val=1
+            )
+            self._feature_encoders["flow_z"] = ScalarEncoder(
+                n_bits=128, n_active=7, min_val=-1, max_val=1
+            )
+
+        if "flow_magnitude" in features:
+            # Flow magnitude in [0, 1] (normalized by threshold)
+            self._feature_encoders["flow_mag"] = ScalarEncoder(
+                n_bits=128, n_active=7, min_val=0, max_val=1
+            )
+
         # Compute total dimensions
         self._location_bits = self.location_encoder.total_bits
         self._feature_bits = sum(e.n_bits for e in self._feature_encoders.values())
@@ -318,6 +336,36 @@ class FeatureSDREncoder:
             else:
                 for key in ["k1", "k2"]:
                     feature_sdrs.append(np.zeros(self._feature_encoders[key].n_bits))
+
+        if "flow_direction" in self._features and hasattr(
+            state, "non_morphological_features"
+        ):
+            nmf = state.non_morphological_features
+            if nmf is not None and "flow_direction" in nmf:
+                fd = nmf["flow_direction"]
+                feature_sdrs.append(self._feature_encoders["flow_x"].encode(fd[0]))
+                feature_sdrs.append(self._feature_encoders["flow_y"].encode(fd[1]))
+                feature_sdrs.append(self._feature_encoders["flow_z"].encode(fd[2]))
+            else:
+                for key in ["flow_x", "flow_y", "flow_z"]:
+                    feature_sdrs.append(
+                        np.zeros(self._feature_encoders[key].n_bits)
+                    )
+
+        if "flow_magnitude" in self._features and hasattr(
+            state, "non_morphological_features"
+        ):
+            nmf = state.non_morphological_features
+            if nmf is not None and "flow_magnitude" in nmf:
+                fm = nmf["flow_magnitude"]
+                val = fm[0] if hasattr(fm, "__len__") else fm
+                feature_sdrs.append(
+                    self._feature_encoders["flow_mag"].encode(float(val))
+                )
+            else:
+                feature_sdrs.append(
+                    np.zeros(self._feature_encoders["flow_mag"].n_bits)
+                )
 
         if feature_sdrs:
             return np.concatenate(feature_sdrs)

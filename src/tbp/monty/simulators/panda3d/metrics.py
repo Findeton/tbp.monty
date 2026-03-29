@@ -67,6 +67,7 @@ class EvalEpisodeResult:
     rotation_error_deg: float | None
     max_evidence: float
     wall_clock_seconds: float
+    mean_settling_iterations: float | None = None
 
 
 @dataclass

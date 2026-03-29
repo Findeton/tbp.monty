@@ -30,6 +30,9 @@ from tbp.monty.frameworks.models.cortical_column.attractor_memory import (
     AttractorMemory,
 )
 from tbp.monty.frameworks.models.cortical_column.column import CorticalColumn
+from tbp.monty.frameworks.models.cortical_column.learning_module import (
+    CorticalColumnLM,
+)
 from tbp.monty.frameworks.models.cortical_column.dendrites import DendriteSegments
 from tbp.monty.frameworks.models.cortical_column.encoders import (
     GridCellEncoder,
@@ -50,6 +53,7 @@ from tbp.monty.frameworks.models.cortical_column.sdr_memory import SDRObjectMemo
 __all__ = [
     "AttractorMemory",
     "CorticalColumn",
+    "CorticalColumnLM",
     "DendriteSegments",
     "GridCellEncoder",
     "HeteroAssociativeMemory",
