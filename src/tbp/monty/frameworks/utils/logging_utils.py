@@ -792,7 +792,14 @@ def add_evidence_lm_episode_stats(lm, stats, consistent_child_objects):
     )
     stats["highest_evidence"] = last_mlh["evidence"]
 
-    # Log per-graph max evidence for category-level analysis
+    # Log per-graph max evidence for category-level analysis.
+    # Always initialize all fields to ensure consistent CSV column counts
+    # across episodes (appended without headers after the first write).
+    stats["evidence_per_graph"] = np.nan
+    stats["category_prediction"] = np.nan
+    stats["category_margin"] = np.nan
+    stats["category_relative_margin"] = np.nan
+    stats["category_novel"] = np.nan
     if hasattr(lm, "get_evidence_for_each_graph"):
         try:
             graph_ids, graph_evidences = lm.get_evidence_for_each_graph()
@@ -1045,8 +1052,9 @@ def lm_stats_to_dataframe(stats, format_for_wandb=False):
         if len(lm_dict) > 0:
             df_list.append(pd.DataFrame.from_dict(lm_dict, orient="index"))
 
-    big_df = pd.concat(df_list)
-    big_df["lm_id"] = big_df.index
+    big_df = pd.concat(df_list) if df_list else pd.DataFrame()
+    if len(big_df) > 0:
+        big_df["lm_id"] = big_df.index
     return big_df
 
 

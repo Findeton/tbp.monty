@@ -60,6 +60,7 @@ class DefaultFeatureEvidenceCalculator:
         feature_weight_list = np.zeros(shape_to_use) * np.nan
         feature_list = np.zeros(shape_to_use) * np.nan
         circular_var = np.zeros(shape_to_use, dtype=bool)
+        circ_range = 1
         start_idx = 0
         for feature in channel_feature_order:
             if feature in [
@@ -100,4 +101,9 @@ class DefaultFeatureEvidenceCalculator:
         feature_evidence = np.clip(tolerance_list - feature_differences, 0, np.inf)
         # normalize evidence to be in [0, 1]
         feature_evidence = feature_evidence / tolerance_list
+        # If no features were processed (e.g. only pose_vectors), weights
+        # will be all NaN and np.average raises ZeroDivisionError.
+        valid_weights = ~np.isnan(feature_weight_list)
+        if not np.any(valid_weights):
+            return np.zeros(channel_feature_array.shape[0])
         return np.average(feature_evidence, weights=feature_weight_list, axis=1)

@@ -92,6 +92,15 @@ class MontyForGraphMatching(MontyBase):
         self.temporal_confusion_threshold = kwargs.pop(
             "temporal_confusion_threshold", 0.7
         )
+        # Track 9: Surprise-gated Hopfield voting. When True, LMs only
+        # exchange votes when the sender's column has settled (low surprise)
+        # and the receiver is stuck (high surprise). The vote payload
+        # includes the sender's Hopfield attractor pattern, which the
+        # receiver uses as a retrieval cue for associative memory recall.
+        self.hopfield_voting = kwargs.pop("hopfield_voting", False)
+        self.hopfield_surprise_threshold = kwargs.pop(
+            "hopfield_surprise_threshold", 0.3
+        )
         super().__init__(*args, **kwargs)
 
     # =============== Public Interface Functions ===============
@@ -470,9 +479,15 @@ class MontyForGraphMatching(MontyBase):
         are ambiguous.
         """
         if self.lm_to_lm_vote_matrix is not None:
+            use_hopfield = getattr(self, "hopfield_voting", False)
             use_predictive = getattr(self, "predictive_voting", False)
 
-            if use_predictive:
+            if use_hopfield:
+                # Track 9: Surprise-gated Hopfield voting. LMs only exchange
+                # votes when the sender has settled (low surprise) and the
+                # receiver is stuck (high surprise).
+                self._vote_hopfield()
+            elif use_predictive:
                 # T6.5: Unified predictive voting replaces both conditional
                 # and temporal voting in a single pass.
                 self._vote_predictive()
@@ -586,6 +601,97 @@ class MontyForGraphMatching(MontyBase):
                 logger.debug(
                     f"------ Conditional vote to LM {i} -------"
                 )
+                self.send_vote_to_lm(
+                    self.learning_modules[i], i, combined_votes
+                )
+                self.update_stats_after_vote(self.learning_modules[i])
+        finally:
+            self.lm_to_lm_vote_matrix = saved_matrix
+
+    def _vote_hopfield(self):
+        """Vote from settled LMs to stuck LMs based on Hopfield surprise.
+
+        This is the Track 9 voting mode. Instead of counting possible matches
+        (conditional voting) or checking temporal predictions (predictive
+        voting), this mode uses the **column's surprise signal** to classify
+        LMs:
+
+        - **Confident**: surprise ≤ threshold → column has settled into a
+          familiar attractor. This LM has useful information to share.
+        - **Stuck**: surprise > threshold → column has not settled. This LM
+          would benefit from lateral input.
+
+        Votes are sent one-directionally from confident → stuck, matching the
+        conditional voting pattern. The key difference is the gating signal:
+        surprise is a continuous, biologically grounded measure (mismatch
+        between predicted and settled patterns) rather than an external count
+        of hypotheses.
+
+        The LM's ``send_out_vote()`` may include a ``hopfield_pattern`` key
+        containing the sender's settled activation. The receiver uses this
+        pattern as a retrieval cue in its own Hopfield memory, biologically
+        analogous to lateral cortical connections sharing attractor states.
+        """
+        threshold = self.hopfield_surprise_threshold
+        n_lms = len(self.learning_modules)
+
+        # Classify each LM by its surprise level
+        confident = set()
+        stuck = set()
+        for i in range(n_lms):
+            lm = self.learning_modules[i]
+            has_observations = lm.buffer.get_num_observations_on_object() > 0
+            if not has_observations:
+                continue
+
+            # Get surprise from the LM. CorticalColumnTorchLM stores it
+            # in _last_result; other LMs may expose it differently.
+            surprise = None
+            if hasattr(lm, "_last_result") and isinstance(lm._last_result, dict):
+                surprise = lm._last_result.get("surprise")
+            if surprise is None and hasattr(lm, "_column"):
+                surprise = getattr(lm._column, "surprise", None)
+
+            if surprise is None:
+                # LM doesn't expose surprise — treat as undecided, skip
+                continue
+
+            if surprise <= threshold:
+                confident.add(i)
+            else:
+                stuck.add(i)
+
+        if not confident or not stuck:
+            return  # Nothing to do
+
+        logger.info(
+            f"Hopfield vote: confident={sorted(confident)} "
+            f"(surprise ≤ {threshold}), stuck={sorted(stuck)}"
+        )
+
+        # Collect votes from all LMs (needed for _combine_votes pose data)
+        votes_per_lm = []
+        for i in range(n_lms):
+            votes_per_lm.append(self.learning_modules[i].send_out_vote())
+
+        # Build temporary matrix: stuck LMs receive from confident senders
+        saved_matrix = self.lm_to_lm_vote_matrix
+        temp_matrix = []
+        for i in range(n_lms):
+            if i in stuck:
+                senders = [
+                    j for j in saved_matrix[i]
+                    if j in confident and votes_per_lm[j] is not None
+                ]
+                temp_matrix.append(senders)
+            else:
+                temp_matrix.append([])
+
+        self.lm_to_lm_vote_matrix = temp_matrix
+        try:
+            combined_votes = self._combine_votes(votes_per_lm)
+            for i in stuck:
+                logger.debug(f"------ Hopfield vote to LM {i} -------")
                 self.send_vote_to_lm(
                     self.learning_modules[i], i, combined_votes
                 )

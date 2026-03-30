@@ -1,0 +1,46 @@
+{
+  "single_column_ycb": {
+    "accuracy": 0.85,
+    "n_correct": 17,
+    "n_episodes": 20,
+    "wall_clock": 52.542381250000005
+  },
+  "two_lm_voting": {
+    "walk_detected": "fox_walk",
+    "walk_correct": true,
+    "static_detected": "fox_static",
+    "static_correct": true,
+    "children_have_evidence": true,
+    "morph_evidence": {
+      "fox_walk": 8.954050726596698,
+      "fox_static": 2.407462090573273
+    },
+    "behavior_evidence": {
+      "fox_walk": 10.64875848549175,
+      "fox_static": 6.7343789968283545
+    },
+    "train_time": 1.1060459999999992,
+    "eval_time": 0.43340937499999654
+  },
+  "three_lm_heterarchy": {
+    "walk_detected": "fox_static",
+    "walk_correct": false,
+    "static_detected": "fox_walk",
+    "static_correct": false,
+    "children_have_evidence": true,
+    "train_time": 0.9788028749999995,
+    "eval_time": 0.39498987500000027
+  },
+  "auto_label": {
+    "n_auto_labels": 2,
+    "auto_labels": [
+      "auto_7f69a70032c7",
+      "auto_1debbeba5f24"
+    ],
+    "anim_detected": "auto_7f69a70032c7",
+    "static_detected": "auto_7f69a70032c7",
+    "discriminated": false,
+    "train_time": 0.390159833999995,
+    "eval_time": 0.23853404199999773
+  }
+}

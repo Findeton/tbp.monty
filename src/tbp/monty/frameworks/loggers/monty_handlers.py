@@ -240,6 +240,10 @@ class BasicCSVStatsHandler(MontyHandler):
 
         # Format stats for a single episode as a dataframe
         dataframe = lm_stats_to_dataframe(stats)
+        # Skip writing if no LM stats (e.g., noise-mixing training episodes
+        # where the LM has no logging output yet).
+        if len(dataframe) == 0:
+            return
         # Move most relevant columns to front
         if "most_likely_object" in dataframe:
             top_columns = [
@@ -288,8 +292,11 @@ class BasicCSVStatsHandler(MontyHandler):
         dataframe.to_csv(output_file, mode="a", header=header)
 
     def move_columns_to_front(self, df, columns):
+        if len(df) == 0:
+            return df
         for c_key in reversed(columns):
-            df.insert(0, c_key, df.pop(c_key))
+            if c_key in df.columns:
+                df.insert(0, c_key, df.pop(c_key))
         return df
 
     def close(self):

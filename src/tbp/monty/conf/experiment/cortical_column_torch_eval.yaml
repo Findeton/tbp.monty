@@ -1,0 +1,76 @@
+# CorticalColumnTorch Evaluation Config
+#
+# Evaluates the PyTorch modern Hopfield cortical column (Track 9) on YCB
+# objects using real Panda3D rendering, CameraSM + ChangeDetectingSM sensors,
+# and InformedPolicy motor control.
+#
+# Usage:
+#   from tbp.monty.frameworks.models.cortical_column_torch.experiment import (
+#       Panda3DTorchExperiment,
+#   )
+#   from tbp.monty.simulators.panda3d.ycb import ycb_glb_path, YCB_EVAL_OBJECTS
+#   import yaml
+#
+#   with open("cortical_column_torch_eval.yaml") as f:
+#       cfg = yaml.safe_load(f)
+#
+#   objects = cfg["objects"]
+#   exp = Panda3DTorchExperiment(**cfg["experiment"])
+#
+#   for obj in objects:
+#       exp.swap_model(str(ycb_glb_path(obj)))
+#       exp.train(obj, n_steps=cfg["train"]["n_steps"])
+#
+#   for obj in objects:
+#       exp.swap_model(str(ycb_glb_path(obj)))
+#       result = exp.evaluate(n_steps=cfg["eval"]["n_steps"])
+#       print(f"{obj}: {result['graph_id']}")
+#
+#   exp.close()
+
+# YCB objects for training and evaluation
+objects:
+  - "025_mug"
+  - "011_banana"
+  - "013_apple"
+  - "035_power_drill"
+  - "003_cracker_box"
+
+# Panda3DTorchExperiment constructor arguments
+experiment:
+  # First object's path — set at runtime via ycb_glb_path(objects[0])
+  model_path: "__SET_AT_RUNTIME__"
+  hierarchical: false
+  resolution: [128, 128]
+  fov: 90.0
+  near: 0.01
+  far: 10.0
+  initial_distance: 0.3
+  object_position: [0.0, 0.0, 0.0]
+  object_scale: [1.0, 1.0, 1.0]
+  rotation_degrees: 5.0
+  translation_distance: 0.004
+
+  # CorticalColumnTorch parameters
+  column_kwargs:
+    n_minicolumns: 2048
+    n_cells_per_minicolumn: 8
+    sparsity: 0.03
+    seed: 42
+    use_apical: false
+    base_learning_rate: 0.01
+    evidence_decay: 0.01
+
+# Training parameters
+train:
+  n_steps: 50
+
+# Evaluation parameters
+eval:
+  n_steps: 30
+
+# Acceptance criteria
+criteria:
+  min_accuracy: 0.8         # >80% top-1 accuracy on 5 objects
+  max_steps: 100            # Recognition within 100 steps
+  novelty_surprise_min: 0.3 # Unseen objects must sustain surprise > 0.3

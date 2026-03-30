@@ -294,6 +294,12 @@ class BasicGraphMatchingLogger(BaseMontyLogger):
                 # but still have an overall performance of correct (or other).
                 episode_performance = p
 
+        # Initialize all episode performance flags (needed even when no
+        # performance was determined, so get_formatted_overall_stats can
+        # safely read them).
+        for p in self.performance_options:
+            stats.setdefault(f"episode_{p}", 0)
+
         if episode_performance:
             for p in self.performance_options:
                 stats[f"episode_{p}"] = int(p == episode_performance)
@@ -336,37 +342,37 @@ class BasicGraphMatchingLogger(BaseMontyLogger):
             # correct.
             "overall/percent_correct": (
                 (stats["num_correct"] + stats["num_correct_mlh"])
-                / (stats["num_episodes"])
+                / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_no_match": (
-                stats["num_no_match"] / (stats["num_episodes"])
+                stats["num_no_match"] / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_confused": (
                 (stats["num_confused"] + stats["num_confused_mlh"])
-                / (stats["num_episodes"])
+                / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_correct_mlh": (
-                (stats["num_correct_mlh"]) / (stats["num_episodes"])
+                (stats["num_correct_mlh"]) / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_confused_mlh": (
-                (stats["num_confused_mlh"]) / (stats["num_episodes"])
+                (stats["num_confused_mlh"]) / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_pose_time_out": (
-                stats["num_pose_time_out"] / (stats["num_episodes"])
+                stats["num_pose_time_out"] / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_time_out": (
-                stats["num_time_out"] / (stats["num_episodes"])
+                stats["num_time_out"] / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_used_mlh_after_timeout": (
                 (stats["num_correct_mlh"] + stats["num_confused_mlh"])
-                / (stats["num_episodes"])
+                / max(stats["num_episodes"], 1)
             )
             * 100,
             # Mean rotation error on all LMs that recognized the object
@@ -396,12 +402,12 @@ class BasicGraphMatchingLogger(BaseMontyLogger):
                 else np.nan
             ),
             "overall/percent_consistent_child_obj": (
-                stats["num_consistent_child_obj"] / (stats["num_episodes"])
+                stats["num_consistent_child_obj"] / max(stats["num_episodes"], 1)
             )
             * 100,
             "overall/percent_correct_child_or_parent": (
                 stats["num_correct_child_or_parent"]
-                / (stats["num_episodes"] * len(self.lms))
+                / max(stats["num_episodes"] * len(self.lms), 1)
             )
             * 100,
             "overall/run_time": np.sum(stats["run_times"]) / len(self.lms),
@@ -434,15 +440,28 @@ class BasicGraphMatchingLogger(BaseMontyLogger):
             ),
             # steps is the max number of steps of all LMs. Some LMs may have taken
             # less steps because they were not on the object all the time.
-            "episode/lm_steps": np.max(stats["episode_lm_steps"][-len(self.lms) :]),
-            "episode/monty_steps": stats["monty_steps"][-1],
-            "episode/monty_matching_steps": stats["monty_matching_steps"][-1],
+            "episode/lm_steps": (
+                np.max(stats["episode_lm_steps"][-len(self.lms):])
+                if len(stats["episode_lm_steps"]) > 0 and len(self.lms) > 0
+                else 0
+            ),
+            "episode/monty_steps": (
+                stats["monty_steps"][-1] if stats["monty_steps"] else 0
+            ),
+            "episode/monty_matching_steps": (
+                stats["monty_matching_steps"][-1]
+                if stats["monty_matching_steps"] else 0
+            ),
             "episode/mean_lm_steps_to_indv_ts": (
                 np.mean(episode_individual_ts_steps)
                 if len(episode_individual_ts_steps) > 0
                 else np.nan
             ),
-            "episode/run_time": np.max(stats["run_times"][-len(self.lms) :]),
+            "episode/run_time": (
+                np.max(stats["run_times"][-len(self.lms):])
+                if len(stats["run_times"]) > 0 and len(self.lms) > 0
+                else 0
+            ),
             # Mean symmetry evidence with multiple LMs may be > required evidence
             # since one LM reaching its terminal condition doesn't mean all others do.
             "episode/symmetry_evidence": (
@@ -461,19 +480,19 @@ class BasicGraphMatchingLogger(BaseMontyLogger):
             if p == "correct":
                 overall_stats["overall/percent_correct_per_lm"] = (
                     (stats["num_correct_per_lm"] + stats["num_correct_mlh_per_lm"])
-                    / (stats["num_episodes"] * len(self.lms))
+                    / max(stats["num_episodes"] * len(self.lms), 1)
                 ) * 100
             elif p == "confused":
                 overall_stats["overall/percent_confused_per_lm"] = (
                     (stats["num_confused_per_lm"] + stats["num_confused_mlh_per_lm"])
-                    / (stats["num_episodes"] * len(self.lms))
+                    / max(stats["num_episodes"] * len(self.lms), 1)
                 ) * 100
             elif p in {"correct_mlh", "confused_mlh"}:
                 # skip because they are already included in correct and confused stats
                 pass
             else:
                 overall_stats[f"overall/percent_{p}_per_lm"] = (
-                    stats[f"num_{p}_per_lm"] / (stats["num_episodes"] * len(self.lms))
+                    stats[f"num_{p}_per_lm"] / max(stats["num_episodes"] * len(self.lms), 1)
                 ) * 100
 
         for lm in self.lms:

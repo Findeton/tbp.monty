@@ -1,0 +1,721 @@
+{
+  "cortical_column": {
+    "episodes": [
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "011_banana",
+        "correct": true,
+        "steps_to_converge": 5,
+        "rotation_error_deg": null,
+        "max_evidence": 30.33701820373535,
+        "wall_clock_seconds": 1.1816315000000017,
+        "mean_settling_iterations": 1.2
+      },
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": false,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 7.610011291503906,
+        "wall_clock_seconds": 0.468299291000001,
+        "mean_settling_iterations": 2.0
+      },
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "011_banana",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 244.91454734802244,
+        "wall_clock_seconds": 9.430437834000003,
+        "mean_settling_iterations": 2.2666666666666666
+      },
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": false,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 114.3654878616333,
+        "wall_clock_seconds": 5.375309334000001,
+        "mean_settling_iterations": 1.826086956521739
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "025_mug",
+        "correct": true,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 12.261518859863282,
+        "wall_clock_seconds": 0.46764766599999774,
+        "mean_settling_iterations": 1.0
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "025_mug",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 411.043637084961,
+        "wall_clock_seconds": 11.563474207999995,
+        "mean_settling_iterations": 2.125
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "025_mug",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 471.63669052124027,
+        "wall_clock_seconds": 12.973650875000004,
+        "mean_settling_iterations": 2.1346153846153846
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "025_mug",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 394.2045776367188,
+        "wall_clock_seconds": 11.89082079100001,
+        "mean_settling_iterations": 2.1041666666666665
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": true,
+        "steps_to_converge": 18,
+        "rotation_error_deg": null,
+        "max_evidence": 110.86508903503417,
+        "wall_clock_seconds": 4.632053874999997,
+        "mean_settling_iterations": 1.7222222222222223
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 284.6950645446777,
+        "wall_clock_seconds": 14.826615000000004,
+        "mean_settling_iterations": 1.8909090909090909
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": true,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 5.9100086212158205,
+        "wall_clock_seconds": 0.5436929170000013,
+        "mean_settling_iterations": 2.0
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": false,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 306.7545025825501,
+        "wall_clock_seconds": 15.042630792000011,
+        "mean_settling_iterations": 2.0535714285714284
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 14.218527221679688,
+        "wall_clock_seconds": 0.53989579200001,
+        "mean_settling_iterations": 1.0
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 13.886521911621093,
+        "wall_clock_seconds": 0.5239433749999876,
+        "mean_settling_iterations": 1.0
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 14.054519653320312,
+        "wall_clock_seconds": 0.5165866669999843,
+        "mean_settling_iterations": 1.0
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 1,
+        "rotation_error_deg": null,
+        "max_evidence": 14.119522094726562,
+        "wall_clock_seconds": 0.5089067499999942,
+        "mean_settling_iterations": 1.0
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "035_power_drill",
+        "correct": true,
+        "steps_to_converge": 14,
+        "rotation_error_deg": null,
+        "max_evidence": 77.67000923156739,
+        "wall_clock_seconds": 3.9230132909999895,
+        "mean_settling_iterations": 1.8571428571428572
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "035_power_drill",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 204.90350780487066,
+        "wall_clock_seconds": 12.379518958999995,
+        "mean_settling_iterations": 2.3181818181818183
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "035_power_drill",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 230.82551250457763,
+        "wall_clock_seconds": 12.541072541000005,
+        "mean_settling_iterations": 2.4545454545454546
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "035_power_drill",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": null,
+        "max_evidence": 169.08200378417968,
+        "wall_clock_seconds": 12.433017541999988,
+        "mean_settling_iterations": 2.3555555555555556
+      }
+    ],
+    "accuracy": 0.85,
+    "mean_steps_to_converge": 4.4,
+    "mean_rotation_error_deg": null,
+    "wall_clock_total": 169.25970925,
+    "config": {
+      "architecture": "CorticalColumn (SDR)",
+      "object_names": [
+        "011_banana",
+        "025_mug",
+        "003_cracker_box",
+        "013_apple",
+        "035_power_drill"
+      ],
+      "eval_rotations": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          45.0,
+          0.0
+        ],
+        [
+          30.0,
+          0.0,
+          60.0
+        ],
+        [
+          0.0,
+          90.0,
+          0.0
+        ]
+      ],
+      "train_steps": 60,
+      "eval_steps": 60,
+      "resolution": [
+        64,
+        64
+      ],
+      "fov": 90.0,
+      "orbit_radius": 0.5,
+      "seed": 42,
+      "sm_features": [
+        "on_object",
+        "hsv",
+        "principal_curvatures_log"
+      ],
+      "column_kwargs": {
+        "n_minicolumns": 2048,
+        "n_cells_per_minicolumn": 8,
+        "sparsity": 0.03,
+        "use_weight_memory": true,
+        "use_attractor": true
+      },
+      "evidence_threshold": 2.0,
+      "train_episodes": 1,
+      "eval_noise_level": 0.0,
+      "memory_bytes": 19665920,
+      "n_dendrite_segments": 25118
+    }
+  },
+  "evidence_graph": {
+    "episodes": [
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "011_banana",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 73.29561418747744,
+        "max_evidence": 2.3739656715178215,
+        "wall_clock_seconds": 0.31602704100001233,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 2.0156233372600703,
+        "wall_clock_seconds": 0.2795776250000017,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "011_banana",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 44.69806496564518,
+        "max_evidence": 2.754965851968736,
+        "wall_clock_seconds": 0.3457746670000006,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "011_banana",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "025_mug",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 2.1408440680925986,
+        "wall_clock_seconds": 0.27920679199999654,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 1.862701066971153,
+        "wall_clock_seconds": 0.3482890829999974,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "011_banana",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 1.2648886528015253,
+        "wall_clock_seconds": 0.3445305410000117,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "025_mug",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 54.435740776777855,
+        "max_evidence": 2.167991339431362,
+        "wall_clock_seconds": 0.36077370800001063,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "025_mug",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 1.315593178086711,
+        "wall_clock_seconds": 0.3511011250000138,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": true,
+        "steps_to_converge": null,
+        "rotation_error_deg": 112.2705795294097,
+        "max_evidence": 0.0,
+        "wall_clock_seconds": 0.8265856670000176,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 106.76507198233767,
+        "max_evidence": 1.515712931171785,
+        "wall_clock_seconds": 0.36361583300001143,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 44.48380354212007,
+        "max_evidence": 2.209801569015031,
+        "wall_clock_seconds": 0.4050121669999953,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "003_cracker_box",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "025_mug",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 2.1126345785798257,
+        "wall_clock_seconds": 0.44075516699999184,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 35.678045991677585,
+        "max_evidence": 1.815685446534483,
+        "wall_clock_seconds": 0.3658125000000041,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 91.67951080520596,
+        "max_evidence": 2.2337606836712323,
+        "wall_clock_seconds": 0.3905218330000082,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "011_banana",
+        "correct": false,
+        "steps_to_converge": 3,
+        "rotation_error_deg": null,
+        "max_evidence": 2.6482294090350234,
+        "wall_clock_seconds": 0.36433458299998733,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "013_apple",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "013_apple",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 69.9021800222238,
+        "max_evidence": 2.6089869217248483,
+        "wall_clock_seconds": 0.36574883299999783,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "detected_object": "011_banana",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 1.4007559499514801,
+        "wall_clock_seconds": 0.33885175000000345,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          0.0,
+          45.0,
+          0.0
+        ],
+        "detected_object": "025_mug",
+        "correct": false,
+        "steps_to_converge": 3,
+        "rotation_error_deg": null,
+        "max_evidence": 2.257830341414896,
+        "wall_clock_seconds": 0.35641025000001036,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          30.0,
+          0.0,
+          60.0
+        ],
+        "detected_object": "035_power_drill",
+        "correct": true,
+        "steps_to_converge": 2,
+        "rotation_error_deg": 41.58984196014597,
+        "max_evidence": 2.6816417755261313,
+        "wall_clock_seconds": 0.3483650409999939,
+        "mean_settling_iterations": null
+      },
+      {
+        "object_name": "035_power_drill",
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "detected_object": "003_cracker_box",
+        "correct": false,
+        "steps_to_converge": 2,
+        "rotation_error_deg": null,
+        "max_evidence": 1.4808216245936758,
+        "wall_clock_seconds": 0.33967291600001204,
+        "mean_settling_iterations": null
+      }
+    ],
+    "accuracy": 0.5,
+    "mean_steps_to_converge": 2.1052631578947367,
+    "mean_rotation_error_deg": 67.47984537630212,
+    "wall_clock_total": 15.259034374999999,
+    "config": {
+      "object_names": [
+        "011_banana",
+        "025_mug",
+        "003_cracker_box",
+        "013_apple",
+        "035_power_drill"
+      ],
+      "eval_rotations": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          45.0,
+          0.0
+        ],
+        [
+          30.0,
+          0.0,
+          60.0
+        ],
+        [
+          0.0,
+          90.0,
+          0.0
+        ]
+      ],
+      "train_steps": 60,
+      "eval_steps": 60,
+      "resolution": [
+        64,
+        64
+      ],
+      "fov": 90.0,
+      "orbit_radius": 0.5,
+      "seed": 42,
+      "sm_features": [
+        "on_object",
+        "hsv",
+        "principal_curvatures_log"
+      ]
+    }
+  }
+}
