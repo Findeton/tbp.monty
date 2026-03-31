@@ -126,6 +126,57 @@ class TestHopfieldAssociativeMemory(unittest.TestCase):
         h2 = [torch.randn(32) for _ in range(5)]
         self.assertNotEqual(mem.auto_label(h1), mem.auto_label(h2))
 
+    def test_auto_label_stable_under_noise(self):
+        """Auto-labels should be stable when activation patterns have small noise.
+
+        R6: The structural fingerprint should produce the same label even
+        when individual sparse patterns vary slightly.  Uses sparse patterns
+        matching real column output (~5% active) rather than dense Gaussians.
+        """
+        torch.manual_seed(42)
+        mem = HopfieldAssociativeMemory(n_cells=256)
+
+        # Create a sparse prototype (like real column output: ~5% active)
+        prototype = torch.zeros(256)
+        active_idx = [3, 17, 42, 88, 120, 155, 199, 210, 230, 250]
+        for idx in active_idx:
+            prototype[idx] = 1.0
+
+        # Generate two histories with small noise around the same prototype
+        h1 = [prototype + torch.randn(256) * 0.05 for _ in range(10)]
+        h2 = [prototype + torch.randn(256) * 0.05 for _ in range(10)]
+
+        label1 = mem.auto_label(h1)
+        label2 = mem.auto_label(h2)
+
+        self.assertEqual(
+            label1, label2,
+            f"Same sparse prototype with small noise should produce same "
+            f"label: {label1} != {label2}",
+        )
+
+    def test_auto_label_different_objects_differ(self):
+        """Auto-labels for genuinely different objects should differ.
+
+        R6: Two orthogonal prototypes should produce different fingerprints.
+        """
+        torch.manual_seed(42)
+        mem = HopfieldAssociativeMemory(n_cells=256)
+
+        p1 = torch.zeros(256)
+        p1[:32] = 1.0  # Active in first 32 dims
+
+        p2 = torch.zeros(256)
+        p2[128:160] = 1.0  # Active in dims 128-160
+
+        h1 = [p1 + torch.randn(256) * 0.01 for _ in range(5)]
+        h2 = [p2 + torch.randn(256) * 0.01 for _ in range(5)]
+
+        self.assertNotEqual(
+            mem.auto_label(h1), mem.auto_label(h2),
+            "Different objects should produce different auto-labels",
+        )
+
     def test_state_dict_roundtrip(self):
         mem = HopfieldAssociativeMemory(n_cells=32)
         mem.learn(torch.randn(32), "test_obj")

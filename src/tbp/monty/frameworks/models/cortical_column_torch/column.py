@@ -6,15 +6,27 @@
 
 """Unified cortical column with modern Hopfield dynamics in PyTorch.
 
+Architecture follows the cortical LM / HPC separation:
+
+**Cortical column (LM)** — slow, incremental learning:
+  - Hopfield memory stores a small number of object-level attractors
+    (one per learned object), updated incrementally via EMA prototypes.
+  - Settling denoises the current observation toward the nearest attractor.
+
+**Episodic memory (HPC)** — fast, one-shot storage:
+  - Stores individual observations with labels and novelty gating.
+  - Used for offline replay / consolidation (not for settling).
+
 Pipeline per step (flat mode — Track 9 default):
 1. Encode sensory input → feedforward float tensor
 2. Spatial pooling: overlap + boosting + top-k
 3. Dendritic prediction: basal predict(prev_active) + apical predict(context)
 4. Cell activation: graded 4-state logic
-5. Hopfield settling: converge to nearest stored attractor
+5. Hopfield settling: denoise toward cortical object attractors
 6. Surprise: mismatch between predicted and settled patterns
 7. Learning: Hebbian on all pathways, modulated by surprise
-8. Evidence update: Hopfield associative readout → per-object scores
+8. Evidence update: attention over prototypes → per-object scores
+9. Episodic storage: one-shot store in HPC memory
 
 Laminar mode (Track 10, laminar=True):
 1. Encode → thalamic relay (L6 gating) → L4 spatial pooling
@@ -40,6 +52,15 @@ from tbp.monty.frameworks.models.cortical_column_torch.dendrites import (
 )
 from tbp.monty.frameworks.models.cortical_column_torch.encoders import (
     TorchFeatureEncoder,
+)
+from tbp.monty.frameworks.models.cortical_column_torch.episodic_memory import (
+    EpisodicMemory,
+)
+from tbp.monty.frameworks.models.cortical_column_torch.location_feature_memory import (
+    LocationFeatureMemory,
+)
+from tbp.monty.frameworks.models.cortical_column_torch.predictive_tracker import (
+    PredictiveTracker,
 )
 from tbp.monty.frameworks.models.cortical_column_torch.hopfield import (
     ModernHopfieldMemory,
@@ -135,10 +156,13 @@ class CorticalColumnTorch:
         use_eligibility: bool = False,
         use_phase_coding: bool = False,
         use_thalamic_relay: bool = False,
+        use_location_feature_memory: bool = False,
         encoder_kwargs: dict = None,
         dendrite_kwargs: dict = None,
         hopfield_kwargs: dict = None,
         memory_kwargs: dict = None,
+        episodic_kwargs: dict = None,
+        lfm_kwargs: dict = None,
         motor_kwargs: dict = None,
         neuromod_kwargs: dict = None,
         laminar_kwargs: dict = None,
@@ -207,18 +231,25 @@ class CorticalColumnTorch:
         else:
             self._apical_dendrites = None
 
-        # ---- Modern Hopfield memory ----
-        # Phase coding adds 2 dimensions to stored patterns
-        hopfield_n_cells = self.n_cells + (2 if use_phase_coding else 0)
+        # ---- Cortical Hopfield memory (L2/3 attractors) ----
+        # Stores a small number of object-level attractors (~1 per object),
+        # NOT individual observations.  Patterns are synced from associative
+        # memory prototypes.  No phase augmentation — attractors are
+        # phase-independent object representations.
         hop_kw = dict(
-            n_cells=hopfield_n_cells,
+            n_cells=self.n_cells,
             beta=beta,
             max_stored=1000,
             max_settle_iters=max_settle_iters,
             device=device,
         )
         if hopfield_kwargs:
-            hop_kw.update(hopfield_kwargs)
+            # Filter out novelty_threshold — that's an episodic concept
+            hop_kw_filtered = {
+                k: v for k, v in hopfield_kwargs.items()
+                if k != "novelty_threshold"
+            }
+            hop_kw.update(hop_kw_filtered)
         self._hopfield = ModernHopfieldMemory(**hop_kw)
 
         # ---- Associative memory ----
@@ -232,6 +263,48 @@ class CorticalColumnTorch:
         if memory_kwargs:
             mem_kw.update(memory_kwargs)
         self._associative_memory = HopfieldAssociativeMemory(**mem_kw)
+
+        # ---- Episodic memory (HPC) ----
+        # One-shot storage of individual observations with novelty gating.
+        # Separate from the cortical column's slow attractor dynamics.
+        ep_kw = dict(
+            n_cells=self.n_cells,
+            max_episodes=2000,
+            novelty_threshold=0.7,
+            device=device,
+        )
+        if episodic_kwargs:
+            ep_kw.update(episodic_kwargs)
+        # Legacy: if hopfield_kwargs had novelty_threshold, use it
+        if hopfield_kwargs and "novelty_threshold" in hopfield_kwargs:
+            ep_kw["novelty_threshold"] = hopfield_kwargs["novelty_threshold"]
+        self._episodic_memory = EpisodicMemory(**ep_kw)
+
+        # ---- Location-Feature memory (Phase 11) ----
+        # Stores composite (location, feature) patterns tagged with object IDs.
+        # Replaces EMA prototype evidence with many-pattern-per-object evidence.
+        self._use_lfm = use_location_feature_memory
+        if self._use_lfm:
+            _lfm_kw = dict(
+                d_loc=self._encoder._location_bits,
+                d_feat=self._encoder.total_bits - self._encoder._location_bits,
+                beta=beta,
+                novelty_threshold=0.7,
+                max_patterns=5000,
+                device=device,
+            )
+            if lfm_kwargs:
+                _lfm_kw.update(lfm_kwargs)
+            self._lfm = LocationFeatureMemory(**_lfm_kw)
+            self._predictive_tracker = PredictiveTracker(
+                surprise_threshold=0.3,
+                anchor_evidence_threshold=0.1,
+                prediction_bonus_weight=0.5,
+                max_consecutive_drops=5,
+            )
+        else:
+            self._lfm = None
+            self._predictive_tracker = None
 
         # ---- Motor prediction ----
         if self._use_motor_prediction:
@@ -307,6 +380,8 @@ class CorticalColumnTorch:
                                     device=self.device)
         self._active_mc = torch.zeros(self.n_minicolumns, dtype=torch.bool,
                                       device=self.device)
+        self._mc_overlap = torch.zeros(self.n_minicolumns, dtype=torch.float32,
+                                       device=self.device)
         self._prev_location: np.ndarray | None = None
         self._mode = "eval"
         self._current_object: str | None = None
@@ -334,7 +409,7 @@ class CorticalColumnTorch:
         for mc in range(self.n_minicolumns):
             indices = rng.choice(n_input, size=n_potential, replace=False)
             self._ff_potential[mc, indices] = True
-            perms = rng.normal(self._sp_connected_threshold, 0.05, n_potential)
+            perms = rng.normal(self._sp_connected_threshold, 0.10, n_potential)
             perms = np.clip(perms, 0.0, 1.0).astype(np.float32)
             self._ff_permanences[mc, indices] = torch.from_numpy(perms)
 
@@ -346,6 +421,20 @@ class CorticalColumnTorch:
             device=self.device,
         )
         self._boost_strength = 3.0
+
+        # Developmental wiring: fixed random bias per cell within each
+        # minicolumn.  In biology, cells in the same minicolumn have
+        # different lateral wiring from birth — this gives each cell an
+        # innate, input-dependent preference before dendrites learn.
+        k = self.n_cells_per_minicolumn
+        cell_rng = np.random.RandomState(seed + 2000)
+        self._cell_bias = torch.from_numpy(
+            cell_rng.standard_normal((self.n_minicolumns, k)).astype(np.float32)
+        ).to(self.device)
+        # Normalize so the bias magnitude is controlled
+        self._cell_bias = self._cell_bias / (
+            self._cell_bias.norm(dim=1, keepdim=True) + 1e-8
+        )
 
     # ------------------------------------------------------------------
     # Track 10: Laminar feature initialization
@@ -499,6 +588,9 @@ class CorticalColumnTorch:
         self._apical_predicted.zero_()
         self._context.zero_()
         self._active_mc.zero_()
+        self._mc_overlap.zero_()
+        self._last_pre_settle = torch.zeros(self.n_cells, dtype=torch.float32,
+                                            device=self.device)
         self._prev_location = None
         self._step_count = 0
         self._surprise = 1.0
@@ -525,9 +617,34 @@ class CorticalColumnTorch:
         if self._laminar and hasattr(self, "_prev_l6_activation"):
             self._prev_l6_activation.zero_()
 
+        # Reset predictive tracker per eval episode
+        if self._predictive_tracker is not None:
+            self._predictive_tracker.reset()
+
         # Initialize evidence for known objects
-        known = self._associative_memory.known_objects
+        if self._use_lfm and self._lfm is not None:
+            known = self._lfm.known_objects
+        else:
+            known = self._associative_memory.known_objects
         self._evidence = {obj: 0.0 for obj in known}
+
+        # Sync cortical attractors from current prototypes
+        self._sync_cortical_attractors()
+
+    def _sync_cortical_attractors(self):
+        """Sync Hopfield attractor patterns from associative memory prototypes.
+
+        In cortical attractor mode, the Hopfield network stores one
+        pattern per known object — the slowly-learned prototype from
+        the associative memory.  This is biologically analogous to L2/3
+        recurrent connectivity forming object-level attractors through
+        experience.
+        """
+        protos = self._associative_memory.get_prototypes()
+        if protos is not None and protos.shape[0] > 0:
+            self._hopfield.set_patterns(protos)
+        else:
+            self._hopfield.clear()
 
     def post_episode(self):
         """Finalize episode."""
@@ -542,18 +659,22 @@ class CorticalColumnTorch:
                 )
 
             if self._current_object:
-                # Store final pattern in Hopfield memory
-                if self._active.abs().sum() > 0:
-                    if self._use_phase_coding and self._oscillator is not None:
-                        aug = self._oscillator.augment_pattern(self._active)
-                        self._hopfield.store(aug)
-                    else:
-                        self._hopfield.store(self._active)
+                # Store final observation in episodic memory (HPC)
+                pat = self._last_pre_settle
+                if pat.abs().sum() > 0:
+                    self._episodic_memory.store(
+                        pat, label=self._current_object,
+                    )
+
+                # Sync cortical attractors from updated prototypes
+                self._sync_cortical_attractors()
+
                 logger.info(
-                    "CorticalColumnTorch: learned '%s', %d Hopfield patterns, "
-                    "%d objects",
+                    "CorticalColumnTorch: learned '%s', "
+                    "%d cortical attractors, %d episodes, %d objects",
                     self._current_object,
                     self._hopfield.n_stored,
+                    self._episodic_memory.n_stored,
                     len(self._associative_memory.known_objects),
                 )
 
@@ -582,6 +703,17 @@ class CorticalColumnTorch:
             # 1. Encode
             input_vec = self._encoder.encode(state)
             current_location = np.asarray(state.location, dtype=np.float64)
+
+            # 1a. Split for location-feature memory (Phase 11)
+            lfm_loc_enc = lfm_feat_enc = None
+            lfm_world_disp = np.zeros(3, dtype=np.float64)
+            if self._use_lfm:
+                _lb = self._encoder._location_bits
+                lfm_loc_enc = input_vec[:_lb]
+                lfm_feat_enc = input_vec[_lb:]
+                # Compute displacement before _prev_location is updated
+                if self._prev_location is not None:
+                    lfm_world_disp = current_location - self._prev_location
 
             # 1b. Motor prediction
             motor_pred_error = 0.0
@@ -628,12 +760,15 @@ class CorticalColumnTorch:
             # 4. Cell activation
             self._activate_cells()
 
-            # Save pre-settling activation for associative memory recall.
-            # Object identity comes from feedforward activation (ventral
-            # stream), not recurrent attractor dynamics (temporal prediction).
+            # Save pre-settle activation.  This is the raw cortical
+            # pattern before attractor denoising — used for episodic
+            # storage and associative memory learning.
             pre_settle_active = self._active.clone()
+            self._last_pre_settle = pre_settle_active
 
-            # 5. Hopfield settling
+            # 5. Hopfield settling — denoise toward cortical attractors
+            # Cortical attractors are object-level prototypes (no phase
+            # augmentation), so we always use the base settling path.
             beta = self._beta
             if self._use_neuromodulation and self._neuromod is not None:
                 beta *= self._neuromod.beta_scale()
@@ -643,22 +778,13 @@ class CorticalColumnTorch:
             if self._use_plateau and self._plateau is not None:
                 query = self._plateau.enrich_query(query)
 
-            if self._use_phase_coding and self._oscillator is not None:
-                from tbp.monty.frameworks.models.cortical_column_torch.oscillator import (
-                    PhaseAugmentedHopfield,
+            def sparsity_fn(x):
+                return enforce_sparsity(
+                    x, self.n_minicolumns, self.n_cells_per_minicolumn
                 )
-                phase_hop = PhaseAugmentedHopfield(
-                    self._hopfield, self._oscillator, self.n_cells
-                )
-                settled, n_iters = phase_hop.settle(query, beta=beta)
-            else:
-                def sparsity_fn(x):
-                    return enforce_sparsity(
-                        x, self.n_minicolumns, self.n_cells_per_minicolumn
-                    )
-                settled, n_iters = self._hopfield.settle(
-                    query, beta=beta, sparsity_fn=sparsity_fn,
-                )
+            settled, n_iters = self._hopfield.settle(
+                query, beta=beta, sparsity_fn=sparsity_fn,
+            )
             self._active = settled
 
             # 6. Surprise: 1 - overlap between predicted and active
@@ -743,23 +869,22 @@ class CorticalColumnTorch:
                     active_binary, ctx_binary, apical_pred_binary,
                 )
 
-            # Store pattern in Hopfield memory during training
-            if self._mode == "train" and self._active.abs().sum() > 0:
-                if self._use_phase_coding and self._oscillator is not None:
-                    aug = self._oscillator.augment_pattern(self._active)
-                    self._hopfield.store(aug)
-                else:
-                    self._hopfield.store(self._active)
+            # 7b. Episodic storage (HPC): one-shot store of raw observation
+            if self._mode == "train" and pre_settle_active.abs().sum() > 0:
+                self._episodic_memory.store(
+                    pre_settle_active, label=self._current_object,
+                )
 
             # SP learning
             if self._mode == "train":
                 self._sp_learn(input_vec, lr)
 
             # 8. Object memory + evidence
-            # Use pre-settling activation for classification — Hopfield
-            # settling is for temporal prediction, not object identity.
+            # Pre-settle activation for both train and eval: keeps the
+            # prototype space consistent (prototypes are learned from
+            # pre-settle, queries should match).
             if self._mode == "train":
-                self._activation_history.append(self._active.clone())
+                self._activation_history.append(pre_settle_active.clone())
                 # Auto-generate label if none was provided.
                 if not self._current_object and len(self._activation_history) >= 5:
                     self._current_object = (
@@ -771,13 +896,89 @@ class CorticalColumnTorch:
                     self._associative_memory.learn(
                         pre_settle_active, self._current_object, lr=lr * 0.1,
                     )
+                    # Sync cortical attractors after prototype update
+                    self._sync_cortical_attractors()
+                    # Store in location-feature memory (Phase 11)
+                    if self._use_lfm and self._lfm is not None:
+                        self._lfm.store(
+                            lfm_loc_enc, lfm_feat_enc, self._current_object,
+                            raw_location=current_location,
+                        )
             elif self._mode == "eval":
-                scores = self._associative_memory.recall(pre_settle_active)
-                for obj_name, score in scores.items():
-                    prev = self._evidence.get(obj_name, 0.0)
-                    if self._evidence_decay > 0:
-                        prev *= (1 - self._evidence_decay)
-                    self._evidence[obj_name] = prev + score
+                if self._use_lfm and self._lfm is not None:
+                    tracker = self._predictive_tracker
+                    _lb = self._encoder._location_bits
+
+                    # -- Anchor-Track-Predict-Surprise loop --
+                    #
+                    # 1. Feature-only query (always): rotation-invariant
+                    #    baseline evidence + predicted object locations
+                    _, feat_ev, pred_locs = self._lfm.query_features(
+                        lfm_feat_enc
+                    )
+
+                    # 2. Predictive tracking per object
+                    #    (lfm_world_disp computed at step 1a, before
+                    #    _prev_location was overwritten)
+                    prediction_bonus: dict[str, float] = {}
+                    for obj_name in list(feat_ev.keys()):
+                        if tracker.is_anchored(obj_name):
+                            # Track: path integration (world displacement
+                            # as object-frame approximation)
+                            tracker.track(obj_name, lfm_world_disp)
+                            tracked_loc = tracker.get_location(obj_name)
+
+                            # Predict: what features at this location?
+                            loc_enc = self._encoder.encode_location(
+                                tracked_loc,
+                            )
+                            retrieved, _ = self._lfm.query_location(
+                                loc_enc,
+                            )
+                            predicted_feat = retrieved[_lb:]
+
+                            # Surprise: predicted vs actual features
+                            cos_sim = float(
+                                torch.nn.functional.cosine_similarity(
+                                    predicted_feat.unsqueeze(0),
+                                    lfm_feat_enc.unsqueeze(0),
+                                ).item()
+                            )
+
+                            if cos_sim > tracker.surprise_threshold:
+                                # Low surprise — prediction confirmed
+                                prediction_bonus[obj_name] = cos_sim
+                                tracker.confirm(obj_name)
+                            else:
+                                # High surprise — drop and re-anchor
+                                tracker.drop(obj_name)
+
+                        # Anchor if not currently tracking
+                        if (
+                            not tracker.is_anchored(obj_name)
+                            and not tracker.is_retired(obj_name)
+                            and feat_ev.get(obj_name, 0.0)
+                            > tracker.anchor_evidence_threshold
+                            and obj_name in pred_locs
+                        ):
+                            tracker.anchor(obj_name, pred_locs[obj_name])
+
+                    # 4. Accumulate evidence: feature baseline +
+                    #    prediction confirmation bonus
+                    for obj_name, score in feat_ev.items():
+                        prev = self._evidence.get(obj_name, 0.0)
+                        if self._evidence_decay > 0:
+                            prev *= (1 - self._evidence_decay)
+                        bonus = prediction_bonus.get(obj_name, 0.0)
+                        total = score + bonus * tracker.prediction_bonus_weight
+                        self._evidence[obj_name] = prev + total
+                else:
+                    scores = self._associative_memory.recall(pre_settle_active)
+                    for obj_name, score in scores.items():
+                        prev = self._evidence.get(obj_name, 0.0)
+                        if self._evidence_decay > 0:
+                            prev *= (1 - self._evidence_decay)
+                        self._evidence[obj_name] = prev + score
 
             # Update neuromodulators
             if self._use_neuromodulation and self._neuromod is not None:
@@ -891,30 +1092,22 @@ class CorticalColumnTorch:
             )
             padded[:n_l23_cells] = l23_act
 
-            # Save pre-settling activation for associative memory recall.
+            # Save pre-settle activation
             pre_settle_active = padded.clone()
+            self._last_pre_settle = pre_settle_active
 
             # Plateau enrichment before settling
             if self._use_plateau and self._plateau is not None:
                 padded = self._plateau.enrich_query(padded)
 
-            # Phase augmentation
-            if self._use_phase_coding and self._oscillator is not None:
-                from tbp.monty.frameworks.models.cortical_column_torch.oscillator import (
-                    PhaseAugmentedHopfield,
+            # Cortical attractor settling (no phase augmentation)
+            def sparsity_fn(x):
+                return enforce_sparsity(
+                    x, self.n_minicolumns, self.n_cells_per_minicolumn
                 )
-                phase_hop = PhaseAugmentedHopfield(
-                    self._hopfield, self._oscillator, self.n_cells
-                )
-                settled, n_iters = phase_hop.settle(padded, beta=beta)
-            else:
-                def sparsity_fn(x):
-                    return enforce_sparsity(
-                        x, self.n_minicolumns, self.n_cells_per_minicolumn
-                    )
-                settled, n_iters = self._hopfield.settle(
-                    padded, beta=beta, sparsity_fn=sparsity_fn,
-                )
+            settled, n_iters = self._hopfield.settle(
+                padded, beta=beta, sparsity_fn=sparsity_fn,
+            )
 
             self._active = settled
 
@@ -1046,19 +1239,15 @@ class CorticalColumnTorch:
                 # L6 feedback learning
                 self._l6.learn(surprise, lr)
 
-            # Hopfield pattern storage
-            if self._mode == "train" and self._active.abs().sum() > 0:
-                if self._use_phase_coding and self._oscillator is not None:
-                    aug = self._oscillator.augment_pattern(self._active)
-                    self._hopfield.store(aug)
-                else:
-                    self._hopfield.store(self._active)
+            # Episodic storage (HPC)
+            if self._mode == "train" and pre_settle_active.abs().sum() > 0:
+                self._episodic_memory.store(
+                    pre_settle_active, label=self._current_object,
+                )
 
             # 10. Object memory + evidence
-            # Use pre-settling activation for classification — Hopfield
-            # settling is for temporal prediction, not object identity.
             if self._mode == "train":
-                self._activation_history.append(self._active.clone())
+                self._activation_history.append(pre_settle_active.clone())
                 if not self._current_object and len(self._activation_history) >= 5:
                     self._current_object = (
                         self._associative_memory.auto_label(
@@ -1069,6 +1258,7 @@ class CorticalColumnTorch:
                     self._associative_memory.learn(
                         pre_settle_active, self._current_object, lr=lr * 0.1,
                     )
+                    self._sync_cortical_attractors()
             elif self._mode == "eval":
                 scores = self._associative_memory.recall(pre_settle_active)
                 for obj_name, score in scores.items():
@@ -1113,6 +1303,11 @@ class CorticalColumnTorch:
             & self._ff_potential
         ).float()
         overlap = (connected * active_input.unsqueeze(0)).sum(dim=1)
+
+        # Save per-minicolumn overlap for cell activation (Level 3).
+        # Different overlap magnitudes interact with the developmental
+        # cell bias to select different cells within each minicolumn.
+        self._mc_overlap = overlap
 
         # Boost
         boosted = overlap * self._boost_factors
@@ -1201,8 +1396,15 @@ class CorticalColumnTorch:
                 noise = torch.rand(k, device=self.device) * 0.3
                 active_2d[mc] = apical * 0.5 + noise
             else:
-                # State 4: neither — full burst (all cells active equally)
-                active_2d[mc] = 1.0 / k
+                # State 4: burst with developmental wiring bias.
+                # Each cell has a fixed random preference (self._cell_bias)
+                # modulated by the minicolumn's overlap score.  Different
+                # inputs produce different overlaps, which interact with
+                # the per-cell bias to select different winners — analogous
+                # to innate wiring diversity in cortical development.
+                overlap_val = self._mc_overlap[mc]
+                bias = self._cell_bias[mc] * (overlap_val * 0.001)
+                active_2d[mc] = (1.0 / k) + bias
 
         # Enforce sparsity: top-1 per minicolumn
         self._active = enforce_sparsity(
@@ -1242,6 +1444,103 @@ class CorticalColumnTorch:
 
             self._context = ctx
 
+    def step_from_context(self) -> dict:
+        """Run a reduced step using only received context (no sensor input).
+
+        Designed for parent columns that have no sensor module. Uses the
+        received context vector as the activation, settles it in Hopfield
+        memory, and queries the associative memory for evidence.
+
+        Returns the same dict format as :meth:`step`.
+        """
+        import torch
+
+        if self._context is None or self._context.abs().sum() < 1e-8:
+            return self._empty_result()
+
+        with torch.no_grad():
+            # Use context as activation
+            self._active = self._context.clone()
+
+            # Enforce sparsity
+            self._active = enforce_sparsity(
+                self._active, self.n_minicolumns,
+                self.n_cells_per_minicolumn,
+            )
+
+            # Save pre-settle for Hopfield storage
+            pre_settle_active = self._active.clone()
+
+            # Hopfield settling
+            beta = self._beta
+            if self._use_neuromodulation and self._neuromod is not None:
+                beta *= self._neuromod.beta_scale()
+
+            def sparsity_fn(x):
+                return enforce_sparsity(
+                    x, self.n_minicolumns, self.n_cells_per_minicolumn,
+                )
+
+            settled, n_iters = self._hopfield.settle(
+                self._active, beta=beta, sparsity_fn=sparsity_fn,
+            )
+            self._active = settled
+
+            # Surprise from prediction overlap
+            pred_overlap = (self._predicted * self._active.abs()).sum()
+            active_norm = self._active.abs().sum() + 1e-8
+            surprise = 1.0 - float(pred_overlap / active_norm)
+            surprise = max(0.0, min(1.0, surprise))
+            self._surprise = surprise
+
+            # Object memory
+            if self._mode == "train":
+                lr = self._base_lr * (0.1 + 0.9 * surprise)
+                # Episodic storage (HPC)
+                self._episodic_memory.store(
+                    pre_settle_active, label=self._current_object,
+                )
+                if self._current_object:
+                    self._associative_memory.learn(
+                        self._active, self._current_object, lr=lr,
+                    )
+                    self._sync_cortical_attractors()
+                else:
+                    # Auto-label for parent
+                    self._auto_label_patterns.append(
+                        self._active.detach().cpu()
+                    )
+                    if len(self._auto_label_patterns) >= 5:
+                        label = self._associative_memory.auto_label(
+                            self._auto_label_patterns
+                        )
+                        self._current_object = label
+                        self._associative_memory.learn(
+                            self._active, label, lr=lr,
+                        )
+                        self._sync_cortical_attractors()
+
+            elif self._mode == "eval":
+                scores = self._associative_memory.recall(self._active)
+                for name, score in scores.items():
+                    self._evidence[name] = (
+                        self._evidence.get(name, 0.0)
+                        + score - self._evidence_decay
+                    )
+
+            # Update prediction for next step
+            self._predicted = self._dendrites.predict(self._active)
+            self._step_count += 1
+
+        return {
+            "surprise": self._surprise,
+            "evidence": dict(self._evidence),
+            "mlh": self._get_mlh(),
+            "active_cells": self._active.cpu().numpy(),
+            "settling_iterations": n_iters,
+            "motor_prediction_error": 0.0,
+        }
+
     def get_context_signal(self) -> dict | None:
         """Return context signal for child LMs."""
         if self._step_count == 0:
@@ -1257,6 +1556,8 @@ class CorticalColumnTorch:
         return self._get_mlh()
 
     def get_all_known_object_ids(self) -> list[str]:
+        if self._use_lfm and self._lfm is not None:
+            return self._lfm.known_objects
         return self._associative_memory.known_objects
 
     def _get_mlh(self) -> dict:
@@ -1291,19 +1592,27 @@ class CorticalColumnTorch:
     # ------------------------------------------------------------------
 
     def state_dict(self) -> dict:
-        return {
+        sd = {
             "hopfield": self._hopfield.state_dict(),
             "associative_memory": self._associative_memory.state_dict(),
+            "episodic_memory": self._episodic_memory.state_dict(),
             "ff_permanences": self._ff_permanences.cpu(),
             "ff_potential": self._ff_potential.cpu(),
             "boost_factors": self._boost_factors.cpu(),
             "mc_duty_cycle": self._mc_duty_cycle.cpu(),
             "evidence": dict(self._evidence),
         }
+        if self._use_lfm and self._lfm is not None:
+            sd["location_feature_memory"] = self._lfm.state_dict()
+        return sd
 
     def load_state_dict(self, sd: dict) -> None:
         self._hopfield.load_state_dict(sd["hopfield"])
         self._associative_memory.load_state_dict(sd["associative_memory"])
+        if "episodic_memory" in sd:
+            self._episodic_memory.load_state_dict(sd["episodic_memory"])
+        if "location_feature_memory" in sd and self._lfm is not None:
+            self._lfm.load_state_dict(sd["location_feature_memory"])
         self._ff_permanences = sd["ff_permanences"].to(self.device)
         self._ff_potential = sd["ff_potential"].to(self.device)
         self._boost_factors = sd["boost_factors"].to(self.device)

@@ -33,6 +33,13 @@ class HopfieldAssociativeMemory:
         Inverse temperature for softmax retrieval.
     learning_rate : float
         Hebbian learning rate for storage.
+    ema_alpha : float
+        Exponential moving average decay for prototype learning.
+        Higher = more plastic (recent observations dominate).
+        Lower = more stable (slow consolidation, like cortex).
+        Default 0.01 balances stability with recency.  With ~240
+        observations per object, this gives the last ~100 observations
+        ~63% of the total weight.
     device : str
         PyTorch device.
     """
@@ -43,12 +50,14 @@ class HopfieldAssociativeMemory:
         n_label_bits: int = 256,
         beta: float = 8.0,
         learning_rate: float = 0.01,
+        ema_alpha: float = 0.01,
         device: str = "cpu",
     ):
         self.n_cells = n_cells
         self.n_label_bits = n_label_bits
         self.beta = beta
         self.learning_rate = learning_rate
+        self._ema_alpha = ema_alpha
         self.device = torch.device(device)
 
         # Weight matrix: W @ x → label space
@@ -86,18 +95,39 @@ class HopfieldAssociativeMemory:
             # Hebbian: W += lr * label ⊗ x
             self._W += rate * torch.outer(label, x)
 
-            # Prototype: running mean (count-based) for stable averaging
-            # across the full training trajectory, not just recent observations.
+            # Prototype: exponential moving average (EMA) for cortical-
+            # style consolidation.  Early observations use a larger
+            # effective alpha (1/n) so the prototype bootstraps quickly;
+            # once enough observations accumulate, the fixed EMA rate
+            # takes over, giving a recency bias that tracks viewpoint
+            # drift without washing out with running-mean averaging.
             if object_name not in self._prototypes:
                 self._prototypes[object_name] = x.clone()
                 self._proto_counts[object_name] = 1
             else:
                 n = self._proto_counts[object_name] + 1
                 self._proto_counts[object_name] = n
-                # Online mean: proto = proto + (x - proto) / n
-                self._prototypes[object_name] += (
-                    x - self._prototypes[object_name]
-                ) / n
+                # Use max(ema_alpha, 1/n): fast bootstrap, then EMA
+                alpha = max(self._ema_alpha, 1.0 / n)
+                self._prototypes[object_name] = (
+                    (1.0 - alpha) * self._prototypes[object_name]
+                    + alpha * x
+                )
+
+    def get_prototypes(self) -> torch.Tensor | None:
+        """Return stacked object prototypes as (n_objects, n_cells) tensor.
+
+        These are the slowly-learned cortical representations — suitable
+        for use as Hopfield attractor patterns in the cortical column.
+        Returns None if no prototypes exist.
+        """
+        if not self._prototypes:
+            return None
+        return torch.stack(list(self._prototypes.values()))
+
+    def get_prototype_labels(self) -> list[str]:
+        """Return object names in the same order as get_prototypes() rows."""
+        return list(self._prototypes.keys())
 
     def recall(self, x: torch.Tensor) -> dict[str, float]:
         """Retrieve per-object evidence using attention over prototypes.
@@ -130,11 +160,35 @@ class HopfieldAssociativeMemory:
             return scores
 
     def auto_label(self, activation_history: list[torch.Tensor]) -> str:
-        """Generate a deterministic label from activation history."""
-        # Hash the first few patterns
+        """Generate a stable label from activation history.
+
+        Uses a structural fingerprint: binarize the prototype (mean of
+        activations) at half the maximum value, then hash the active
+        indices. This is robust because:
+        - Averaging smooths noise across observations
+        - Threshold at max/2 exploits the gap between truly active
+          cells (~1.0) and noise (~0), making it invariant to small
+          perturbations
+        - Sorted indices produce a canonical representation
+        """
+        # Compute prototype from all available patterns
+        stacked = torch.stack([p.float() for p in activation_history])
+        prototype = stacked.mean(dim=0).abs()
+
+        # Threshold at half the peak — exploits the large gap between
+        # active cells and background noise in sparse activations
+        peak = prototype.max()
+        if peak < 1e-8:
+            # Degenerate case: hash raw bytes
+            h = hashlib.sha256(prototype.cpu().numpy().tobytes())
+            return f"auto_{h.hexdigest()[:12]}"
+
+        threshold = peak * 0.5
+        active_indices = torch.nonzero(prototype > threshold, as_tuple=True)[0]
+
+        # Hash the sorted active indices
         h = hashlib.sha256()
-        for pat in activation_history[:5]:
-            h.update(pat.cpu().numpy().tobytes())
+        h.update(active_indices.cpu().numpy().tobytes())
         return f"auto_{h.hexdigest()[:12]}"
 
     def _make_label(self, name: str) -> torch.Tensor:

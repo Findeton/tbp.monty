@@ -48,6 +48,7 @@ class ModernHopfieldMemory:
         max_stored: int = 1000,
         max_settle_iters: int = 10,
         convergence_threshold: float = 1e-4,
+        novelty_threshold: float | None = 0.7,
         device: str = "cpu",
     ):
         self.n_cells = n_cells
@@ -55,6 +56,7 @@ class ModernHopfieldMemory:
         self.max_stored = max_stored
         self.max_settle_iters = max_settle_iters
         self.convergence_threshold = convergence_threshold
+        self._novelty_threshold = novelty_threshold
         self.device = torch.device(device)
 
         # Stored patterns: (n_stored, n_cells)
@@ -67,15 +69,38 @@ class ModernHopfieldMemory:
     def n_stored(self) -> int:
         return self._n_stored
 
-    def store(self, pattern: torch.Tensor) -> None:
-        """Store a pattern (Hebbian accumulation).
+    def store(
+        self,
+        pattern: torch.Tensor,
+        novelty_threshold: float | None = None,
+    ) -> bool:
+        """Store a pattern if it's sufficiently novel.
 
-        Normalizes the pattern before storing.
+        Stores the raw (unnormalized) pattern to preserve magnitude
+        information — biologically, firing rates carry signal.  When
+        ``novelty_threshold`` is set, a new pattern is only stored if
+        its maximum cosine similarity to all existing patterns is below
+        the threshold.  This implements hippocampal novelty gating.
+
+        Returns True if the pattern was stored, False if it was too
+        similar to an existing pattern and was skipped.
         """
         with torch.no_grad():
             p = pattern.detach().to(self.device).float()
-            norm = p.norm() + 1e-8
-            p = p / norm
+
+            thresh = (novelty_threshold if novelty_threshold is not None
+                      else self._novelty_threshold)
+
+            # Novelty gate: cosine similarity check (normalize just
+            # for the comparison, not for storage)
+            if thresh is not None and self._n_stored > 0:
+                n = min(self._n_stored, self.max_stored)
+                p_unit = p / (p.norm() + 1e-8)
+                stored_norms = self._patterns[:n].norm(dim=1, keepdim=True) + 1e-8
+                stored_unit = self._patterns[:n] / stored_norms
+                sims = torch.mv(stored_unit, p_unit)
+                if sims.max().item() >= thresh:
+                    return False
 
             if self._n_stored < self.max_stored:
                 self._patterns = torch.cat(
@@ -87,6 +112,8 @@ class ModernHopfieldMemory:
                 idx = self._n_stored % self.max_stored
                 self._patterns[idx] = p
                 self._n_stored += 1
+
+            return True
 
     def settle(
         self,
@@ -181,6 +208,27 @@ class ModernHopfieldMemory:
             similarities = similarities - similarities.max()
             weights = torch.softmax(similarities, dim=0)
             return torch.mv(xi.t(), weights)
+
+    def set_patterns(self, patterns: torch.Tensor) -> None:
+        """Replace all stored patterns (cortical attractor mode).
+
+        In cortical attractor mode, the Hopfield network stores a small
+        number of slowly-learned object representations (one per known
+        object).  This method sets those attractor patterns directly,
+        rather than accumulating them one-shot via ``store()``.
+
+        Parameters
+        ----------
+        patterns : Tensor (n_patterns, n_cells)
+            The attractor patterns — typically object prototypes from
+            the associative memory.
+        """
+        with torch.no_grad():
+            p = patterns.detach().to(self.device).float()
+            if p.ndim == 1:
+                p = p.unsqueeze(0)
+            self._patterns = p
+            self._n_stored = p.shape[0]
 
     def clear(self) -> None:
         """Remove all stored patterns."""

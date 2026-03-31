@@ -514,6 +514,18 @@ class CorticalColumnTorchLM(LearningModule):
     def receive_context(self, **context_signal) -> None:
         self._column.receive_context(**context_signal)
 
+        # Parent LM pattern: if this LM was NOT stepped by a sensor module
+        # this cycle, drive it from the received context.  This makes parent
+        # columns in a heterarchy functional — they aggregate children's
+        # activations through their own Hopfield + associative memory.
+        if not self._stepped and context_signal.get("active_cells") is not None:
+            result = self._column.step_from_context()
+            self._last_result = result
+            self._stepped = True
+            self._step_count += 1
+            self.evidence = dict(self._column._evidence)
+            self._update_possible_matches()
+
     def get_context_signal(self) -> dict | None:
         if not self._stepped:
             return None

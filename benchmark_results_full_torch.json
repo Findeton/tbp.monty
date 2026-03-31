@@ -1,46 +1,46 @@
 {
   "single_column_ycb": {
-    "accuracy": 0.85,
-    "n_correct": 17,
+    "accuracy": 0.7,
+    "n_correct": 14,
     "n_episodes": 20,
-    "wall_clock": 52.542381250000005
+    "wall_clock": 83.906850292
   },
   "two_lm_voting": {
     "walk_detected": "fox_walk",
     "walk_correct": true,
-    "static_detected": "fox_static",
-    "static_correct": true,
-    "children_have_evidence": true,
-    "morph_evidence": {
-      "fox_walk": 8.954050726596698,
-      "fox_static": 2.407462090573273
-    },
-    "behavior_evidence": {
-      "fox_walk": 10.64875848549175,
-      "fox_static": 6.7343789968283545
-    },
-    "train_time": 1.1060459999999992,
-    "eval_time": 0.43340937499999654
-  },
-  "three_lm_heterarchy": {
-    "walk_detected": "fox_static",
-    "walk_correct": false,
     "static_detected": "fox_walk",
     "static_correct": false,
     "children_have_evidence": true,
-    "train_time": 0.9788028749999995,
-    "eval_time": 0.39498987500000027
+    "morph_evidence": {
+      "fox_walk": 8.804343992367086,
+      "fox_static": 2.5571689067244843
+    },
+    "behavior_evidence": {
+      "fox_walk": 10.298076367208532,
+      "fox_static": 7.894706377355084
+    },
+    "train_time": 1.2765436669999985,
+    "eval_time": 0.5367523339999991
+  },
+  "three_lm_heterarchy": {
+    "walk_detected": "fox_walk",
+    "walk_correct": true,
+    "static_detected": "fox_walk",
+    "static_correct": false,
+    "children_have_evidence": true,
+    "train_time": 1.248040666999998,
+    "eval_time": 0.5623399159999991
   },
   "auto_label": {
     "n_auto_labels": 2,
     "auto_labels": [
-      "auto_7f69a70032c7",
-      "auto_1debbeba5f24"
+      "auto_88b7f1f0acaf",
+      "auto_6082ce297141"
     ],
-    "anim_detected": "auto_7f69a70032c7",
-    "static_detected": "auto_7f69a70032c7",
+    "anim_detected": "auto_88b7f1f0acaf",
+    "static_detected": "auto_88b7f1f0acaf",
     "discriminated": false,
-    "train_time": 0.390159833999995,
-    "eval_time": 0.23853404199999773
+    "train_time": 0.5025960830000002,
+    "eval_time": 0.2656191250000006
   }
 }

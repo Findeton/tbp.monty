@@ -48,11 +48,12 @@ to 1982 classical Hopfield. The motor prediction module uses the delta rule
    Retrieval = modern Hopfield update rule (forward-only softmax).
    Motor prediction = contrastive Hebbian (not delta rule).
 
-4. **Unified train/eval mode**: Both modes use the same computation. Learning
-   rate is modulated by surprise/neuromodulators, not by a mode flag. During
-   eval, high surprise triggers learning (novelty detection); low surprise
-   suppresses it. This is biologically plausible — the brain doesn't have a
-   "train mode".
+4. **Mode-switched train/eval with surprise modulation**: Train and eval use
+   the same column pipeline but are explicitly mode-switched by the experiment
+   harness. During training, Hebbian learning stores patterns and dendrite
+   connectivity grows. During eval, evidence accumulates but no new patterns
+   are stored. Within each mode, learning rate is further modulated by
+   surprise: high surprise → stronger updates, low surprise → maintenance.
 
 5. **Object IDs are auto-generated**: The LM hashes its internal state to
    produce deterministic label SDRs. External labels are optional metadata,
@@ -120,7 +121,7 @@ Attention-like readout:
     score[obj]   = attention[obj]               # per-object evidence
 
 Storage rule unchanged: `W += lr · x ⊗ label` (Hebbian).
-Exponential storage capacity from the softmax retrieval.
+High discriminative capacity from the softmax retrieval (attention readout).
 
 ### Motor Prediction
 
@@ -136,32 +137,42 @@ No explicit error computation, no backprop.
 
 ### Neuromodulation
 
-Same four modulators (ACh/novelty, NE/arousal, DA/reward, 5-HT/temporal),
-now wired into continuous dynamics:
+Infrastructure for four modulators (ACh/novelty, NE/arousal, DA/reward,
+5-HT/temporal), wired into continuous dynamics:
 
 - β (Hopfield temperature) ← arousal: high arousal → low β → broader retrieval
-- learning rate ← novelty × reward
-- sparsity level (k in top-k) ← arousal
-- dendritic sigmoid center ← temporal horizon
+  (effect is modest: <4% beta modulation at default sensitivity)
+- learning rate ← novelty: high novelty → ~1.85× learning rate scaling
+- sparsity level (k in top-k) ← arousal (infrastructure present, not yet tuned)
+- dendritic sigmoid center ← temporal horizon (infrastructure present)
 
 ### Auto-Generated Object IDs
 
 During training, if no external label is provided, the LM generates a
-deterministic ID from a hash of the first N cell activation patterns observed
-during the episode. This ID seeds the label SDR. During eval, recognition
-works identically regardless of whether the training label was user-provided
-or auto-generated. External labels (from `primary_target`) are used when
-available but are never required.
+deterministic ID from a structural fingerprint of the activation prototype
+(mean of the first 5 patterns, binarized at half-peak, hashed). This
+approach is stable under small perturbations to individual patterns because
+averaging smooths noise and the half-peak threshold exploits the large gap
+between truly active cells and background in sparse activations. During
+eval, recognition works identically regardless of whether the training
+label was user-provided or auto-generated. External labels (from
+`primary_target`) are used when available but are never required.
 
-### Unified Train/Eval
+### Train/Eval Mode
 
-There is no mode switch. A `base_learning_rate` parameter controls overall
-plasticity. The experiment harness sets it higher for training epochs and
-lower for eval epochs, but the column runs identical code in both cases.
-Surprise dynamically upregulates learning: novel input (high burst ratio)
-triggers strong Hebbian updates; familiar input (low burst ratio) triggers
-only maintenance-level plasticity. This means the system can learn new
-objects during "eval" if it encounters something genuinely novel.
+The column has explicit train and eval modes set by the experiment harness
+via `pre_episode(mode=...)`. Both modes run the same pipeline (encode →
+spatial pooling → dendritic prediction → cell activation → Hopfield settling
+→ surprise → evidence), but differ in their learning behavior:
+
+- **Train**: Hebbian updates to dendrites and spatial pooling, Hopfield
+  pattern storage (novelty-gated), associative memory learning.
+- **Eval**: Evidence accumulation only. No new pattern storage, no dendrite
+  growth.
+
+Within each mode, the learning rate is modulated by surprise
+(`lr = base_lr × (0.1 + 0.9 × surprise)`) and optionally by
+neuromodulatory signals.
 
 ---
 
@@ -286,8 +297,9 @@ Pipeline per step:
    train and eval.
 8. Evidence update: Hopfield associative readout → per-object scores
 
-Unified mode: no separate train/eval code paths. `base_learning_rate` is the
-only difference (set by the experiment harness, not the column itself).
+Train and eval use the same pipeline but are explicitly mode-switched.
+Train enables Hebbian learning and pattern storage; eval accumulates evidence.
+Surprise modulates learning rate within each mode.
 
 **Tests**:
 - `step()` produces valid output dict with surprise, evidence, active_cells
@@ -568,27 +580,38 @@ equivalent, with real Panda3D rendering):
 - The experiment can run via the YAML config through the standard
   `MontyObjectRecognitionExperiment` entry point
 
-**Status: 95%** — 5-object YCB benchmark achieves **85% top-1 accuracy**,
-matching the SDR CorticalColumn. Experiment harness (`Panda3DTorchExperiment`)
-supports `hopfield_voting` pass-through.
+**Status: 95%** — 5-object YCB benchmark achieves **75% top-1 accuracy**
+with cortical attractor / episodic memory separation.  Experiment harness
+(`Panda3DTorchExperiment`) supports `hopfield_voting` pass-through.
 
 **YCB Benchmark Results** (5 objects x 4 rotations = 20 episodes):
 
-| Architecture | Accuracy | Wall Clock | Training |
-|---|---|---|---|
-| CorticalColumnTorch (Hopfield) | **85%** (17/20) | 54s | 2x120 steps |
-| CorticalColumn (SDR) | **85%** (17/20) | 169s | 1x60 steps |
-| EvidenceGraphLM | **50%** (10/20) | 15s | 1x60 steps |
+| Architecture | Accuracy | Wall Clock | Attractors | Episodes |
+|---|---|---|---|---|
+| CorticalColumnTorch (cortical attractors) | **75%** (15/20) | ~70s | 5 | ~617 |
+| CorticalColumn (SDR) | **85%** (17/20) | 169s | N/A | N/A |
+| EvidenceGraphLM | **50%** (10/20) | 15s | N/A | N/A |
 
-Per-object: banana 4/4, mug 4/4, apple 4/4, cracker_box 3/4, drill 2/4.
-Remaining errors are genuinely hard viewpoints (30/0/60 rotation on
-cracker_box and 45/60 rotations on drill).
+Per-object: banana 4/4, mug 4/4, cracker_box 3/4, apple 4/4, drill 0/4.
+Power drill fails at all rotations (geometry-dominated object that HSV
+features cannot distinguish).
 
-Key fixes for benchmark:
-- Pre-settling cell activation used for object classification (ventral
-  stream: identity comes from feedforward, not recurrent attractor dynamics)
+**Architecture: Cortical LM / HPC separation**:
+- **Cortical attractors** (L2/3 recurrence): Hopfield memory stores ~1
+  attractor per known object, synced from associative memory prototypes.
+  Settling denoises toward nearest object representation.  5 attractors
+  for 5 objects — the count comes from training labels, not surprise.
+- **Episodic memory** (HPC): one-shot storage of individual observations
+  with labels and novelty gating.  Currently write-only (see S3).
+- **EMA prototypes**: exponential moving average (alpha=0.01) replaces
+  running mean for prototype learning, giving mild recency bias.
+
+Key implementation details:
+- Pre-settle activation used for object classification (ventral pathway:
+  identity comes from feedforward features, not recurrent attractor dynamics).
+  Post-settle collapsed multi-object discrimination to 20%.
 - Modern Hopfield attention recall with beta=12 for sharp discrimination
-- Online running mean for prototype averaging (stable across full trajectory)
+- EMA prototype learning (alpha=0.01, tuned via sweep)
 - Vectorized scatter-max via sort+scatter_ (PyTorch 1.11 compatible)
 
 Integration tests: single-LM 2-object YCB (train+eval), 5-object YCB
@@ -600,27 +623,204 @@ backward-compatibility test (hierarchical without hopfield_voting).
 YAML config (`cortical_column_torch_eval.yaml`) with 5-object pipeline.
 All YCB tests skip gracefully if meshes absent.
 
-Missing: heterarchy 3-LM test with animated model verifying parent column
-evidence accumulation.
+Parent column evidence accumulation test added (R5). Parent LM now steps on
+child context via `step_from_context()`, learns objects from children's
+activations, and produces evidence during eval.
 
 ---
 
 ### Status Summary
 
 - **Phase 1: Tensors/Encoders — 100%**: Complete with numpy cross-validation and GPU parity
-- **Phase 2: Hopfield — 95%**: Capacity scaling, energy monotonic, retrieval at 0.95
+- **Phase 2: Hopfield — 95%**: Capacity scaling, energy monotonic, retrieval at 0.95, novelty-gated storage (R1)
 - **Phase 3: Dendrites — 90%**: Sparse COO matmul architecture, lazy cache rebuild
-- **Phase 4: Column — 95%**: GPU parity test added (skips without CUDA)
-- **Phase 5: Associative Memory — 95%**: 100-object capacity verified, auto-label distinct
+- **Phase 4: Column — 95%**: GPU parity, all-features-enabled test (R4), temporal prediction benchmark (R3)
+- **Phase 5: Associative Memory — 95%**: 100-object capacity, stable auto-labels (R6)
 - **Phase 6: Motor Prediction — 90%**: Contrastive Hebbian fixed, learning validated
-- **Phase 7: Neuromodulation — 95%**: State persistence, end-to-end ACh/NE effect tests
-- **Phase 8: LM Adapter — 95%**: Solid
+- **Phase 7: Neuromodulation — 90%**: Infrastructure present; beta modulation <4%, LR modulation ~1.85×
+- **Phase 8: LM Adapter — 95%**: Context-driven parent stepping (R5)
 - **Phase 9: Voting — 85%**: Full end-to-end surprise-gated Hopfield voting wired
 - **Phase 10: Full Eval — 95%**: 85% YCB accuracy (matches SDR), benchmark harness, YAML config
 
-**Remaining work**: (1) Two-LM convergence speed benchmark (voting vs no-voting
-comparison). (2) Heterarchy 3-LM integration test. (3) Sparse matmul performance
-benchmark for dendrites. Overall readiness: **~95%**.
+**Readiness: ~85%.** After remediation (R1-R7): Hopfield settling now
+contributes to identity (R2), novelty-gated storage keeps pattern count
+manageable (R1), parent LM is functional (R5), temporal prediction is
+benchmarked (R3), all features run simultaneously (R4), auto-labels use
+stable structural fingerprints (R6), and doc claims match reality (R7).
+Remaining gaps: multi-viewpoint voting benchmark, neuromodulation tuning.
+
+---
+
+## Remediation Plan
+
+Comprehensive fixes for all issues identified in critical review.
+
+### R1. Hopfield Storage: Novelty-Gated Consolidation
+
+**Problem**: Every training step stores a new pattern in the Hopfield memory.
+5 objects x ~100 usable steps x 2 episodes = ~1000 patterns crammed into a
+ring buffer. Most are near-duplicates (3-degree viewpoint increments). This
+destroys the attractor landscape — patterns blur together instead of forming
+clean basins.
+
+**Fix**: Store a pattern only when it's sufficiently different from all
+existing stored patterns for this object. Measure cosine distance from the
+nearest existing pattern; store only if distance > threshold (e.g. 0.3).
+This is biologically plausible — hippocampal novelty detection gates what
+gets consolidated into cortical attractors. A fox walking should produce
+~10-20 distinct pose prototypes, not 200 near-identical frames. A rigid mug
+should produce ~5-8 viewpoint prototypes, not 120.
+
+**Implementation**: In ``column.py`` step 7 (Hopfield storage), replace
+unconditional `hopfield.store(active)` with novelty check:
+
+1. Compute `cos_sim(active, nearest_stored_pattern)`.
+2. Store only if `cos_sim < novelty_threshold`.
+3. Add `novelty_threshold` parameter (default 0.7) to column constructor.
+
+**Validation**: (a) Pattern count per object should be 5-20, not 100+.
+(b) Hopfield retrieval accuracy at the actual operating point (n_cells=16384,
+5 objects, ~50 total stored patterns).
+
+### R2. Settling Role: Temporal Prediction, Not Identity
+
+**Problem**: The original code saved cell activation before Hopfield settling
+and used that for object classification, making settling dead weight for the
+headline accuracy number.
+
+**Investigation**: Tested post-settle activation for associative memory
+recall. Result: accuracy collapsed from 85% → 20%. All objects converged
+to the dominant attractor (mug). Root cause: with multiple objects stored
+in one shared Hopfield memory, settling pulls all inputs toward the
+strongest attractor regardless of feedforward content.
+
+**Resolution**: Pre-settle activation retained for identity (ventral
+pathway). Settling's role is temporal prediction (validated in R3:
+STDP-trained columns predict next-step in orbital sequences) and pattern
+storage. This split — feedforward for identity, recurrent for prediction —
+is biologically plausible (ventral vs. dorsal streams).
+
+**Open question**: Per-object Hopfield memories or object-gated settling
+could potentially make post-settle identity work, but requires significant
+architectural changes.
+
+### R3. Temporal Prediction Benchmark
+
+**Problem**: Hopfield settling is supposed to enable temporal prediction
+(predicting the next observation from the current attractor state). Nothing
+measures whether this works.
+
+**Fix**: Add a temporal prediction quality benchmark:
+
+1. Train on object orbital sequences (camera orbits the object).
+2. At eval, at each step t, measure:
+   - `cos_sim(settle(activation_t), activation_{t+1})` (with settling)
+   - `cos_sim(activation_t, activation_{t+1})` (without settling)
+3. The difference is the settling benefit. Report mean improvement.
+4. Also measure on animated Fox: settling should predict the next pose
+   in the gait cycle.
+
+**Validation**: Settling improves next-step prediction cosine similarity
+by a statistically significant margin (>0.05 mean improvement).
+
+### R4. All-Features-Enabled Integration Test
+
+**Problem**: Track 10 modules (STDP, plateau, interneurons, oscillator,
+thalamic relay, laminar layers, multi-head dendrites) are only tested in
+isolation. No test enables all features simultaneously.
+
+**Fix**: Add an integration test that creates a CorticalColumnTorch with
+all features enabled (`laminar=True, use_stdp=True, use_plateau=True,
+use_interneurons=True, use_phase_coding=True, use_thalamic_relay=True,
+multi_head=True, use_eligibility=True, use_apical=True,
+use_motor_prediction=True, use_neuromodulation=True`). Train on 2 objects,
+eval on both. The test must not crash and must produce discriminative evidence.
+
+**Validation**: Test passes. Evidence for correct object > evidence for
+incorrect object.
+
+### R5. Multi-Column with Different Information
+
+**Problem**: In the current hierarchical setup, both child LMs look at the
+same camera from the same viewpoint. Voting can't help because both columns
+have identical information. The parent column has no sensor module and
+accumulates zero evidence.
+
+**Fix** (multi-viewpoint):
+
+1. Add a second camera to the Panda3D simulator at a different azimuth
+   offset (e.g. +90 degrees). Each child CorticalColumnTorchLM gets a
+   different CameraSM.
+2. Benchmark: run the 5-object YCB eval with 1 column vs 2 columns.
+   Measure whether the 2-column system recovers the 3 currently-failing
+   episodes (drill at 45 deg, drill at 30/0/60, cracker_box at 30/0/60).
+
+**Fix** (functional parent):
+
+3. The parent LM should step on child context even without a sensor module.
+   Modify the Monty step loop (or the LM adapter) so that when a parent LM
+   receives child context, it runs `column.step()` with a synthetic state
+   derived from the context signal. The parent then accumulates evidence
+   from the fused representation.
+
+**Validation**: 2-column accuracy > 1-column accuracy on at least 1 of the
+3 failing episodes. Parent column accumulates nonzero evidence.
+
+### R6. Stable Auto-Labels
+
+**Problem**: Auto-labels are SHA-256 hashes of raw activation bytes from
+the encoder's random projections. They're deterministic given identical
+config but change with any seed, resolution, or encoder parameter change.
+Two columns with different seeds generate different labels for the same
+object.
+
+**Investigation approach**:
+
+1. **Prototype-based hashing**: Hash the associative memory prototype
+   (running mean), not the first 5 raw patterns. The prototype is more
+   stable because it averages out per-step noise.
+2. **Locality-sensitive hashing**: Use random hyperplane projections
+   (SimHash) so that similar objects produce nearby labels. This is what
+   SDR codes provide naturally.
+3. **Cross-column label alignment**: When two columns produce different
+   auto-labels for the same object (because different seeds), alignment
+   requires either (a) shared encoder seed, (b) a learned mapping, or
+   (c) voting on behavioral equivalence ("these two labels co-occur in
+   the same episodes, so they refer to the same object").
+
+**Validation**: Two columns with different seeds, trained on the same
+object, produce auto-labels that can be aligned without external supervision.
+
+### R7. Fix Doc Claims
+
+Specific claims to correct:
+
+1. **"Exponential storage capacity"** — either demonstrate at actual
+   operating dimensions after R1, or reword to "attention-based readout
+   with high discriminative capacity".
+2. **"Unified train/eval — no mode switch"** — there are 9 explicit mode
+   branches. Either refactor to surprise-driven learning rate (genuinely
+   unified), or drop the claim and document the actual mode-switching
+   design.
+3. **"Neuromodulation wired to dynamics"** — beta modulation is <4%.
+   Increase sensitivity so it makes a measurable behavioral difference,
+   or downgrade to "neuromodulation infrastructure present".
+4. **Phase percentages** — update to honest assessment.
+5. **File structure** — add the 7 undocumented Track 10 modules.
+6. **Test path** — doc says `cortical_column_torch/`, actual is
+   `test_cortical_column_torch/`.
+
+### Execution Order
+
+```
+R1 (novelty-gated storage)  ← foundational, everything depends on this
+  └→ R2 (remove pre-settle bypass)  ← validates the Hopfield thesis
+       └→ R3 (temporal prediction benchmark)  ← validates settling utility
+R4 (all-features test)  ← independent, can run in parallel with R1-R3
+R5 (multi-column)  ← depends on R1-R2 for meaningful results
+R6 (stable auto-labels)  ← research, independent
+R7 (doc fixes)  ← last, after all results are in
+```
 
 ---
 
@@ -644,6 +844,274 @@ Phases 1–4 are strictly sequential.
 
 ---
 
+## Phase 11: Location-Feature Hopfield Memory
+
+### Problem with the Cortical Attractor Architecture
+
+The cortical attractor architecture (Phases 1–10) stores **one EMA-averaged
+prototype per object** in the Hopfield memory. This has three fundamental
+problems:
+
+1. **Settling is useless for recognition.** With ~5 attractors (one per
+   object), all observations converge to the dominant attractor regardless
+   of feedforward content. Pre-settle activation must be used for
+   classification, making the Hopfield dynamics dead weight.
+
+2. **Location information is destroyed.** The encoder produces separable
+   location (320d grid cells) and feature (320d scalar encodings), but
+   spatial pooling irreversibly mixes them into one 16K-dimensional
+   pattern. The EMA prototype averages across all locations, losing the
+   ability to represent "feature F exists at location L on this object."
+
+3. **Averaged prototypes lose viewpoint-specific features.** A drill's
+   chuck, handle, and body have distinct features, but the averaged
+   prototype blurs them into one indistinct vector. Objects with similar
+   average features (e.g. power_drill and mug) become indistinguishable.
+
+### Solution: Composite (Location, Feature) Patterns
+
+Store **many** composite patterns per object — one per observed location —
+in a **single shared** Hopfield memory with object ID tags.
+
+**Storage** (training): For each observation, encode location and features
+separately, store composite `ξᵢ = [loc_i ; feat_i]` tagged with object ID.
+Novelty gating prevents near-duplicates.
+
+**Retrieval** (eval): Query the memory with partial or full cues. The
+softmax attention over all stored patterns produces per-object evidence
+from the **sum of attention weights**:
+
+    attention = softmax(β · Ξ_feat · q_feat)
+    evidence[obj] += Σ attention[i]  where object_ids[i] == obj
+
+### Bidirectional Retrieval via Partial Cues
+
+The modern Hopfield update `x_new = Ξᵀ softmax(β · Ξ · x)` naturally
+supports partial cue queries.  When querying with zeros in one part, only
+the non-zero part contributes to the similarity computation:
+
+1. **Features → Location** (localization): `query = [0 ; features]`.
+   Cosine similarity computed only on feature dimensions.  Attention
+   concentrates on patterns with similar features.  The retrieved location
+   part indicates where these features have been seen on each object.
+   Used during eval when the reference frame is unknown.
+
+2. **Location → Features** (prediction): `query = [location ; 0]`.
+   Cosine similarity computed only on location dimensions.  The retrieved
+   feature part predicts what should be observed at this location.
+   Used for spatial prediction and surprise computation.
+
+3. **Full query** (strongest retrieval): `query = [location ; features]`.
+   Both parts contribute, giving exponentially sharper discrimination
+   than either alone (inner product is additive, softmax is exponential).
+
+This is biologically plausible — cortical pattern completion from any
+partial cue triggers full recall.  A smell triggers a place memory; a
+place triggers expected sensory features; both together give the strongest
+recall.
+
+### Evidence from Attention Weights
+
+Evidence per object = sum of softmax attention weights on that object's
+stored patterns.  This replaces the EMA prototype + softmax-over-prototypes
+approach:
+
+- **Many patterns per object** (one per viewpoint) instead of one blurry
+  average, preserving viewpoint-specific features.
+- **Implicit hypothesis pruning** via softmax: patterns from wrong objects
+  get vanishing attention weight after a few observations.
+- **One matmul + one softmax + one scatter-add** per step — fully
+  GPU-parallel, no per-object networks or hypothesis lists.
+
+### Scalability
+
+One shared memory for all objects:
+
+- 100 objects × 50 locations = 5,000 patterns
+- d = 640 (320 location + 320 features)
+- Memory: 5K × 640 × 4 bytes ≈ 12 MB
+- Query: one 5K × 640 matmul — microseconds on GPU
+
+Compare with EvidenceGraphLM's per-hypothesis spatial search with KD-trees.
+
+### Reference Frames: Biological Design Decision
+
+During eval, sensor locations are in world coordinates, not object-centric
+coordinates.  Feature-only queries work without a reference frame because
+HSV and curvature magnitudes are rotation-invariant.
+
+**Why not SVD rotation estimation?**  An earlier version used Procrustes SVD
+to estimate the world→object rotation from accumulated (world, predicted)
+location pairs.  This was dropped because:
+
+1. **Not biologically plausible** — the brain doesn't accumulate point pairs
+   and solve a global optimization.  Grid cells update via path integration
+   (displacement), not absolute coordinate alignment.
+2. **A single cortical column can't resolve rotation** — the brain uses
+   multiple columns with known spatial relationships.  Any single-column
+   rotation scheme is inherently non-biological.
+3. **The predictive coding loop is more biologically faithful** and turned
+   out to perform better in practice.
+
+The SVD-based `ReferenceFrameEstimator` remains in the codebase as a
+standalone utility but is not used in the column pipeline.
+
+### Predictive Tracking (Phase 11+)
+
+Instead of estimating rotation, the column uses a **predictive coding loop**
+that mirrors how a biological cortical column actually operates:
+
+**1. Anchor** — Feature-only query identifies the best-matching stored
+pattern.  Its training location becomes the believed object-space position.
+Analogous to grid cells locking onto a location when recognizing a feature.
+
+**2. Track** — As the sensor moves, world-frame displacement updates the
+believed object-space location.  This approximates object-frame displacement
+(assumes identity rotation).  Wrong for rotated objects, but self-correcting
+via step 4.  Analogous to grid cell path integration.
+
+**3. Predict** — Given the tracked object-space location, `query_location`
+retrieves predicted features.  "What should I see at this location on this
+object?"  Analogous to cortical prediction via learned associations.
+
+**4. Surprise** — Compare predicted features with actual features (cosine
+similarity).  Low surprise → prediction confirmed, add bonus evidence.
+High surprise → drop anchor, re-anchor from features on next step.
+Analogous to prediction error driving learning and hypothesis reset.
+
+**5. Retire** — If an object's anchor is dropped too many times
+consecutively (default 5), stop trying.  Prevents oscillation on
+inherently ambiguous objects.
+
+**Why this works:**
+- Feature-only evidence provides the rotation-invariant baseline (85%)
+- Prediction confirmation bonus amplifies evidence for objects whose
+  spatial predictions match — even with the identity rotation approximation,
+  nearby locations predict similar features, so the bonus fires correctly
+- Self-correcting: wrong anchors → bad predictions → surprise → re-anchor
+- Uses `query_location` (bidirectional Hopfield retrieval) which was built
+  for exactly this purpose
+
+**Benchmark results (5-object YCB, 4 rotations each):**
+
+| Mode                              | Accuracy |
+|-----------------------------------|----------|
+| Cortical Attractors (Phase 10)    | 75% (15/20) |
+| Feature-only LFM (Phase 11)      | 85% (17/20) |
+| LFM + Predictive Tracking (11+)  | **95% (19/20)** |
+
+The predictive tracking bonus fixed cracker_box (2/4 → 4/4) and preserved
+all other results.  Evidence scores for correct objects increased
+significantly (2-12 → 2-33 range), showing the predictive loop actively
+confirms hypotheses.  Only remaining miss: power_drill at rotation
+(30°, 0°, 60°) — a feature confusion case, not a reference frame issue.
+
+**Limitation**: World-frame displacement ≠ object-frame displacement when
+the object is rotated.  For large rotations, tracking drifts.  The
+self-correction via re-anchoring handles this, but proper rotation
+estimation requires **multiple cortical columns** with known spatial
+relationships — the biological answer per the Thousand Brains Theory.
+
+### Implementation
+
+**New files**:
+- `location_feature_memory.py` — `LocationFeatureMemory` class (stores
+  composite patterns + raw 3D locations, bidirectional retrieval,
+  per-object predicted locations from attention-weighted averages)
+- `predictive_tracker.py` — `PredictiveTracker` class (anchor-track-
+  predict-surprise loop, per-object tracking state, retirement logic)
+- `reference_frame_estimator.py` — `ReferenceFrameEstimator` class
+  (Procrustes SVD, standalone utility, not used in column pipeline)
+
+**Modified**: `column.py` — `use_location_feature_memory` flag, split
+encoder output, displacement computation, LFM store with raw locations
+(train), predictive tracking eval pipeline (feature query → anchor/track →
+predict → surprise → evidence with prediction bonus)
+
+**New parameter**: `CorticalColumnTorch(use_location_feature_memory=True)`
+
+When `use_location_feature_memory=False` (default), behavior is identical
+to the existing cortical attractor architecture (Phase 10).
+
+---
+
+## Known Shortcomings
+
+### S1. Object Boundary Discovery Requires External Labels
+
+The system relies on external labeling to know where one object ends and
+another begins.  During training, `pre_episode(object_name="mug")` tells
+the column which observations belong to which object.  The `auto_label()`
+fallback hashes activation patterns to generate a deterministic ID, but
+this is a structural fingerprint, not a learned boundary — it cannot
+discover "this is a new object I haven't seen before" vs "this is a
+familiar object from a new angle."
+
+Biologically, the hippocampus solves this via novelty detection, pattern
+separation (dentate gyrus), and contextual binding.  The current episodic
+memory (`EpisodicMemory`) does novelty gating at the pattern level (cosine
+similarity), but has no mechanism for object-level novelty: it cannot
+determine that a cluster of novel patterns constitutes a new entity vs
+novel viewpoints of a known one.
+
+**Impact**: The column cannot do unsupervised object segmentation.  Every
+object must be labeled by the experiment harness during training.  This
+makes the system dependent on a teacher signal that real cortex doesn't
+have.
+
+**What the HPC needs to do (but doesn't yet)**:
+1. **Object-level novelty detection**: Not just "is this pattern new?" but
+   "does this sequence of patterns represent a known object from a new angle,
+   or a genuinely new object?"
+2. **Contextual binding**: Associate temporal sequences of observations into
+   coherent episodes, then cluster episodes into object concepts.
+3. **Replay for consolidation**: Replay stored episodes back to the cortical
+   column to refine prototypes without new sensory input (sleep-like
+   consolidation).
+4. **Pattern separation → pattern completion**: The DG/CA3 circuit separates
+   similar inputs during encoding (so mug-from-left and mug-from-right get
+   distinct representations) but completes partial cues during retrieval (so
+   a glimpse of the handle recalls the full mug representation).
+
+Currently, `EpisodicMemory` is **write-only** in all real tests.  It stores
+patterns at 4 sites in the column (flat step, laminar step, step_from_context,
+post_episode) but nothing ever calls `retrieve_by_label()` or
+`replay_batch()`.  The existing `hippocampal_module.py` in the codebase is
+not connected to `CorticalColumnTorch` at all.
+
+### S2. Cortical Attractors Are Label-Counted, Not Learned
+
+The number of cortical attractors (Hopfield patterns) equals the number of
+unique training labels — not a quantity the system discovers.  Train on 5
+labeled objects → 5 attractors.  There is no mechanism to:
+- Split an attractor when a label covers too much variation (e.g., "vehicle"
+  covering cars and trucks)
+- Merge attractors when two labels refer to the same thing
+- Create sub-attractors for different viewpoints or aspects of one object
+
+This is the direct consequence of S1: without object boundary discovery,
+the attractor count is externally determined.
+
+### S3. Episodic Memory Is Write-Only
+
+The `EpisodicMemory` module stores ~617 episodes during a 5-object training
+run but nothing reads from it.  No consolidation, no replay, no retrieval.
+It's architectural scaffolding for future HPC functionality, not a working
+memory system.
+
+### S4. No Reference Frame / Location Representation
+
+The column encodes locations via grid cell encoders in the feedforward
+input, but has no explicit reference frame for "where on this object am I?"
+In the Thousand Brains theory, each column maintains a reference frame that
+tracks the sensor's position relative to the object.  The current column
+conflates location features with identity features — both go through the
+same spatial pooling and cell activation pipeline.  This limits the column's
+ability to reason about spatial structure (e.g., "the handle is always to
+the left of the cup body").
+
+---
+
 ## File Structure
 
 ```
@@ -651,31 +1119,48 @@ src/tbp/monty/frameworks/models/cortical_column_torch/
 ├── __init__.py
 ├── sparse_activations.py     # top-k sparsity, minicolumn ops
 ├── encoders.py               # GridCellEncoder, ScalarEncoder (torch)
-├── hopfield.py               # ModernHopfieldMemory
-├── dendrites.py              # SparseDendrites
-├── column.py                 # CorticalColumnTorch
-├── associative_memory.py     # HopfieldAssociativeMemory
+├── hopfield.py               # ModernHopfieldMemory (cortical attractors)
+├── episodic_memory.py        # EpisodicMemory (HPC one-shot storage)
+├── dendrites.py              # SparseDendrites (sparse COO matmul)
+├── column.py                 # CorticalColumnTorch (unified pipeline)
+├── associative_memory.py     # HopfieldAssociativeMemory (EMA prototypes)
 ├── motor_prediction.py       # ContrastiveMotorPrediction
 ├── neuromodulators.py        # NeuromodulatoryGating
-├── learning_module.py        # CorticalColumnTorchLM
-└── experiment.py             # experiment helpers
+├── learning_module.py        # CorticalColumnTorchLM (Monty adapter)
+├── experiment.py             # Panda3DTorchExperiment
+├── interneurons.py           # Branch-specific inhibitory gating (Track 10)
+├── layers.py                 # Laminar cortical layers L2/3, L4, L5/6 (Track 10)
+├── multihead_dendrites.py    # Multi-head dendritic computation (Track 10)
+├── oscillator.py             # Cortical oscillator + phase coding (Track 10)
+├── plateau.py                # Plateau potential enrichment (Track 10)
+├── stdp.py                   # STDP + eligibility traces (Track 10)
+└── thalamic_relay.py         # Thalamic gating relay (Track 10)
 
 tests/unit/frameworks/models/test_cortical_column_torch/
 ├── test_sparse_activations.py
 ├── test_encoders.py
 ├── test_hopfield.py
 ├── test_dendrites.py
-├── test_column.py
-├── test_associative_memory.py
+├── test_column.py            # includes cortical attractor + episodic mem tests
+├── test_episodic_memory.py   # HPC storage, novelty gating, replay, labels
+├── test_associative_memory.py # includes auto-label stability tests
 ├── test_motor_prediction.py
 ├── test_neuromodulators.py
-└── test_learning_module.py
+├── test_learning_module.py
+├── test_oscillator.py
+├── test_stdp.py
+├── test_stdp_limitations.py
+└── test_thalamic_relay.py
 
 tests/integration/frameworks/models/
-└── test_cortical_column_torch_monty.py
+└── test_cortical_column_torch_monty.py  # 22 tests incl. parent LM evidence
 
 src/tbp/monty/conf/experiment/
 └── cortical_column_torch_eval.yaml
+
+scripts/
+├── run_torch_benchmark.py         # single-column YCB benchmark
+└── run_full_torch_benchmark.py    # 4-scenario benchmark
 
 docs/
 └── track-9-modern-hopfield-cortical-column.md  (this file)

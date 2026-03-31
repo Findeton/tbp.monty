@@ -636,6 +636,68 @@ class TestTwoLMHopfieldVoting(unittest.TestCase):
 
 
 @unittest.skipUnless(_assets_available(), "Real 3D model assets not found")
+class TestParentLMEvidence(unittest.TestCase):
+    """R5: Verify parent LM in heterarchy accumulates evidence from children.
+
+    Before R5, the parent LM (index 2) had no sensor module and never stepped,
+    making it functionally dead. After R5, it processes children's context
+    via step_from_context and builds its own object representations.
+    """
+
+    def test_parent_learns_objects(self):
+        """Parent LM should learn object identities from children's context."""
+        exp = Panda3DTorchExperiment(
+            model_path=FOX_PATH,
+            hierarchical=True,
+            resolution=(32, 32),
+            initial_distance=2.0,
+            object_scale=(0.01, 0.01, 0.01),
+            asset_search_paths=[ASSET_DIR],
+            column_kwargs={"n_minicolumns": 512, "sparsity": 0.05},
+        )
+        try:
+            exp._setup()
+            anim = list(exp._anim_obj.animation_names)[0]
+            exp.train("fox_walk", anim_name=anim, n_steps=15)
+            exp.train("fox_static", n_steps=15)
+
+            lm_parent = exp.monty.learning_modules[2]
+            known = lm_parent.get_all_known_object_ids()
+            self.assertTrue(
+                len(known) >= 1,
+                f"Parent LM should have learned objects, got: {known}",
+            )
+        finally:
+            exp.close()
+
+    def test_parent_accumulates_evidence_on_eval(self):
+        """Parent LM should produce evidence during eval."""
+        exp = Panda3DTorchExperiment(
+            model_path=FOX_PATH,
+            hierarchical=True,
+            resolution=(32, 32),
+            initial_distance=2.0,
+            object_scale=(0.01, 0.01, 0.01),
+            asset_search_paths=[ASSET_DIR],
+            column_kwargs={"n_minicolumns": 512, "sparsity": 0.05},
+        )
+        try:
+            exp._setup()
+            anim = list(exp._anim_obj.animation_names)[0]
+            exp.train("fox_walk", anim_name=anim, n_steps=15)
+
+            result = exp.evaluate(anim_name=anim, n_steps=10)
+
+            lm_parent = exp.monty.learning_modules[2]
+            self.assertTrue(
+                len(lm_parent.evidence) > 0,
+                f"Parent LM should have evidence, got: {lm_parent.evidence}",
+            )
+        finally:
+            exp.close()
+
+
+@unittest.skipUnless(_assets_available(), "Real 3D model assets not found")
 class TestAutoLabelIntegration(unittest.TestCase):
     """Phase 10, test 5: Train without external labels (auto-generated).
 

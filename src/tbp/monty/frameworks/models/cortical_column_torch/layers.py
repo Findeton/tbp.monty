@@ -162,7 +162,7 @@ class L4Layer:
         for mc in range(n_minicolumns):
             indices = rng.choice(n_input, size=n_potential, replace=False)
             self._ff_potential[mc, indices] = True
-            perms = rng.normal(connected_threshold, 0.05, n_potential)
+            perms = rng.normal(connected_threshold, 0.10, n_potential)
             perms = np.clip(perms, 0.0, 1.0).astype(np.float32)
             self._ff_permanences[mc, indices] = torch.from_numpy(perms)
 

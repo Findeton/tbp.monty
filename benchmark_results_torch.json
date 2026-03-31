@@ -11,9 +11,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 6.0582096201911595,
-      "wall_clock_seconds": 1.0115644999999986,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 6.5708866727795625,
+      "wall_clock_seconds": 1.034069792000004,
+      "mean_settling_iterations": 5.733333333333333
     },
     {
       "object_name": "011_banana",
@@ -26,9 +26,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 3.5316206339862073,
-      "wall_clock_seconds": 0.6389098750000031,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 3.993557396869305,
+      "wall_clock_seconds": 0.6544100420000021,
+      "mean_settling_iterations": 5.588235294117647
     },
     {
       "object_name": "011_banana",
@@ -41,9 +41,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 8.081509530217897,
-      "wall_clock_seconds": 1.3234952090000007,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 8.968911346572714,
+      "wall_clock_seconds": 1.4320701659999955,
+      "mean_settling_iterations": 6.044444444444444
     },
     {
       "object_name": "011_banana",
@@ -56,9 +56,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 4.975231952046662,
-      "wall_clock_seconds": 0.791464083000001,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 5.068826346184574,
+      "wall_clock_seconds": 0.8158240830000025,
+      "mean_settling_iterations": 6.434782608695652
     },
     {
       "object_name": "025_mug",
@@ -71,9 +71,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 9.277259791400738,
-      "wall_clock_seconds": 1.2836327919999988,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 11.188428710539348,
+      "wall_clock_seconds": 1.3819286249999934,
+      "mean_settling_iterations": 6.5813953488372094
     },
     {
       "object_name": "025_mug",
@@ -84,11 +84,11 @@
       ],
       "detected_object": "025_mug",
       "correct": true,
-      "steps_to_converge": null,
+      "steps_to_converge": 7,
       "rotation_error_deg": null,
-      "max_evidence": 9.623538049262878,
-      "wall_clock_seconds": 1.3882725839999992,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 2.1615535010171874,
+      "wall_clock_seconds": 0.4154397919999937,
+      "mean_settling_iterations": 7.571428571428571
     },
     {
       "object_name": "025_mug",
@@ -101,9 +101,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 10.668873144670192,
-      "wall_clock_seconds": 1.5312245000000004,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 12.22029782248306,
+      "wall_clock_seconds": 1.5964734579999984,
+      "mean_settling_iterations": 6.461538461538462
     },
     {
       "object_name": "025_mug",
@@ -114,11 +114,11 @@
       ],
       "detected_object": "025_mug",
       "correct": true,
-      "steps_to_converge": null,
+      "steps_to_converge": 7,
       "rotation_error_deg": null,
-      "max_evidence": 9.67350349465022,
-      "wall_clock_seconds": 1.4034306250000057,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 2.1820694132503657,
+      "wall_clock_seconds": 0.45312200000000047,
+      "mean_settling_iterations": 7.428571428571429
     },
     {
       "object_name": "003_cracker_box",
@@ -131,9 +131,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 9.353644858341342,
-      "wall_clock_seconds": 1.5471887080000002,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 11.0748143443754,
+      "wall_clock_seconds": 1.7848303330000022,
+      "mean_settling_iterations": 7.2592592592592595
     },
     {
       "object_name": "003_cracker_box",
@@ -146,9 +146,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 9.241029285608604,
-      "wall_clock_seconds": 1.5464379579999985,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 10.153311813373682,
+      "wall_clock_seconds": 1.722315291000001,
+      "mean_settling_iterations": 7.090909090909091
     },
     {
       "object_name": "003_cracker_box",
@@ -157,13 +157,13 @@
         0.0,
         60.0
       ],
-      "detected_object": "011_banana",
+      "detected_object": "025_mug",
       "correct": false,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 9.788595336986702,
-      "wall_clock_seconds": 1.6612935409999992,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 9.772467081158151,
+      "wall_clock_seconds": 1.8255502920000026,
+      "mean_settling_iterations": 6.254237288135593
     },
     {
       "object_name": "003_cracker_box",
@@ -176,9 +176,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 10.131722066046736,
-      "wall_clock_seconds": 1.6273095409999954,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 10.56637122409724,
+      "wall_clock_seconds": 1.759345500000002,
+      "mean_settling_iterations": 7.875
     },
     {
       "object_name": "013_apple",
@@ -191,9 +191,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 9.709223172638008,
-      "wall_clock_seconds": 1.452146500000005,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 11.018510863298633,
+      "wall_clock_seconds": 1.5789712090000023,
+      "mean_settling_iterations": 5.254901960784314
     },
     {
       "object_name": "013_apple",
@@ -206,9 +206,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 10.203644460026652,
-      "wall_clock_seconds": 1.4624521670000021,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 11.595201359574785,
+      "wall_clock_seconds": 1.537014708000001,
+      "mean_settling_iterations": 5.0
     },
     {
       "object_name": "013_apple",
@@ -221,9 +221,9 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 10.264554767319504,
-      "wall_clock_seconds": 1.562683917000001,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 11.472713741755214,
+      "wall_clock_seconds": 1.7370523749999904,
+      "mean_settling_iterations": 5.254545454545455
     },
     {
       "object_name": "013_apple",
@@ -236,39 +236,39 @@
       "correct": true,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 10.156597192764073,
-      "wall_clock_seconds": 1.4487780410000042,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 11.239699211322593,
+      "wall_clock_seconds": 2.0653443329999988,
+      "mean_settling_iterations": 5.392156862745098
     },
     {
       "object_name": "035_power_drill",
       "rotation": [
         0.0,
         0.0,
-        0.0
-      ],
-      "detected_object": "035_power_drill",
-      "correct": true,
-      "steps_to_converge": null,
-      "rotation_error_deg": null,
-      "max_evidence": 6.854197334646674,
-      "wall_clock_seconds": 1.2134602500000113,
-      "mean_settling_iterations": 2.0
-    },
-    {
-      "object_name": "035_power_drill",
-      "rotation": [
-        0.0,
-        45.0,
         0.0
       ],
       "detected_object": "011_banana",
       "correct": false,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 7.331247000900955,
-      "wall_clock_seconds": 1.2885204580000078,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 7.064400893337817,
+      "wall_clock_seconds": 2.8670567919999996,
+      "mean_settling_iterations": 6.175
+    },
+    {
+      "object_name": "035_power_drill",
+      "rotation": [
+        0.0,
+        45.0,
+        0.0
+      ],
+      "detected_object": "011_banana",
+      "correct": false,
+      "steps_to_converge": null,
+      "rotation_error_deg": null,
+      "max_evidence": 7.5710156644902575,
+      "wall_clock_seconds": 2.562235584000007,
+      "mean_settling_iterations": 6.4772727272727275
     },
     {
       "object_name": "035_power_drill",
@@ -281,9 +281,9 @@
       "correct": false,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 7.990604865596594,
-      "wall_clock_seconds": 1.3163315420000004,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 8.674939108192447,
+      "wall_clock_seconds": 1.8148448750000057,
+      "mean_settling_iterations": 7.4772727272727275
     },
     {
       "object_name": "035_power_drill",
@@ -292,19 +292,19 @@
         90.0,
         0.0
       ],
-      "detected_object": "035_power_drill",
-      "correct": true,
+      "detected_object": "025_mug",
+      "correct": false,
       "steps_to_converge": null,
       "rotation_error_deg": null,
-      "max_evidence": 7.614309124223128,
-      "wall_clock_seconds": 1.3009901669999948,
-      "mean_settling_iterations": 2.0
+      "max_evidence": 7.969109428940599,
+      "wall_clock_seconds": 1.6285600000000073,
+      "mean_settling_iterations": 7.533333333333333
     }
   ],
-  "accuracy": 0.85,
-  "mean_steps_to_converge": null,
+  "accuracy": 0.75,
+  "mean_steps_to_converge": 7.0,
   "mean_rotation_error_deg": null,
-  "wall_clock_total": 67.380509,
+  "wall_clock_total": 72.63892370900001,
   "config": {
     "architecture": "CorticalColumnTorch (Modern Hopfield)",
     "object_names": [
@@ -360,7 +360,7 @@
       "evidence_decay": 0.01
     },
     "evidence_threshold": 2.0,
-    "n_hopfield_patterns": 898,
-    "n_dendrite_segments": 61
+    "n_hopfield_patterns": 5,
+    "n_dendrite_segments": 1564
   }
 }
