@@ -321,6 +321,7 @@ class InformedPolicy(BasePolicy, JumpToGoalStateMixin):
     def __init__(
         self,
         use_goal_state_driven_actions=False,
+        view_finder_id="view_finder",
         **kwargs,
     ) -> None:
         """Initialize policy.
@@ -329,10 +330,14 @@ class InformedPolicy(BasePolicy, JumpToGoalStateMixin):
             use_goal_state_driven_actions: Whether to enable the motor system to make
                 use of the JumpToGoalStateMixin, which attempts to "jump" (i.e.
                 teleport) the agent to a specified goal state.
+            view_finder_id: Sensor ID used to check if the object is visible after
+                a hypotheis-testing jump. Defaults to "view_finder". Set this to
+                the name of the depth-bearing sensor in your setup (e.g. "patch").
             **kwargs: Additional keyword arguments.
         """
         super().__init__(**kwargs)
         self.use_goal_state_driven_actions = use_goal_state_driven_actions
+        self._view_finder_id = view_finder_id
         if self.use_goal_state_driven_actions:
             JumpToGoalStateMixin.__init__(self)
 
@@ -623,7 +628,7 @@ class InformedPolicy(BasePolicy, JumpToGoalStateMixin):
         depth_at_center = PositioningProcedure.depth_at_center(
             agent_id=self.agent_id,
             observations=observations,
-            sensor_id="view_finder",
+            sensor_id=self._view_finder_id,
         )
         should_undo = depth_at_center >= 1.0
         if should_undo:

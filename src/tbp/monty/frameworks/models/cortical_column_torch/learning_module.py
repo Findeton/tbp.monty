@@ -505,7 +505,93 @@ class CorticalColumnTorchLM(LearningModule):
         )
 
     def propose_goal_states(self) -> list:
-        return []
+        """Propose a hypothesis-testing goal state using the LFM predicted locations.
+
+        When the LFM (Phase 11) is active, queries the location-feature memory
+        with the current feature encoding to obtain per-object predicted locations
+        (attention-weighted average of training locations matching current features).
+        The most-likely-hypothesis object's predicted location is proposed as the
+        next sensor target, directing the motor system to visit the region where
+        the training data for the best hypothesis was collected.
+
+        Falls back to the current sensor location if:
+          - the LFM is not active or has no patterns stored,
+          - no step has been taken yet this episode, or
+          - no evidence has been accumulated or max evidence is below threshold.
+
+        This is akin to EvidenceGoalStateGenerator.propose_goal_states() in
+        EvidenceGraphLM, but uses the LFM's pred_locs instead of a stored graph.
+        """
+        from tbp.monty.frameworks.models.states import GoalState
+
+        if not self._stepped or self._last_input_state is None:
+            return []
+
+        evidence = dict(self._column._evidence)
+        if not evidence:
+            return []
+
+        values = list(evidence.values())
+        max_ev = max(values)
+        if max_ev < self._evidence_match_threshold:
+            return []
+
+        # Confidence: how far above threshold we are, clipped to [0, 1]
+        confidence = min(1.0, max_ev / max(self._evidence_match_threshold, 1e-6))
+
+        # --- LFM path: predict most informative next location ---
+        target_location = None
+        lfm = self._column._lfm if self._column._use_lfm else None
+        if lfm is not None and lfm.n_stored > 0:
+            # Re-encode the current features for the LFM query
+            _lb = self._column._encoder._location_bits
+            import torch
+            with torch.no_grad():
+                input_vec = self._column._encoder.encode(self._last_input_state)
+                feat_enc = input_vec[_lb:]
+
+            _, feat_ev, pred_locs = lfm.query_features(feat_enc)
+
+            if feat_ev and pred_locs:
+                # Pick the highest-evidence object that has a predicted location
+                best_obj = max(
+                    (obj for obj in feat_ev if obj in pred_locs),
+                    key=lambda o: feat_ev[o],
+                    default=None,
+                )
+                if best_obj is not None:
+                    target_location = np.asarray(
+                        pred_locs[best_obj], dtype=np.float64
+                    )
+
+        # Fall back to current location if LFM gave nothing useful
+        if target_location is None:
+            target_location = np.asarray(
+                self._last_input_state.location, dtype=np.float64
+            )
+
+        pose_vectors = np.asarray(
+            self._last_input_state.morphological_features.get(
+                "pose_vectors", np.eye(3)
+            ),
+            dtype=np.float64,
+        )
+
+        return [
+            GoalState(
+                location=target_location,
+                morphological_features={
+                    "pose_vectors": pose_vectors,
+                    "pose_fully_defined": True,
+                },
+                non_morphological_features=None,
+                confidence=float(confidence),
+                use_state=True,
+                sender_id=self.learning_module_id,
+                sender_type="GSG",
+                goal_tolerances={"location": 0.015},
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Context
@@ -577,12 +663,21 @@ class CorticalColumnTorchLM(LearningModule):
         if terminal_state == "match":
             mlh = self._column.get_current_mlh()
             self.detected_object = mlh.get("graph_id")
+            # Set detected_rotation_quat for logging compatibility.
+            rotation = mlh.get("rotation", Rotation.identity())
+            if hasattr(rotation, "as_quat"):
+                self.buffer.stats["detected_rotation_quat"] = rotation.as_quat()
+            else:
+                self.buffer.stats["detected_rotation_quat"] = np.array(
+                    [0.0, 0.0, 0.0, 1.0]
+                )
         elif terminal_state == "no_match":
             self.detected_object = None
         else:
             self.detected_object = terminal_state
         self.buffer.stats["individual_ts_reached_at_step"] = self._step_count
         self.buffer.stats["individual_ts_object"] = self.detected_object
+        self.buffer.stats["individual_ts_rot"] = self.buffer.stats["detected_rotation_quat"]
 
     def update_terminal_condition(self) -> str | None:
         matches = self.get_possible_matches()
@@ -610,6 +705,11 @@ class CorticalColumnTorchLM(LearningModule):
         self.buffer.update_stats(
             dict(lm_processed_steps=lm_processed), update_time=False
         )
+        # Keep buffer.on_object in sync so get_last_obs_processed() works.
+        # (buffer.append() fails silently because State lacks .displacement,
+        # leaving len(buffer)==0 and causing check_if_any_lms_updated() to
+        # always return False.)
+        self.buffer.on_object.append(lm_processed)
 
     def get_unique_pose_if_available(self, object_id):
         return None
@@ -674,8 +774,13 @@ class CorticalColumnTorchLM(LearningModule):
         }
 
     def _auto_update_terminal_condition(self):
-        if self._mode is not ExperimentMode.EVAL:
-            return
+        """Update terminal condition each matching step (both train and eval).
+
+        During training with empty memory, this immediately sets terminal_state
+        to "no_match", which causes MontyForEvidenceGraphMatching to switch to
+        exploratory mode on the first on-object step—matching EvidenceGraphLM
+        behavior.
+        """
         self.update_terminal_condition()
 
     def _buffer_observation(self, state: State) -> None:
