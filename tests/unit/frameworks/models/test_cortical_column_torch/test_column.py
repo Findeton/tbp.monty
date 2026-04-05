@@ -72,6 +72,165 @@ class TestCorticalColumnTorchStep(unittest.TestCase):
         col.post_episode()
         self.assertIn("mug", col.get_all_known_object_ids())
 
+    def test_train_without_label_persists_auto_labeled_object(self):
+        col = self._make_column()
+        col.pre_episode(mode="train", object_name=None)
+
+        for i in range(3):
+            state = _MockState(location=[0.1 * i, 0.2, 0.0], hsv=[0.5, 0.3, 0.8])
+            col.step(state)
+
+        col.post_episode()
+
+        self.assertIsNotNone(col._current_object)
+        self.assertTrue(str(col._current_object).startswith("auto_"))
+        self.assertIn(col._current_object, col.get_all_known_object_ids())
+
+    def test_deferred_sensor_auto_label_waits_for_full_episode_history(self):
+        def _run_episode(suffix_states):
+            col = self._make_column(defer_sensor_auto_label=True)
+            col.pre_episode(mode="train", object_name=None)
+
+            for _ in range(5):
+                col.step(
+                    _MockState(
+                        location=[0.0, 0.0, 0.0],
+                        hsv=[0.2, 0.3, 0.4],
+                    )
+                )
+
+            self.assertIsNone(col._current_object)
+
+            for location, hsv in suffix_states:
+                col.step(_MockState(location=location, hsv=hsv))
+
+            self.assertIsNone(col._current_object)
+            col.post_episode()
+
+            self.assertIsNotNone(col._current_object)
+            return col._current_object
+
+        label_a = _run_episode(
+            [
+                ([0.8, 0.0, 0.0], [0.9, 0.1, 0.1]),
+                ([0.9, 0.1, 0.0], [0.9, 0.1, 0.1]),
+                ([1.0, 0.2, 0.0], [0.9, 0.1, 0.1]),
+            ]
+        )
+        label_b = _run_episode(
+            [
+                ([0.0, 0.8, 0.0], [0.1, 0.9, 0.1]),
+                ([0.1, 0.9, 0.0], [0.1, 0.9, 0.1]),
+                ([0.2, 1.0, 0.0], [0.1, 0.9, 0.1]),
+            ]
+        )
+
+        self.assertNotEqual(label_a, label_b)
+
+    def test_deferred_sensor_auto_label_learns_distinct_episode_prototypes(self):
+        col = self._make_column(defer_sensor_auto_label=True)
+        prefix_states = [
+            ([0.0, 0.0, 0.0], [0.2, 0.3, 0.4]),
+            ([0.0, 0.0, 0.0], [0.2, 0.3, 0.4]),
+            ([0.0, 0.0, 0.0], [0.2, 0.3, 0.4]),
+            ([0.0, 0.0, 0.0], [0.2, 0.3, 0.4]),
+            ([0.0, 0.0, 0.0], [0.2, 0.3, 0.4]),
+        ]
+        suffix_a = [
+            ([0.8, 0.0, 0.0], [0.9, 0.1, 0.1]),
+            ([0.9, 0.1, 0.0], [0.9, 0.1, 0.1]),
+            ([1.0, 0.2, 0.0], [0.9, 0.1, 0.1]),
+        ]
+        suffix_b = [
+            ([0.0, 0.8, 0.0], [0.1, 0.9, 0.1]),
+            ([0.1, 0.9, 0.0], [0.1, 0.9, 0.1]),
+            ([0.2, 1.0, 0.0], [0.1, 0.9, 0.1]),
+        ]
+
+        def _train_episode(suffix_states):
+            col.pre_episode(mode="train", object_name=None)
+
+            for location, hsv in prefix_states:
+                col.step(_MockState(location=location, hsv=hsv))
+
+            for location, hsv in suffix_states:
+                col.step(_MockState(location=location, hsv=hsv))
+
+            col.post_episode()
+            label = col._current_object
+            prototype = torch.stack(
+                [
+                    pattern.clone()
+                    for pattern in col._activation_history
+                    if pattern.abs().sum() > 0
+                ]
+            ).mean(dim=0)
+            return label, prototype
+
+        label_a, prototype_a = _train_episode(suffix_a)
+        label_b, prototype_b = _train_episode(suffix_b)
+
+        self.assertNotEqual(label_a, label_b)
+        self.assertEqual(set(col.get_all_known_object_ids()), {label_a, label_b})
+
+        scores_a = col._associative_memory.recall(prototype_a)
+        scores_b = col._associative_memory.recall(prototype_b)
+
+        self.assertGreater(scores_a[label_a], scores_a[label_b])
+        self.assertGreater(scores_b[label_b], scores_b[label_a])
+
+        def _eval_episode(suffix_states):
+            col.pre_episode(mode="eval")
+            result = None
+
+            for location, hsv in prefix_states + suffix_states:
+                result = col.step(_MockState(location=location, hsv=hsv))
+
+            return result["mlh"]["graph_id"]
+
+        self.assertEqual(_eval_episode(suffix_a), label_a)
+        self.assertEqual(_eval_episode(suffix_b), label_b)
+
+    def test_step_from_context_without_label_persists_auto_labeled_object(self):
+        col = self._make_column(defer_context_auto_label=True)
+        col.pre_episode(mode="train", object_name=None)
+
+        context = np.zeros(col.n_cells, dtype=np.float32)
+        context[: max(1, col.n_cells // 16)] = 1.0
+
+        for _ in range(5):
+            col.receive_context(active_cells=context)
+            result = col.step_from_context()
+
+        self.assertIsNone(col._current_object)
+
+        col.post_episode()
+
+        self.assertIn("surprise", result)
+        self.assertIsNotNone(col._current_object)
+        self.assertTrue(str(col._current_object).startswith("auto_"))
+        self.assertIn(col._current_object, col.get_all_known_object_ids())
+
+    def test_deferred_context_auto_label_eval_uses_episode_prototype(self):
+        col = self._make_column(defer_context_auto_label=True)
+        prototype_a = torch.zeros(col.n_cells, dtype=torch.float32)
+        prototype_b = torch.zeros(col.n_cells, dtype=torch.float32)
+        prototype_a[: max(1, col.n_cells // 16)] = 1.0
+        prototype_b[max(1, col.n_cells // 8): max(1, col.n_cells // 8) + max(1, col.n_cells // 16)] = 1.0
+
+        col._associative_memory.learn(prototype_a, "auto_ctx_a")
+        col._associative_memory.learn(prototype_b, "auto_ctx_b")
+
+        col.pre_episode(mode="eval")
+        col._activation_history = [prototype_a.clone() for _ in range(5)]
+        col._active = prototype_a.clone()
+        self.assertEqual(col._get_mlh()["graph_id"], "auto_ctx_a")
+
+        col.pre_episode(mode="eval")
+        col._activation_history = [prototype_b.clone() for _ in range(5)]
+        col._active = prototype_b.clone()
+        self.assertEqual(col._get_mlh()["graph_id"], "auto_ctx_b")
+
     def test_eval_produces_evidence(self):
         col = self._make_column()
 
@@ -174,6 +333,52 @@ class TestCorticalColumnTorchApical(unittest.TestCase):
         self.assertEqual(len(signal["active_cells"]), col.n_cells)
 
 
+class TestCorticalColumnTorchHopfieldQueryBias(unittest.TestCase):
+    def _make_column(self, **kwargs):
+        defaults = dict(
+            n_minicolumns=64,
+            n_cells_per_minicolumn=4,
+            sparsity=0.1,
+            seed=42,
+        )
+        defaults.update(kwargs)
+        return CorticalColumnTorch(**defaults)
+
+    def test_query_bias_is_added_before_hopfield_settling(self):
+        col = self._make_column()
+        col.pre_episode(mode="eval")
+
+        captured = {}
+
+        def capture_settle(query, beta=None, max_iters=None, sparsity_fn=None):
+            captured["query"] = query.clone()
+            settled = sparsity_fn(query) if sparsity_fn is not None else query
+            return settled, 1
+
+        col._hopfield.settle = capture_settle
+
+        bias = torch.zeros(col.n_cells, dtype=torch.float32)
+        bias[:4] = 0.25
+        col.receive_context(hopfield_query_bias=bias)
+
+        col.step(_MockState(location=[0.1, 0.2, 0.3]))
+
+        self.assertIn("query", captured)
+        expected = col._last_pre_settle + col._hopfield_query_bias
+        self.assertTrue(torch.allclose(captured["query"], expected))
+
+    def test_query_bias_can_be_cleared(self):
+        col = self._make_column()
+        col.pre_episode(mode="eval")
+
+        bias = np.ones(col.n_cells, dtype=np.float32)
+        col.receive_context(hopfield_query_bias=bias)
+        self.assertGreater(float(col._hopfield_query_bias.abs().sum().item()), 0.0)
+
+        col.receive_context(hopfield_query_bias=None)
+        self.assertEqual(float(col._hopfield_query_bias.abs().sum().item()), 0.0)
+
+
 class TestCorticalColumnTorchMotor(unittest.TestCase):
     def test_motor_prediction(self):
         col = CorticalColumnTorch(
@@ -191,6 +396,89 @@ class TestCorticalColumnTorchMotor(unittest.TestCase):
             result = col.step(state)
 
         self.assertIn("motor_prediction_error", result)
+
+    def test_action_conditioned_prediction_biases_hopfield_query(self):
+        col = CorticalColumnTorch(
+            n_minicolumns=64,
+            n_cells_per_minicolumn=4,
+            sparsity=0.1,
+            use_action_conditioned_prediction=True,
+            action_predictor_kwargs={"motor_dim": 8},
+            seed=42,
+        )
+        col.pre_episode(mode="eval")
+
+        captured = {}
+
+        def capture_settle(query, beta=None, max_iters=None, sparsity_fn=None):
+            captured["query"] = query.clone()
+            settled = sparsity_fn(query) if sparsity_fn is not None else query
+            return settled, 1
+
+        predicted_mc = torch.linspace(0.1, 1.0, steps=col.n_minicolumns)
+        col._action_conditioned_prediction._prev_location = torch.zeros(
+            col.n_minicolumns,
+            dtype=torch.float32,
+            device=col.device,
+        )
+        col._action_conditioned_prediction.step = lambda *args, **kwargs: {
+            "prediction_error": 0.8,
+            "predicted_location": predicted_mc.clone(),
+        }
+        col._hopfield.settle = capture_settle
+
+        col.receive_context(action_context=np.ones(8, dtype=np.float32))
+        col.step(_MockState(location=[0.1, 0.2, 0.3]))
+
+        self.assertIn("query", captured)
+        expected = col._last_pre_settle + col.action_conditioned_query_bias
+        self.assertTrue(torch.allclose(captured["query"], expected))
+        self.assertAlmostEqual(col.action_prediction_error, 0.8)
+
+    def test_zero_action_context_disables_action_conditioned_prediction(self):
+        col = CorticalColumnTorch(
+            n_minicolumns=64,
+            n_cells_per_minicolumn=4,
+            sparsity=0.1,
+            use_action_conditioned_prediction=True,
+            action_predictor_kwargs={"motor_dim": 8},
+            seed=42,
+        )
+        col.pre_episode(mode="eval")
+
+        captured = {}
+        calls = {"prime": 0, "step": 0}
+
+        def capture_settle(query, beta=None, max_iters=None, sparsity_fn=None):
+            captured["query"] = query.clone()
+            settled = sparsity_fn(query) if sparsity_fn is not None else query
+            return settled, 1
+
+        def prime_summary(location):
+            calls["prime"] += 1
+            col._action_conditioned_prediction._prev_location = location.clone()
+            col._action_conditioned_prediction._prediction_error = 0.0
+
+        def unexpected_step(*args, **kwargs):
+            calls["step"] += 1
+            raise AssertionError("Action predictor should be skipped")
+
+        col._action_conditioned_prediction.prime = prime_summary
+        col._action_conditioned_prediction.step = unexpected_step
+        col._hopfield.settle = capture_settle
+
+        col.receive_context(action_context=np.zeros(8, dtype=np.float32))
+        col.step(_MockState(location=[0.1, 0.2, 0.3]))
+
+        self.assertEqual(calls["prime"], 1)
+        self.assertEqual(calls["step"], 0)
+        self.assertIn("query", captured)
+        self.assertTrue(torch.allclose(captured["query"], col._last_pre_settle))
+        self.assertEqual(
+            float(col.action_conditioned_query_bias.abs().sum().item()),
+            0.0,
+        )
+        self.assertEqual(col.action_prediction_error, 0.0)
 
 
 class TestCorticalColumnTorchNeuromod(unittest.TestCase):
@@ -987,6 +1275,27 @@ class TestLocationFeatureMemoryIntegration(unittest.TestCase):
         known = col.get_all_known_object_ids()
         self.assertIn("mug", known)
 
+    def test_context_only_training_falls_back_to_associative_known_objects(self):
+        col = self._make_lfm_column(defer_context_auto_label=True)
+        col.pre_episode(mode="train", object_name=None)
+
+        context = np.zeros(col.n_cells, dtype=np.float32)
+        context[: max(1, col.n_cells // 16)] = 1.0
+
+        for _ in range(5):
+            col.receive_context(active_cells=context)
+            col.step_from_context()
+
+        col.post_episode()
+
+        learned_label = col._current_object
+        self.assertEqual(col._lfm.known_objects, [])
+        self.assertIn(learned_label, col._associative_memory.known_objects)
+        self.assertIn(learned_label, col.get_all_known_object_ids())
+
+        col.pre_episode(mode="eval")
+        self.assertIn(learned_label, col._evidence)
+
     def test_lfm_state_dict_roundtrip(self):
         col = self._make_lfm_column()
         col.pre_episode(mode="train", object_name="mug")
@@ -1151,6 +1460,88 @@ class TestPredictiveTrackerIntegration(unittest.TestCase):
 
         # Tracker should have anchored mug (feature evidence > threshold)
         self.assertIn("mug", col._predictive_tracker.anchored_objects)
+
+
+class TestReferenceFrameEstimatorIntegration(unittest.TestCase):
+    def _make_lfm_column(self, **kwargs):
+        defaults = dict(
+            n_minicolumns=128,
+            n_cells_per_minicolumn=4,
+            sparsity=0.1,
+            use_location_feature_memory=True,
+            use_reference_frame_estimator=True,
+            seed=42,
+        )
+        defaults.update(kwargs)
+        return CorticalColumnTorch(**defaults)
+
+    def test_reference_frame_estimator_created_when_enabled(self):
+        col = self._make_lfm_column()
+        self.assertIsNotNone(col._reference_frame_estimator)
+
+    def test_reference_frame_estimator_reset_per_episode(self):
+        col = self._make_lfm_column()
+        for value in (0.0, 1.0, 2.0):
+            col._reference_frame_estimator.add_observation(
+                "mug",
+                np.array([value, 0.0, 0.0]),
+                np.array([value, 0.0, 0.0]),
+                evidence=1.0,
+            )
+        self.assertEqual(col._reference_frame_estimator.estimated_objects, ["mug"])
+
+        col.pre_episode(mode="eval")
+        self.assertEqual(col._reference_frame_estimator.estimated_objects, [])
+
+    def test_compute_reference_frame_evidence_uses_full_query_for_confident_objects(
+        self,
+    ):
+        col = self._make_lfm_column()
+
+        class _MockEstimator:
+            def has_rotation(self, object_id):
+                return object_id == "mug"
+
+            def transform(self, object_id, world_loc):
+                return np.asarray(world_loc, dtype=np.float64)
+
+            def get_confidence(self, object_id):
+                return 1.0
+
+        class _MockLFM:
+            def query_full(self, loc_enc, feat_enc):
+                return torch.zeros_like(torch.cat([loc_enc, feat_enc])), {
+                    "mug": 0.9,
+                    "drill": 0.1,
+                }
+
+        col._reference_frame_estimator = _MockEstimator()
+        col._lfm = _MockLFM()
+
+        feat_enc = torch.zeros(col._encoder.total_bits - col._encoder._location_bits)
+        scores = col._compute_reference_frame_evidence(
+            current_location=np.array([0.1, 0.2, 0.3]),
+            feat_enc=feat_enc,
+            object_ids=["mug", "drill"],
+        )
+
+        self.assertEqual(scores, {"mug": 0.9})
+
+    def test_blend_reference_frame_evidence_only_boosts_improvements(self):
+        col = self._make_lfm_column()
+
+        class _MockEstimator:
+            def get_confidence(self, object_id):
+                return {"mug": 1.0, "drill": 0.8}.get(object_id, 0.0)
+
+        col._reference_frame_estimator = _MockEstimator()
+        blended = col._blend_reference_frame_evidence(
+            feature_evidence={"mug": 0.4, "drill": 0.6},
+            reference_frame_evidence={"mug": 0.9, "drill": 0.2},
+        )
+
+        self.assertAlmostEqual(blended["mug"], 0.9)
+        self.assertAlmostEqual(blended["drill"], 0.6)
 
 
 if __name__ == "__main__":

@@ -159,6 +159,11 @@ class ContrastiveMotorPrediction:
         self._prev_location = None
         self._prediction_error = 0.0
 
+    def prime(self, location: torch.Tensor) -> None:
+        with torch.no_grad():
+            self._prev_location = location.detach().to(self.device).float().clone()
+            self._prediction_error = 0.0
+
     def state_dict(self) -> dict:
         return {
             "W_ih": self._W_ih.cpu(),

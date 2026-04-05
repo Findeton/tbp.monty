@@ -398,7 +398,61 @@ class TemporalMemory:
 
         self.reset_episode()
 
-    def recognize_behavior(self, observed_states, min_overlap=0.3):
+    def store_behavior_prototype(self, name, states):
+        """Store a named behavior prototype without replaying learning.
+
+        This is useful when another component already fed the same sequence
+        through the temporal memory during normal online learning and only
+        needs to persist the resulting sequence template for later recognition.
+        """
+        self._known_behaviors[name] = [self.encode(state) for state in states]
+
+    def score_behaviors(
+        self,
+        observed_states,
+        tempo_invariant=False,
+    ):
+        """Return overlap scores for every stored behavior prototype."""
+        if not self._known_behaviors:
+            return {}
+
+        observed_sdrs = [self.encode(s) for s in observed_states]
+        if not observed_sdrs:
+            return {}
+
+        scores = {}
+        for name, prototype_sdrs in self._known_behaviors.items():
+            if not prototype_sdrs:
+                continue
+
+            if tempo_invariant:
+                n = max(len(observed_sdrs), len(prototype_sdrs))
+                obs_compare = self._resample_sdrs(observed_sdrs, n)
+                proto_compare = self._resample_sdrs(prototype_sdrs, n)
+            else:
+                n = min(len(observed_sdrs), len(prototype_sdrs))
+                if n == 0:
+                    continue
+                obs_compare = observed_sdrs[:n]
+                proto_compare = prototype_sdrs[:n]
+
+            overlaps = []
+            for i in range(len(obs_compare)):
+                overlap = float(np.dot(obs_compare[i], proto_compare[i]))
+                overlaps.append(
+                    overlap / self.n_active if self.n_active > 0 else 0
+                )
+
+            scores[name] = float(np.mean(overlaps)) if overlaps else 0.0
+
+        return scores
+
+    def recognize_behavior(
+        self,
+        observed_states,
+        min_overlap=0.3,
+        tempo_invariant=False,
+    ):
         """Recognize which learned behavior best matches observed sequence.
 
         Compares the SDR sequence of observed states against stored
@@ -415,34 +469,33 @@ class TemporalMemory:
         -------
         tuple of (name, score) or (None, best_score)
         """
-        if not self._known_behaviors:
+        scores = self.score_behaviors(
+            observed_states,
+            tempo_invariant=tempo_invariant,
+        )
+        if not scores:
             return None, 0.0
 
-        observed_sdrs = [self.encode(s) for s in observed_states]
-
-        best_name = None
-        best_score = 0.0
-
-        for name, prototype_sdrs in self._known_behaviors.items():
-            n = min(len(observed_sdrs), len(prototype_sdrs))
-            if n == 0:
-                continue
-
-            overlaps = []
-            for i in range(n):
-                overlap = float(np.dot(observed_sdrs[i], prototype_sdrs[i]))
-                overlaps.append(
-                    overlap / self.n_active if self.n_active > 0 else 0
-                )
-
-            score = float(np.mean(overlaps))
-            if score > best_score:
-                best_score = score
-                best_name = name
+        best_name, best_score = max(scores.items(), key=lambda item: item[1])
 
         if best_score >= min_overlap:
             return best_name, best_score
         return None, best_score
+
+    @staticmethod
+    def _resample_sdrs(sdrs, target_len):
+        """Nearest-neighbor resample a sequence of SDRs to a target length."""
+        if not sdrs:
+            return []
+        if target_len <= 0:
+            return []
+        if len(sdrs) == target_len:
+            return list(sdrs)
+
+        positions = np.linspace(0, len(sdrs) - 1, target_len)
+        indices = np.rint(positions).astype(int)
+        indices = np.clip(indices, 0, len(sdrs) - 1)
+        return [sdrs[idx] for idx in indices]
 
     def replay_episode(self, n_replays=3, learning_rate_scale=0.5):
         """Replay current episode to strengthen temporal associations.

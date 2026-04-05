@@ -42,6 +42,14 @@ class TestStoreAndCount:
         assert not lfm.store(loc, feat, "mug")
         assert lfm.n_stored == 1
 
+    def test_novelty_gating_allows_same_pattern_for_different_object(self, lfm):
+        loc = _rand(32, seed=0)
+        feat = _rand(32, seed=1)
+        assert lfm.store(loc, feat, "banana")
+        assert lfm.store(loc, feat, "apple")
+        assert lfm.n_stored == 2
+        assert set(lfm.known_objects) == {"banana", "apple"}
+
     def test_novelty_gating_accepts_different(self, lfm):
         lfm.store(_rand(32, seed=0), _rand(32, seed=1), "mug")
         lfm.store(_rand(32, seed=2), _rand(32, seed=3), "mug")

@@ -138,6 +138,52 @@ class TestTorchFeatureEncoder(unittest.TestCase):
         result = enc.encode_location(np.array([1.0, 0.0, 0.0]))
         self.assertEqual(result.shape, (enc._location_bits,))
 
+    def test_extract_features_includes_hsv_flow_and_pose(self):
+        class MockState:
+            location = [1.0, 2.0, 3.0]
+            use_state = True
+            sender_type = "SM"
+            morphological_features = {"pose_vectors": np.eye(3)}
+            non_morphological_features = {
+                "hsv": [0.5, 0.3, 0.8],
+                "flow_direction": [0.25, -0.5, 0.75],
+                "flow_magnitude": [0.4],
+            }
+
+        result = TorchFeatureEncoder._extract_features(MockState())
+
+        np.testing.assert_allclose(
+            result,
+            [0.5, 0.3, 0.8, 0.25, -0.5, 0.75, 0.4, 1.0, 0.0, 0.0],
+            atol=1e-6,
+        )
+
+    def test_extract_features_includes_lm_identity_evidence_and_pose(self):
+        class MockState:
+            location = [1.0, 2.0, 3.0]
+            use_state = True
+            sender_type = "LM"
+            sender_id = "lm_behavior"
+            morphological_features = {"pose_vectors": np.eye(3)}
+            non_morphological_features = {
+                "graph_id": "fox",
+                "evidence": 2.5,
+                "surprise": 0.2,
+            }
+
+        result = TorchFeatureEncoder._extract_features(MockState())
+        expected = [
+            *TorchFeatureEncoder._hash_text_features("fox", 4),
+            *TorchFeatureEncoder._hash_text_features("lm_behavior", 1),
+            float(np.tanh(2.5)),
+            0.2,
+            1.0,
+            0.0,
+            0.0,
+        ]
+
+        np.testing.assert_allclose(result[: len(expected)], expected, atol=1e-6)
+
     def test_hash_label_deterministic(self):
         a = TorchFeatureEncoder.hash_label("test_object")
         b = TorchFeatureEncoder.hash_label("test_object")

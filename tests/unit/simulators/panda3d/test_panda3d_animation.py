@@ -229,6 +229,19 @@ class TestAnimatedObjectLoading(unittest.TestCase):
             finally:
                 sim.close()
 
+    def test_expose_joint(self):
+        """Can expose a live joint node for animated transform inspection."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gltf_path = _make_animated_gltf(tmpdir)
+            sim = _make_simulator(asset_search_paths=[tmpdir])
+            try:
+                info = sim.add_object(gltf_path, animated=True)
+                anim = sim.get_animated_object(info.object_id)
+                joint = anim.expose_joint("Bone1")
+                self.assertFalse(joint.isEmpty())
+            finally:
+                sim.close()
+
     def test_non_animated_object_raises(self):
         """get_animated_object raises for non-animated objects."""
         sim = _make_simulator()

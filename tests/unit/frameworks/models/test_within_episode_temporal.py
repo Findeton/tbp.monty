@@ -811,6 +811,28 @@ class TestBehaviorRecognition(unittest.TestCase):
             f"Should recognize at least 4 of 6 behaviors, got {correct}"
         )
 
+    def test_tempo_invariant_recognition_rescues_scaled_behavior(self):
+        """Tempo-invariant matching should handle stretched sequences better."""
+        tm = TemporalMemory(sdr_dim=2048, sdr_sparsity=0.02, learning_rate=0.3)
+
+        tm.learn_behavior("walking", walking_gait(n_steps=60), n_repetitions=3)
+        tm.learn_behavior("door", door_opening(n_steps=40), n_repetitions=3)
+
+        stretched_walk = walking_gait(n_steps=90, gait_period=30)
+        plain_name, plain_score = tm.recognize_behavior(
+            stretched_walk,
+            min_overlap=0.2,
+            tempo_invariant=False,
+        )
+        tempo_name, tempo_score = tm.recognize_behavior(
+            stretched_walk,
+            min_overlap=0.2,
+            tempo_invariant=True,
+        )
+
+        self.assertEqual(tempo_name, "walking")
+        self.assertGreaterEqual(tempo_score, plain_score)
+
 
 # =============================================================================
 # Sequence Prediction (Mental Simulation)

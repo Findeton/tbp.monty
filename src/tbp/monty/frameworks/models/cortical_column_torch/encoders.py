@@ -171,6 +171,28 @@ class TorchFeatureEncoder:
 
         morph = getattr(state, "morphological_features", None) or {}
         non_morph = getattr(state, "non_morphological_features", None) or {}
+        sender_type = str(getattr(state, "sender_type", "SM"))
+
+        if sender_type == "LM":
+            graph_id = non_morph.get("graph_id")
+            if graph_id not in (None, "", "unknown", "no_observations_yet"):
+                vals.extend(
+                    TorchFeatureEncoder._hash_text_features(str(graph_id), 4)
+                )
+
+            sender_id = getattr(state, "sender_id", None)
+            if sender_id not in (None, ""):
+                vals.extend(
+                    TorchFeatureEncoder._hash_text_features(str(sender_id), 1)
+                )
+
+            evidence = non_morph.get("evidence")
+            if evidence is not None:
+                vals.append(float(np.tanh(float(evidence))))
+
+            surprise = non_morph.get("surprise")
+            if surprise is not None:
+                vals.append(float(np.clip(float(surprise), -1.0, 1.0)))
 
         # HSV color
         hsv = non_morph.get("hsv")
@@ -179,6 +201,18 @@ class TorchFeatureEncoder:
                 vals.extend(float(v) for v in hsv[:3])
             else:
                 vals.append(float(hsv))
+
+        # Flow direction and magnitude
+        flow_direction = non_morph.get("flow_direction")
+        if flow_direction is not None:
+            vals.extend(float(v) for v in np.asarray(flow_direction).ravel()[:3])
+
+        flow_magnitude = non_morph.get("flow_magnitude")
+        if flow_magnitude is not None:
+            if hasattr(flow_magnitude, "__len__"):
+                vals.append(float(np.asarray(flow_magnitude).ravel()[0]))
+            else:
+                vals.append(float(flow_magnitude))
 
         # Curvatures
         for key in ("principal_curvatures", "principal_curvatures_log",
@@ -196,6 +230,20 @@ class TorchFeatureEncoder:
             flat = np.asarray(pose).ravel()
             vals.extend(float(v) for v in flat[:3])
 
+        return vals
+
+    @staticmethod
+    def _hash_text_features(text: str, n_vals: int) -> list[float]:
+        """Map text to deterministic float features in [-1, 1]."""
+        digest = hashlib.sha256(text.encode()).digest()
+        vals = []
+        for idx in range(max(0, int(n_vals))):
+            start = (2 * idx) % len(digest)
+            chunk = digest[start:start + 2]
+            if len(chunk) < 2:
+                chunk = (chunk + digest[:2])[:2]
+            raw = int.from_bytes(chunk, byteorder="big", signed=False)
+            vals.append((2.0 * (raw / 65535.0)) - 1.0)
         return vals
 
     @staticmethod

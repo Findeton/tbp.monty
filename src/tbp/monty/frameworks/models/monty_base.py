@@ -156,8 +156,9 @@ class MontyBase(Monty):
     def aggregate_sensory_inputs(self, ctx: RuntimeContext, observation):
         sensor_module_outputs = []
         for sensor_module in self.sensor_modules:
-            raw_obs = self.get_observations(observation, sensor_module.sensor_module_id)
-            sensor_module.update_state(self.get_agent_state())
+            sensor_module_id = sensor_module.sensor_module_id
+            raw_obs = self.get_observations(observation, sensor_module_id)
+            sensor_module.update_state(self.get_agent_state(sensor_module_id))
             sm_output = sensor_module.step(ctx, raw_obs, self.is_motor_only_step)
             sensor_module_outputs.append(sm_output)
         # Aggregate LM outputs here to be input to higher level LM at next step
@@ -551,12 +552,18 @@ class MontyBase(Monty):
         agent_obs = observations[agent_id]
         return agent_obs[sensor_module_id]
 
-    def get_agent_state(self):
+    def get_agent_state(self, sensor_module_id=None):
         """Get state of agent (dict).
 
         Returns:
             State of the agent.
         """
+        # Sensor modules need the proprioceptive state of the specific agent they are
+        # attached to. Fall back to the policy helper for legacy single-agent callers.
+        if self.motor_system._state is not None and sensor_module_id is not None:
+            agent_id = self.sm_to_agent_dict[sensor_module_id]
+            return self.motor_system._state[agent_id]
+
         # TODO: This is left in place for now to keep PR scope limited, but should be
         #       refactored in the future to simplify this access pattern.
         return self.motor_system._policy.get_agent_state(self.motor_system._state)

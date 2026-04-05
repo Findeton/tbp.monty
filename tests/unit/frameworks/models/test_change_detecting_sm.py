@@ -34,6 +34,18 @@ def _make_points_around(center, n=20, spread=0.02, seed=42):
     return center + rng.randn(n, 3) * spread
 
 
+def _make_curved_patch(size=8):
+    """Generate a square on-object patch with mild curvature."""
+    xs = np.linspace(-0.05, 0.05, size)
+    ys = np.linspace(-0.05, 0.05, size)
+    points = []
+    for y in ys:
+        for x in xs:
+            z = 0.5 + 0.2 * (x**2 + 0.5 * y**2)
+            points.append([x, y, z])
+    return np.asarray(points, dtype=float)
+
+
 class TestChangeDetectingSMStatic(unittest.TestCase):
     """Test with static (non-changing) observations."""
 
@@ -46,7 +58,7 @@ class TestChangeDetectingSMStatic(unittest.TestCase):
         self.assertFalse(state.use_state)
 
     def test_identical_observations_no_change(self):
-        """Two identical observations → no change detected."""
+        """Quiet frames should emit a low-confidence context state."""
         sm = ChangeDetectingSM(
             sensor_module_id="change_SM_0",
             flow_threshold=0.01,
@@ -55,10 +67,12 @@ class TestChangeDetectingSMStatic(unittest.TestCase):
         obs = _make_observation(points)
         sm.step(None, obs)
         state = sm.step(None, obs)
-        self.assertFalse(state.use_state)
+        self.assertTrue(state.use_state)
+        self.assertLess(state.confidence, 0.3)
+        self.assertIn("flow_magnitude", state.non_morphological_features)
 
     def test_very_small_movement_no_change(self):
-        """Movement below threshold → no change detected."""
+        """Sub-threshold movement should still emit usable context."""
         sm = ChangeDetectingSM(
             sensor_module_id="change_SM_0",
             flow_threshold=0.01,
@@ -69,7 +83,8 @@ class TestChangeDetectingSMStatic(unittest.TestCase):
         obs2 = _make_observation(_make_points_around(center2, seed=1))
         sm.step(None, obs1)
         state = sm.step(None, obs2)
-        self.assertFalse(state.use_state)
+        self.assertTrue(state.use_state)
+        self.assertLess(state.confidence, 0.3)
 
 
 class TestChangeDetectingSMMotion(unittest.TestCase):
@@ -175,7 +190,7 @@ class TestChangeDetectingSMFeatureChange(unittest.TestCase):
         self.assertTrue(state.use_state)
 
     def test_color_change_below_threshold(self):
-        """Small color change below threshold → no detection."""
+        """Small color change below threshold still emits context features."""
         sm = ChangeDetectingSM(
             sensor_module_id="change_SM_0",
             flow_threshold=0.01,
@@ -190,7 +205,11 @@ class TestChangeDetectingSMFeatureChange(unittest.TestCase):
 
         sm.step(None, obs1)
         state = sm.step(None, obs2)
-        self.assertFalse(state.use_state)
+        self.assertTrue(state.use_state)
+        self.assertLess(state.confidence, 0.3)
+        self.assertIn("hsv", state.non_morphological_features)
+        self.assertIn("delta_rgba", state.non_morphological_features)
+        self.assertIn("delta_hsv", state.non_morphological_features)
 
 
 class TestChangeDetectingSMReset(unittest.TestCase):
@@ -247,6 +266,44 @@ class TestChangeDetectingSMStateFormat(unittest.TestCase):
         self.assertIn("flow_magnitude", state.non_morphological_features)
         self.assertGreaterEqual(state.confidence, 0.0)
         self.assertLessEqual(state.confidence, 1.0)
+
+    def test_quiet_state_carries_absolute_hsv_context(self):
+        """Quiet frames should still carry absolute appearance context."""
+        sm = ChangeDetectingSM(
+            sensor_module_id="change_SM_0",
+            flow_threshold=0.01,
+        )
+        points = _make_points_around(np.array([0.0, 0.0, 0.5]), seed=1)
+        rgba = np.full((16, 16, 4), [255, 0, 0, 255], dtype=np.uint8)
+        obs = _make_observation(points, rgba=rgba)
+
+        sm.step(None, obs)
+        state = sm.step(None, obs)
+
+        self.assertTrue(state.use_state)
+        self.assertEqual(state.sender_type, "SM")
+        self.assertEqual(state.location.shape, (3,))
+        self.assertIn("hsv", state.non_morphological_features)
+        self.assertIn("flow_direction", state.non_morphological_features)
+        self.assertIn("flow_magnitude", state.non_morphological_features)
+        self.assertLess(state.confidence, 0.3)
+
+    def test_quiet_state_carries_curvature_context_when_patch_available(self):
+        """Square semantic patches should contribute absolute curvature context."""
+        sm = ChangeDetectingSM(
+            sensor_module_id="change_SM_0",
+            flow_threshold=0.01,
+        )
+        rgba = np.full((8, 8, 4), [180, 180, 180, 255], dtype=np.uint8)
+        obs = _make_observation(_make_curved_patch(), rgba=rgba)
+
+        sm.step(None, obs)
+        state = sm.step(None, obs)
+
+        curvature = state.non_morphological_features.get("principal_curvatures_log")
+        self.assertIsNotNone(curvature)
+        self.assertEqual(curvature.shape, (2,))
+        self.assertTrue(np.isfinite(curvature).all())
 
 
 if __name__ == "__main__":

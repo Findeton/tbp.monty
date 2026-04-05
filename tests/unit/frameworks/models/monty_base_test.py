@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, sentinel
 
 from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.models.monty_base import MontyBase
+from tbp.monty.frameworks.models.motor_system_state import AgentState, SensorState
+from tbp.monty.frameworks.sensors import SensorID
 
 
 class MontyBasePrivateTest(unittest.TestCase):
@@ -24,13 +26,15 @@ class MontyBasePrivateTest(unittest.TestCase):
         self.lm1 = MagicMock()
         self.lm2 = MagicMock()
         self.lm3 = MagicMock()
+        self.motor_system = MagicMock()
+        self.motor_system.motor_only_step = False
         self.monty_base = MontyBase(
             sensor_modules=[self.sm1, self.sm2],
             learning_modules=[self.lm1, self.lm2, self.lm3],
-            motor_system=MagicMock(),
+            motor_system=self.motor_system,
             sm_to_agent_dict={
                 "sm1": AgentID("agent_id_0"),
-                "sm2": AgentID("agent_id_0"),
+                "sm2": AgentID("agent_id_1"),
             },
             sm_to_lm_matrix=[[], [], []],
             lm_to_lm_matrix=[[], [], []],
@@ -40,6 +44,47 @@ class MontyBasePrivateTest(unittest.TestCase):
             num_exploratory_steps=10,
             max_total_steps=100,
         )
+
+    def test_aggregate_sensory_inputs_uses_per_sensor_agent_state(self) -> None:
+        agent_state_0 = AgentState(
+            sensors={
+                SensorID("sm1"): SensorState(
+                    position=(0.0, 0.0, 0.0),
+                    rotation=sentinel.sensor_rotation_0,
+                )
+            },
+            position=(1.0, 0.0, 0.0),
+            rotation=sentinel.agent_rotation_0,
+        )
+        agent_state_1 = AgentState(
+            sensors={
+                SensorID("sm2"): SensorState(
+                    position=(0.0, 0.0, 0.0),
+                    rotation=sentinel.sensor_rotation_1,
+                )
+            },
+            position=(0.0, 1.0, 0.0),
+            rotation=sentinel.agent_rotation_1,
+        )
+        self.motor_system._state = {
+            AgentID("agent_id_0"): agent_state_0,
+            AgentID("agent_id_1"): agent_state_1,
+        }
+        self.lm1.get_output.return_value = sentinel.lm1_output
+        self.lm2.get_output.return_value = sentinel.lm2_output
+        self.lm3.get_output.return_value = sentinel.lm3_output
+
+        observations = {
+            AgentID("agent_id_0"): {"sm1": sentinel.raw_obs_1},
+            AgentID("agent_id_1"): {"sm2": sentinel.raw_obs_2},
+        }
+
+        self.monty_base.aggregate_sensory_inputs(sentinel.ctx, observations)
+
+        self.sm1.update_state.assert_called_once_with(agent_state_0)
+        self.sm2.update_state.assert_called_once_with(agent_state_1)
+        self.sm1.step.assert_called_once_with(sentinel.ctx, sentinel.raw_obs_1, False)
+        self.sm2.step.assert_called_once_with(sentinel.ctx, sentinel.raw_obs_2, False)
 
     def test_pass_goal_states_collects_all_goals_from_learning_and_sensor_modules(
         self,

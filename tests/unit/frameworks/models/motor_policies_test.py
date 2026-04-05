@@ -31,6 +31,7 @@ from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.models.abstract_monty_classes import Observations
 from tbp.monty.frameworks.models.motor_policies import (
     BasePolicy,
+    MultiAgentInformedPolicy,
     PredefinedPolicy,
     SurfacePolicyCurvatureInformed,
 )
@@ -39,7 +40,7 @@ from tbp.monty.frameworks.models.motor_system_state import (
     MotorSystemState,
     SensorState,
 )
-from tbp.monty.frameworks.models.states import State
+from tbp.monty.frameworks.models.states import GoalState, State
 from tbp.monty.frameworks.sensors import SensorID
 
 
@@ -217,6 +218,94 @@ class PredefinedPolicyReadActionFileTest(unittest.TestCase):
             first_occurrence = returned_actions[i]
             second_occurrence = returned_actions[i + cycle_length]
             self.assertEqual(first_occurrence, second_occurrence)
+
+
+class MultiAgentInformedPolicyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.agent_id_0 = AgentID("agent_id_0")
+        self.agent_id_1 = AgentID("agent_id_1")
+        self.policy = MultiAgentInformedPolicy(
+            action_sampler=UniformlyDistributedSampler(actions=[LookUp]),
+            agent_ids=[self.agent_id_0, self.agent_id_1],
+            view_finder_ids={
+                self.agent_id_0: "patch_0",
+                self.agent_id_1: "patch_1",
+            },
+            sender_to_agent_dict={
+                "patch_0": self.agent_id_0,
+                "patch_1": self.agent_id_1,
+                "learning_module_0": self.agent_id_0,
+                "learning_module_1": self.agent_id_1,
+            },
+            use_goal_state_driven_actions=True,
+        )
+
+    def _make_state(self, sender_id: str) -> State:
+        return State(
+            location=np.zeros(3, dtype=np.float64),
+            morphological_features={
+                "pose_vectors": np.eye(3),
+                "pose_fully_defined": True,
+            },
+            non_morphological_features={"hsv": [0.0, 0.0, 0.0]},
+            confidence=1.0,
+            use_state=True,
+            sender_id=sender_id,
+            sender_type="SM",
+        )
+
+    def _make_goal_state(self, sender_id: str, confidence: float) -> GoalState:
+        return GoalState(
+            location=np.zeros(3, dtype=np.float64),
+            morphological_features={
+                "pose_vectors": np.eye(3),
+                "pose_fully_defined": True,
+            },
+            non_morphological_features=None,
+            confidence=confidence,
+            use_state=True,
+            sender_id=sender_id,
+            sender_type="GSG",
+            goal_tolerances={"location": 0.01},
+        )
+
+    def test_set_agent_processed_observations_routes_by_agent_and_sensor(self) -> None:
+        state_0 = self._make_state("patch_0")
+        state_1 = self._make_state("patch_1")
+
+        self.policy.set_agent_processed_observations(
+            {
+                self.agent_id_0: {"patch_0": state_0},
+                self.agent_id_1: {"patch_1": state_1},
+            }
+        )
+
+        self.assertIs(
+            self.policy._agent_policies[self.agent_id_0].processed_observations,
+            state_0,
+        )
+        self.assertIs(
+            self.policy._agent_policies[self.agent_id_1].processed_observations,
+            state_1,
+        )
+
+    def test_set_driving_goal_states_selects_best_goal_per_agent(self) -> None:
+        low_conf_goal = self._make_goal_state("learning_module_0", 0.2)
+        high_conf_goal = self._make_goal_state("learning_module_0", 0.9)
+        other_goal = self._make_goal_state("learning_module_1", 0.5)
+
+        self.policy.set_driving_goal_states(
+            [low_conf_goal, high_conf_goal, other_goal]
+        )
+
+        self.assertIs(
+            self.policy._agent_policies[self.agent_id_0].driving_goal_state,
+            high_conf_goal,
+        )
+        self.assertIs(
+            self.policy._agent_policies[self.agent_id_1].driving_goal_state,
+            other_goal,
+        )
 
 
 if __name__ == "__main__":

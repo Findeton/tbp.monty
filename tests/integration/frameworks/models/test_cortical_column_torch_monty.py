@@ -45,8 +45,13 @@ except ImportError:
 from tbp.monty.frameworks.models.cortical_column_torch.experiment import (
     Panda3DTorchExperiment,
 )
+from tbp.monty.frameworks.experiments.mode import ExperimentMode
 from tbp.monty.frameworks.models.cortical_column_torch.learning_module import (
     CorticalColumnTorchLM,
+)
+from tbp.monty.simulators.panda3d.kinematic_phase import (
+    extract_foot_cycle_phase_info,
+    extract_joint_phase_info,
 )
 
 # Real 3D model assets
@@ -427,11 +432,140 @@ class TestSwapModel(unittest.TestCase):
             exp.train("fox", n_steps=10)
 
             # Swap to Robot
-            exp.swap_model(ROBOT_PATH)
+            exp.swap_model(
+                ROBOT_PATH,
+                object_scale=(0.3, 0.3, 0.3),
+                initial_distance=3.0,
+            )
+            robot_anim_names = list(exp._anim_obj.animation_names)
+            robot_anim = next(
+                (
+                    name
+                    for name in robot_anim_names
+                    if "walk" in str(name).lower()
+                ),
+                robot_anim_names[0],
+            )
 
             # Should be able to eval (different model)
-            result = exp.evaluate(n_steps=10)
+            result = exp.evaluate(anim_name=robot_anim, n_steps=10)
             self.assertIn("graph_id", result)
+            self.assertEqual(exp._object_scale, (0.3, 0.3, 0.3))
+            self.assertEqual(exp._initial_distance, 3.0)
+        finally:
+            exp.close()
+
+
+@unittest.skipUnless(_assets_available(), "Real 3D model assets not found")
+class TestRealMeshPhaseTraining(unittest.TestCase):
+    """Track 9b phase supervision on a real animated mesh."""
+
+    @staticmethod
+    def _phase_provider(phase_by_frame):
+        phase_by_frame = list(int(phase) for phase in phase_by_frame)
+
+        def provider(step, frame, total_steps, n_frames, object_name, experiment):
+            if not phase_by_frame:
+                phase = 0
+            else:
+                phase = phase_by_frame[int(frame) % len(phase_by_frame)]
+            return {"lm_behavior": phase}
+
+        return provider
+
+    def test_behavior_lm_learns_phase_labels_on_real_animation(self):
+        exp = Panda3DTorchExperiment(
+            model_path=FOX_PATH,
+            hierarchical=True,
+            resolution=(32, 32),
+            initial_distance=2.0,
+            object_scale=(0.01, 0.01, 0.01),
+            flow_threshold=1e-6,
+            asset_search_paths=[ASSET_DIR],
+            column_kwargs={"n_minicolumns": 512, "sparsity": 0.05},
+            behavior_lm_kwargs={
+                "temporal_memory_config": {
+                    "sdr_dim": 256,
+                    "sdr_sparsity": 0.05,
+                    "learning_rate": 0.2,
+                    "include_location": False,
+                },
+                "temporal_transition_config": {
+                    "min_stable_steps": 1,
+                    "default_duration": 2.0,
+                },
+            },
+        )
+        try:
+            exp._setup()
+            anim = list(exp._anim_obj.animation_names)[0]
+            n_frames = exp._anim_obj.get_num_frames(anim)
+            phase_info = extract_foot_cycle_phase_info(
+                exp._anim_obj,
+                anim_name=anim,
+                n_phase_bins=4,
+            )
+            self.assertGreaterEqual(len(set(phase_info["phase_by_frame"])), 3)
+            self.assertTrue(
+                any("LeftFoot" in name for name in phase_info["joint_names"])
+            )
+            self.assertTrue(
+                any("RightFoot" in name for name in phase_info["joint_names"])
+            )
+
+            provider = self._phase_provider(phase_info["phase_by_frame"])
+            frame_schedule = [frame for _ in range(2) for frame in range(n_frames)]
+
+            for _ in range(2):
+                exp.run_episode(
+                    mode=ExperimentMode.TRAIN,
+                    object_name="fox_phase",
+                    anim_name=anim,
+                    frame_schedule=frame_schedule,
+                    state_provider=provider,
+                )
+
+            behavior_lm = exp.monty.learning_modules[1]
+            known_phase_labels = {
+                label
+                for label in behavior_lm.get_all_known_object_ids()
+                if str(label).startswith("fox_phase:")
+            }
+            self.assertGreaterEqual(len(known_phase_labels), 3)
+
+            result = exp.run_episode(
+                mode=ExperimentMode.EVAL,
+                anim_name=anim,
+                frame_schedule=frame_schedule,
+                state_provider=provider,
+                collect_trace=True,
+            )
+
+            self.assertEqual(len(result["trace"]), len(frame_schedule))
+            predicted_phase_labels = {
+                step["learning_modules"]["lm_behavior"].get("graph_id")
+                for step in result["trace"]
+                if step["learning_modules"]["lm_behavior"].get("graph_id")
+            }
+            self.assertTrue(
+                any(
+                    str(label).startswith("fox_phase:")
+                    for label in predicted_phase_labels
+                )
+            )
+
+            predicted_temporal_labels = {
+                (step["learning_modules"]["lm_behavior"].get("temporal_context") or {})
+                .get("predicted_label")
+                for step in result["trace"]
+            }
+            self.assertTrue(
+                any(
+                    str(label).startswith("fox_phase:")
+                    for label in predicted_temporal_labels
+                    if label is not None
+                )
+            )
         finally:
             exp.close()
 

@@ -43,7 +43,8 @@ class LocationFeatureMemory:
         Inverse temperature for softmax retrieval.
     novelty_threshold : float or None
         Cosine similarity threshold for novelty gating on the full
-        composite.  None disables gating (store everything).
+        composite.  Novelty gating only compares against patterns stored
+        for the same object ID. None disables gating (store everything).
     max_patterns : int
         Maximum stored patterns (ring buffer when exceeded).
     device : str
@@ -106,7 +107,8 @@ class LocationFeatureMemory:
             Raw 3D sensor location (world frame) for reference frame
             estimation.  If None, a zero vector is stored.
         novelty_threshold : float or None
-            Override instance threshold for this store call.
+            Override instance threshold for this store call. Novelty is
+            evaluated only against patterns already stored for object_id.
 
         Returns True if stored, False if rejected by novelty gate.
         """
@@ -123,13 +125,19 @@ class LocationFeatureMemory:
 
             if thresh is not None and self.n_stored > 0:
                 n = self.n_stored
-                c_norm = composite / (composite.norm() + 1e-8)
-                p_norms = self._patterns[:n] / (
-                    self._patterns[:n].norm(dim=1, keepdim=True) + 1e-8
-                )
-                sims = torch.mv(p_norms, c_norm)
-                if sims.max().item() >= thresh:
-                    return False
+                same_object_indices = [
+                    i for i, oid in enumerate(self._object_ids[:n])
+                    if oid == object_id
+                ]
+                if same_object_indices:
+                    c_norm = composite / (composite.norm() + 1e-8)
+                    same_object_patterns = self._patterns[same_object_indices]
+                    p_norms = same_object_patterns / (
+                        same_object_patterns.norm(dim=1, keepdim=True) + 1e-8
+                    )
+                    sims = torch.mv(p_norms, c_norm)
+                    if sims.max().item() >= thresh:
+                        return False
 
             raw_loc = (
                 np.asarray(raw_location, dtype=np.float64)

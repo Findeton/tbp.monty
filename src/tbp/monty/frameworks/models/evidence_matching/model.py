@@ -33,7 +33,31 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
 
     def __init__(self, *args, **kwargs):
         """Initialize and reset LM."""
+        self.authoritative_goal_sender_ids = set(
+            kwargs.pop("authoritative_goal_sender_ids", []) or []
+        )
         super().__init__(*args, **kwargs)
+
+    def _select_motor_goal_states(self):
+        goal_states = [
+            goal_state
+            for goal_state in getattr(self, "gsg_outputs", [])
+            if goal_state is not None
+            and bool(getattr(goal_state, "use_state", True))
+        ]
+
+        authoritative_goal_sender_ids = set(
+            getattr(self, "authoritative_goal_sender_ids", set()) or []
+        )
+        if not authoritative_goal_sender_ids:
+            return goal_states
+
+        return [
+            goal_state
+            for goal_state in goal_states
+            if getattr(goal_state, "sender_id", None)
+            in authoritative_goal_sender_ids
+        ]
 
     def _pass_infos_to_motor_system(self):
         """Pass processed observations and goal states to the motor system.
@@ -42,12 +66,17 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
         goal states are considered bound for the motor system. TODO M change this.
         """
         super()._pass_infos_to_motor_system()
+        goal_states = self._select_motor_goal_states()
 
         # Check that the motor system can receive goal states
         if self.motor_system._policy.use_goal_state_driven_actions:
+            if hasattr(self.motor_system._policy, "set_driving_goal_states"):
+                self.motor_system._policy.set_driving_goal_states(goal_states)
+                return
+
             best_goal_state = None
             best_goal_confidence = -np.inf
-            for current_goal_state in self.gsg_outputs:
+            for current_goal_state in goal_states:
                 if (
                     current_goal_state is not None
                     and current_goal_state.confidence > best_goal_confidence
@@ -66,10 +95,45 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
         combined_votes = []
         for i in range(len(self.learning_modules)):
             lm_state_votes = {}
+            aggregated_ranked_hypotheses = {}
             if votes_per_lm[i] is not None:
                 receiving_lm_pose = votes_per_lm[i]["sensed_pose_rel_body"]
                 for j in self.lm_to_lm_vote_matrix[i]:
                     if votes_per_lm[j] is not None:
+                        for hypothesis in votes_per_lm[j].get(
+                            "ranked_hypotheses", []
+                        ):
+                            object_id = str(hypothesis.get("object_id", ""))
+                            if not object_id:
+                                continue
+                            entry = aggregated_ranked_hypotheses.setdefault(
+                                object_id,
+                                {
+                                    "object_id": object_id,
+                                    "probability": 0.0,
+                                    "evidence": 0.0,
+                                    "source_rank": int(hypothesis.get("rank", 10**6)),
+                                    "sender_ids": set(),
+                                },
+                            )
+                            entry["probability"] += float(
+                                hypothesis.get("probability", 0.0)
+                            )
+                            entry["evidence"] = max(
+                                entry["evidence"],
+                                float(hypothesis.get("evidence", 0.0)),
+                            )
+                            entry["source_rank"] = min(
+                                entry["source_rank"],
+                                int(hypothesis.get("rank", 10**6)),
+                            )
+                            sender_id = hypothesis.get(
+                                "sender_id",
+                                votes_per_lm[j].get("sender_id"),
+                            )
+                            if sender_id is not None:
+                                entry["sender_ids"].add(str(sender_id))
+
                         sending_lm_pose = votes_per_lm[j]["sensed_pose_rel_body"]
                         sensor_disp = np.array(receiving_lm_pose[0]) - np.array(
                             sending_lm_pose[0]
@@ -118,7 +182,21 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
                             else:
                                 lm_state_votes[obj] = transformed_lm_states_for_object
             logger.debug(f"VOTE from LMs {self.lm_to_lm_vote_matrix[i]} to LM {i}")
-            vote = lm_state_votes
+            vote = {"possible_states": lm_state_votes}
+            if aggregated_ranked_hypotheses:
+                ranked_hypotheses = sorted(
+                    aggregated_ranked_hypotheses.values(),
+                    key=lambda item: (
+                        -float(item["probability"]),
+                        int(item["source_rank"]),
+                        str(item["object_id"]),
+                    ),
+                )
+                for rank, hypothesis in enumerate(ranked_hypotheses, start=1):
+                    hypothesis["rank"] = rank
+                    hypothesis["sender_ids"] = sorted(hypothesis["sender_ids"])
+                    hypothesis.pop("source_rank", None)
+                vote["ranked_hypotheses"] = ranked_hypotheses
             combined_votes.append(vote)
         return combined_votes
 

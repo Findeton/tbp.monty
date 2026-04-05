@@ -69,6 +69,9 @@ class MontyForGraphMatching(MontyBase):
                 independently before any votes are exchanged.  Higher values
                 give each LM more time to form an independent opinion.
                 Default 100.
+            vote_cooldown_steps: Minimum matching steps between repeated
+                lateral votes to the same receiving LM. Defaults to 0 for
+                backward compatibility.
             temporal_voting: If True, also apply temporal prediction voting.
                 LMs that correctly predicted the current state vote to help
                 LMs whose temporal predictions failed.  Default False.
@@ -78,6 +81,7 @@ class MontyForGraphMatching(MontyBase):
             "vote_confident_threshold", 2
         )
         self.vote_after_steps = kwargs.pop("vote_after_steps", 100)
+        self.vote_cooldown_steps = kwargs.pop("vote_cooldown_steps", 0)
         self.temporal_voting = kwargs.pop("temporal_voting", False)
         # T6.5: Unified predictive voting. When True, replaces both
         # conditional_voting and temporal_voting with a single pass that
@@ -101,6 +105,10 @@ class MontyForGraphMatching(MontyBase):
         self.hopfield_surprise_threshold = kwargs.pop(
             "hopfield_surprise_threshold", 0.3
         )
+        self.hopfield_vote_after_steps = kwargs.pop(
+            "hopfield_vote_after_steps", 0
+        )
+        self._last_vote_step_by_receiver = {}
         super().__init__(*args, **kwargs)
 
     # =============== Public Interface Functions ===============
@@ -109,6 +117,7 @@ class MontyForGraphMatching(MontyBase):
         """Reset values and call sub-pre_episode functions."""
         self._is_done = False
         self.reset_episode_steps()
+        self._last_vote_step_by_receiver = {}
         self.switch_to_matching_step()
         self.reset()
         self.primary_target = primary_target
@@ -134,6 +143,21 @@ class MontyForGraphMatching(MontyBase):
             lm.receive_votes(combined_votes[lm_id])
 
         logger.debug(f"Matches after voting (LM {lm_id}): {lm.get_possible_matches()}")
+
+    def _receiver_vote_ready(self, receiver_id: int) -> bool:
+        """Return whether a receiver is eligible for another lateral vote."""
+        if self.vote_cooldown_steps <= 0:
+            return True
+
+        last_step = self._last_vote_step_by_receiver.get(receiver_id)
+        if last_step is None:
+            return True
+
+        return (self.matching_steps - last_step) >= self.vote_cooldown_steps
+
+    def _mark_vote_sent(self, receiver_id: int) -> None:
+        """Record that a receiver consumed a lateral vote on this step."""
+        self._last_vote_step_by_receiver[receiver_id] = self.matching_steps
 
     def update_stats_after_vote(self, lm):
         """Add voting stats to buffer and check individual terminal condition."""
@@ -566,9 +590,13 @@ class MontyForGraphMatching(MontyBase):
         if undecided or not confident or not stuck:
             return  # Not ready yet
 
+        ready_stuck = {i for i in stuck if self._receiver_vote_ready(i)}
+        if not ready_stuck:
+            return
+
         logger.info(
             f"Conditional vote: confident={sorted(confident)}, "
-            f"stuck={sorted(stuck)}"
+            f"stuck={sorted(ready_stuck)}"
         )
 
         # Collect votes from ALL LMs that have observations (needed for
@@ -584,7 +612,7 @@ class MontyForGraphMatching(MontyBase):
         saved_matrix = self.lm_to_lm_vote_matrix
         temp_matrix = []
         for i in range(n_lms):
-            if i in stuck:
+            if i in ready_stuck:
                 senders = [
                     j for j in saved_matrix[i]
                     if j in confident and votes_per_lm[j] is not None
@@ -597,7 +625,9 @@ class MontyForGraphMatching(MontyBase):
         self.lm_to_lm_vote_matrix = temp_matrix
         try:
             combined_votes = self._combine_votes(votes_per_lm)
-            for i in stuck:
+            for i in ready_stuck:
+                if not temp_matrix[i]:
+                    continue
                 logger.debug(
                     f"------ Conditional vote to LM {i} -------"
                 )
@@ -605,6 +635,7 @@ class MontyForGraphMatching(MontyBase):
                     self.learning_modules[i], i, combined_votes
                 )
                 self.update_stats_after_vote(self.learning_modules[i])
+                self._mark_vote_sent(i)
         finally:
             self.lm_to_lm_vote_matrix = saved_matrix
 
@@ -632,6 +663,9 @@ class MontyForGraphMatching(MontyBase):
         pattern as a retrieval cue in its own Hopfield memory, biologically
         analogous to lateral cortical connections sharing attractor states.
         """
+        if self.matching_steps <= self.hopfield_vote_after_steps:
+            return
+
         threshold = self.hopfield_surprise_threshold
         n_lms = len(self.learning_modules)
 
@@ -664,9 +698,13 @@ class MontyForGraphMatching(MontyBase):
         if not confident or not stuck:
             return  # Nothing to do
 
+        ready_stuck = {i for i in stuck if self._receiver_vote_ready(i)}
+        if not ready_stuck:
+            return
+
         logger.info(
             f"Hopfield vote: confident={sorted(confident)} "
-            f"(surprise ≤ {threshold}), stuck={sorted(stuck)}"
+            f"(surprise ≤ {threshold}), stuck={sorted(ready_stuck)}"
         )
 
         # Collect votes from all LMs (needed for _combine_votes pose data)
@@ -678,7 +716,7 @@ class MontyForGraphMatching(MontyBase):
         saved_matrix = self.lm_to_lm_vote_matrix
         temp_matrix = []
         for i in range(n_lms):
-            if i in stuck:
+            if i in ready_stuck:
                 senders = [
                     j for j in saved_matrix[i]
                     if j in confident and votes_per_lm[j] is not None
@@ -690,12 +728,15 @@ class MontyForGraphMatching(MontyBase):
         self.lm_to_lm_vote_matrix = temp_matrix
         try:
             combined_votes = self._combine_votes(votes_per_lm)
-            for i in stuck:
+            for i in ready_stuck:
+                if not temp_matrix[i]:
+                    continue
                 logger.debug(f"------ Hopfield vote to LM {i} -------")
                 self.send_vote_to_lm(
                     self.learning_modules[i], i, combined_votes
                 )
                 self.update_stats_after_vote(self.learning_modules[i])
+                self._mark_vote_sent(i)
         finally:
             self.lm_to_lm_vote_matrix = saved_matrix
 
@@ -829,9 +870,13 @@ class MontyForGraphMatching(MontyBase):
         if not confident or not confused:
             return  # Nothing to do
 
+        ready_confused = {i for i in confused if self._receiver_vote_ready(i)}
+        if not ready_confused:
+            return
+
         logger.info(
             f"Predictive vote: confident={sorted(confident)}, "
-            f"confused={sorted(confused)}"
+            f"confused={sorted(ready_confused)}"
         )
 
         # Collect votes from all LMs
@@ -843,7 +888,7 @@ class MontyForGraphMatching(MontyBase):
         saved_matrix = self.lm_to_lm_vote_matrix
         temp_matrix = []
         for i in range(n_lms):
-            if i in confused:
+            if i in ready_confused:
                 senders = [
                     j for j in saved_matrix[i]
                     if j in confident and votes_per_lm[j] is not None
@@ -855,7 +900,9 @@ class MontyForGraphMatching(MontyBase):
         self.lm_to_lm_vote_matrix = temp_matrix
         try:
             combined_votes = self._combine_votes(votes_per_lm)
-            for i in confused:
+            for i in ready_confused:
+                if not temp_matrix[i]:
+                    continue
                 logger.debug(
                     f"------ Predictive vote to LM {i} -------"
                 )
@@ -863,6 +910,7 @@ class MontyForGraphMatching(MontyBase):
                     self.learning_modules[i], i, combined_votes
                 )
                 self.update_stats_after_vote(self.learning_modules[i])
+                self._mark_vote_sent(i)
         finally:
             self.lm_to_lm_vote_matrix = saved_matrix
 
@@ -871,13 +919,34 @@ class MontyForGraphMatching(MontyBase):
 
         Omit goal states in this case.
         """
-        # TODO M: generalize to multiple sensor modules
+        if len(self.sensor_module_outputs) == 0:
+            return
 
-        if (
+        if not (
             self.step_type == "matching_step"
-            or self.sensor_module_outputs[0] is not None
+            or any(percept is not None for percept in self.sensor_module_outputs)
         ):
-            self._pass_input_obs_to_motor_system(self.sensor_module_outputs[0])
+            return
+
+        policy = self.motor_system._policy
+        if hasattr(policy, "set_agent_processed_observations"):
+            percepts_by_agent = {}
+            for sensor_module, percept in zip(
+                self.sensor_modules,
+                self.sensor_module_outputs,
+            ):
+                if percept is None:
+                    continue
+                sensor_module_id = sensor_module.sensor_module_id
+                agent_id = self.sm_to_agent_dict[sensor_module_id]
+                if agent_id not in percepts_by_agent:
+                    percepts_by_agent[agent_id] = {}
+                percepts_by_agent[agent_id][sensor_module_id] = percept
+
+            policy.set_agent_processed_observations(percepts_by_agent)
+            return
+
+        self._pass_input_obs_to_motor_system(self.sensor_module_outputs[0])
 
     def _set_step_type_and_check_if_done(self):
         """Check terminal conditions and decide if we change the step type."""

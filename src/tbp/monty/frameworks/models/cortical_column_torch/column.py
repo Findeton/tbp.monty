@@ -22,7 +22,8 @@ Pipeline per step (flat mode — Track 9 default):
 2. Spatial pooling: overlap + boosting + top-k
 3. Dendritic prediction: basal predict(prev_active) + apical predict(context)
 4. Cell activation: graded 4-state logic
-5. Hopfield settling: denoise toward cortical object attractors
+5. Hopfield settling: denoise toward cortical object attractors with
+    optional direct query bias
 6. Surprise: mismatch between predicted and settled patterns
 7. Learning: Hebbian on all pathways, modulated by surprise
 8. Evidence update: attention over prototypes → per-object scores
@@ -61,6 +62,9 @@ from tbp.monty.frameworks.models.cortical_column_torch.location_feature_memory i
 )
 from tbp.monty.frameworks.models.cortical_column_torch.predictive_tracker import (
     PredictiveTracker,
+)
+from tbp.monty.frameworks.models.cortical_column_torch.reference_frame_estimator import (
+    ReferenceFrameEstimator,
 )
 from tbp.monty.frameworks.models.cortical_column_torch.hopfield import (
     ModernHopfieldMemory,
@@ -157,17 +161,25 @@ class CorticalColumnTorch:
         use_phase_coding: bool = False,
         use_thalamic_relay: bool = False,
         use_location_feature_memory: bool = False,
+        use_reference_frame_estimator: bool = False,
+        use_action_conditioned_prediction: bool = False,
         encoder_kwargs: dict = None,
         dendrite_kwargs: dict = None,
         hopfield_kwargs: dict = None,
         memory_kwargs: dict = None,
         episodic_kwargs: dict = None,
         lfm_kwargs: dict = None,
+        reference_frame_kwargs: dict = None,
+        action_predictor_kwargs: dict = None,
         motor_kwargs: dict = None,
         neuromod_kwargs: dict = None,
         laminar_kwargs: dict = None,
         plateau_kwargs: dict = None,
         oscillator_kwargs: dict = None,
+        reference_frame_query_weight: float = 1.0,
+        action_prediction_query_weight: float = 0.2,
+        defer_sensor_auto_label: bool = False,
+        defer_context_auto_label: bool = False,
         seed: int = 42,
         device: str = "cpu",
     ):
@@ -183,6 +195,14 @@ class CorticalColumnTorch:
         self._use_motor_prediction = use_motor_prediction
         self._use_neuromodulation = use_neuromodulation
         self._evidence_decay = evidence_decay
+        self._use_reference_frame_estimator = use_reference_frame_estimator
+        self._reference_frame_query_weight = reference_frame_query_weight
+        self._use_action_conditioned_prediction = (
+            use_action_conditioned_prediction
+        )
+        self._action_prediction_query_weight = action_prediction_query_weight
+        self._defer_sensor_auto_label = bool(defer_sensor_auto_label)
+        self._defer_context_auto_label = bool(defer_context_auto_label)
         self.device = torch.device(device)
 
         torch.manual_seed(seed)
@@ -302,9 +322,24 @@ class CorticalColumnTorch:
                 prediction_bonus_weight=0.5,
                 max_consecutive_drops=5,
             )
+            if self._use_reference_frame_estimator:
+                _rfe_kw = dict(
+                    min_pairs=3,
+                    evidence_threshold=0.15,
+                    confidence_threshold=0.5,
+                    max_pairs=30,
+                )
+                if reference_frame_kwargs:
+                    _rfe_kw.update(reference_frame_kwargs)
+                self._reference_frame_estimator = ReferenceFrameEstimator(
+                    **_rfe_kw
+                )
+            else:
+                self._reference_frame_estimator = None
         else:
             self._lfm = None
             self._predictive_tracker = None
+            self._reference_frame_estimator = None
 
         # ---- Motor prediction ----
         if self._use_motor_prediction:
@@ -318,6 +353,29 @@ class CorticalColumnTorch:
             self._motor_prediction = ContrastiveMotorPrediction(**mp_kw)
         else:
             self._motor_prediction = None
+
+        if self._use_action_conditioned_prediction:
+            ap_kw = dict(
+                location_dim=self.n_minicolumns,
+                motor_dim=8,
+                hidden_dim=128,
+                device=device,
+            )
+            if action_predictor_kwargs:
+                ap_kw.update(action_predictor_kwargs)
+            self._action_conditioned_prediction = ContrastiveMotorPrediction(
+                **ap_kw
+            )
+            self._action_context = torch.zeros(
+                int(ap_kw["motor_dim"]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            self._action_conditioned_prediction = None
+            self._action_context = torch.zeros(
+                0, dtype=torch.float32, device=self.device
+            )
 
         # ---- Neuromodulation ----
         if self._use_neuromodulation:
@@ -378,6 +436,12 @@ class CorticalColumnTorch:
                                              device=self.device)
         self._context = torch.zeros(self.n_cells, dtype=torch.float32,
                                     device=self.device)
+        self._hopfield_query_bias = torch.zeros(
+            self.n_cells, dtype=torch.float32, device=self.device
+        )
+        self._action_conditioned_query_bias = torch.zeros(
+            self.n_cells, dtype=torch.float32, device=self.device
+        )
         self._active_mc = torch.zeros(self.n_minicolumns, dtype=torch.bool,
                                       device=self.device)
         self._mc_overlap = torch.zeros(self.n_minicolumns, dtype=torch.float32,
@@ -388,6 +452,8 @@ class CorticalColumnTorch:
         self._step_count = 0
         self._evidence: dict[str, float] = {}
         self._surprise = 1.0
+        self._prediction_mismatch = 1.0
+        self._action_prediction_error = 0.0
         self._activation_history: list[torch.Tensor] = []
 
     def _init_feedforward(self, seed: int) -> None:
@@ -587,6 +653,8 @@ class CorticalColumnTorch:
         self._predicted.zero_()
         self._apical_predicted.zero_()
         self._context.zero_()
+        self._hopfield_query_bias.zero_()
+        self._action_conditioned_query_bias.zero_()
         self._active_mc.zero_()
         self._mc_overlap.zero_()
         self._last_pre_settle = torch.zeros(self.n_cells, dtype=torch.float32,
@@ -594,10 +662,16 @@ class CorticalColumnTorch:
         self._prev_location = None
         self._step_count = 0
         self._surprise = 1.0
+        self._prediction_mismatch = 1.0
+        self._action_prediction_error = 0.0
         self._activation_history.clear()
 
         if self._motor_prediction is not None:
             self._motor_prediction.reset()
+        if self._action_conditioned_prediction is not None:
+            self._action_conditioned_prediction.reset()
+        if self._action_context.numel() > 0:
+            self._action_context.zero_()
         if self._neuromod is not None:
             self._neuromod.reset()
 
@@ -620,12 +694,11 @@ class CorticalColumnTorch:
         # Reset predictive tracker per eval episode
         if self._predictive_tracker is not None:
             self._predictive_tracker.reset()
+        if self._reference_frame_estimator is not None:
+            self._reference_frame_estimator.reset()
 
         # Initialize evidence for known objects
-        if self._use_lfm and self._lfm is not None:
-            known = self._lfm.known_objects
-        else:
-            known = self._associative_memory.known_objects
+        known = self._get_known_object_ids()
         self._evidence = {obj: 0.0 for obj in known}
 
         # Sync cortical attractors from current prototypes
@@ -649,16 +722,34 @@ class CorticalColumnTorch:
     def post_episode(self):
         """Finalize episode."""
         if self._mode == "train":
-            # Auto-generate label if none was provided and step() didn't
-            # already generate one (e.g. fewer than 5 steps).
+            generated_from_history = False
+            # Auto-generate label if none was provided and step() deferred the
+            # decision until the full episode history was available.
             if not self._current_object and self._activation_history:
                 self._current_object = (
                     self._associative_memory.auto_label(
                         self._activation_history
                     )
                 )
+                generated_from_history = True
 
             if self._current_object:
+                if generated_from_history:
+                    episode_patterns = [
+                        pattern.to(self.device)
+                        for pattern in self._activation_history
+                        if pattern.abs().sum() > 0
+                    ]
+                    if episode_patterns:
+                        episode_prototype = torch.stack(
+                            episode_patterns
+                        ).mean(dim=0)
+                        self._associative_memory.learn(
+                            episode_prototype,
+                            self._current_object,
+                            lr=self._base_lr,
+                        )
+
                 # Store final observation in episodic memory (HPC)
                 pat = self._last_pre_settle
                 if pat.abs().sum() > 0:
@@ -677,6 +768,70 @@ class CorticalColumnTorch:
                     self._episodic_memory.n_stored,
                     len(self._associative_memory.known_objects),
                 )
+
+    def _update_reference_frame_estimates(
+        self,
+        current_location: np.ndarray,
+        feature_evidence: dict[str, float],
+        predicted_locations: dict[str, np.ndarray],
+    ) -> None:
+        if self._reference_frame_estimator is None:
+            return
+
+        for object_id, evidence in feature_evidence.items():
+            if object_id not in predicted_locations:
+                continue
+            self._reference_frame_estimator.add_observation(
+                object_id=object_id,
+                world_loc=current_location,
+                predicted_obj_loc=predicted_locations[object_id],
+                evidence=evidence,
+            )
+
+    def _compute_reference_frame_evidence(
+        self,
+        current_location: np.ndarray,
+        feat_enc: torch.Tensor,
+        object_ids,
+    ) -> dict[str, float]:
+        if self._reference_frame_estimator is None or self._lfm is None:
+            return {}
+
+        reference_frame_evidence: dict[str, float] = {}
+        for object_id in object_ids:
+            if not self._reference_frame_estimator.has_rotation(object_id):
+                continue
+
+            object_location = self._reference_frame_estimator.transform(
+                object_id, current_location
+            )
+            loc_enc = self._encoder.encode_location(object_location)
+            _, full_evidence = self._lfm.query_full(loc_enc, feat_enc)
+            reference_frame_evidence[object_id] = float(
+                full_evidence.get(object_id, 0.0)
+            )
+
+        return reference_frame_evidence
+
+    def _blend_reference_frame_evidence(
+        self,
+        feature_evidence: dict[str, float],
+        reference_frame_evidence: dict[str, float],
+    ) -> dict[str, float]:
+        if self._reference_frame_estimator is None:
+            return dict(feature_evidence)
+
+        blended = dict(feature_evidence)
+        for object_id, full_score in reference_frame_evidence.items():
+            confidence = self._reference_frame_estimator.get_confidence(object_id)
+            base_score = blended.get(object_id, 0.0)
+            improvement = max(0.0, full_score - base_score)
+            blended[object_id] = (
+                base_score
+                + confidence * improvement * self._reference_frame_query_weight
+            )
+
+        return blended
 
     # ------------------------------------------------------------------
     # Core step
@@ -765,6 +920,23 @@ class CorticalColumnTorch:
             # storage and associative memory learning.
             pre_settle_active = self._active.clone()
             self._last_pre_settle = pre_settle_active
+            action_predicted_summary = self._update_action_conditioned_prediction(
+                pre_settle_active
+            )
+            self._prediction_mismatch = self._compute_prediction_mismatch(
+                pre_settle_active
+            )
+            if action_predicted_summary is not None:
+                observed_summary = self._summarize_activity_by_minicolumn(
+                    pre_settle_active
+                )
+                self._prediction_mismatch = max(
+                    self._prediction_mismatch,
+                    self._compute_summary_prediction_mismatch(
+                        observed_summary,
+                        action_predicted_summary,
+                    ),
+                )
 
             # 5. Hopfield settling — denoise toward cortical attractors
             # Cortical attractors are object-level prototypes (no phase
@@ -773,10 +945,8 @@ class CorticalColumnTorch:
             if self._use_neuromodulation and self._neuromod is not None:
                 beta *= self._neuromod.beta_scale()
 
-            # Plateau enrichment before settling
-            query = self._active
-            if self._use_plateau and self._plateau is not None:
-                query = self._plateau.enrich_query(query)
+            # Compose the actual Hopfield query after cortical activation.
+            query = self._compose_hopfield_query(self._active)
 
             def sparsity_fn(x):
                 return enforce_sparsity(
@@ -886,7 +1056,11 @@ class CorticalColumnTorch:
             if self._mode == "train":
                 self._activation_history.append(pre_settle_active.clone())
                 # Auto-generate label if none was provided.
-                if not self._current_object and len(self._activation_history) >= 5:
+                if (
+                    not self._defer_sensor_auto_label
+                    and not self._current_object
+                    and len(self._activation_history) >= 5
+                ):
                     self._current_object = (
                         self._associative_memory.auto_label(
                             self._activation_history
@@ -905,6 +1079,11 @@ class CorticalColumnTorch:
                             raw_location=current_location,
                         )
             elif self._mode == "eval":
+                if (
+                    (self._defer_sensor_auto_label or self._defer_context_auto_label)
+                    and pre_settle_active.abs().sum() > 0
+                ):
+                    self._activation_history.append(pre_settle_active.clone())
                 if self._use_lfm and self._lfm is not None:
                     tracker = self._predictive_tracker
                     _lb = self._encoder._location_bits
@@ -916,12 +1095,33 @@ class CorticalColumnTorch:
                     _, feat_ev, pred_locs = self._lfm.query_features(
                         lfm_feat_enc
                     )
+                    self._update_reference_frame_estimates(
+                        current_location=current_location,
+                        feature_evidence=feat_ev,
+                        predicted_locations=pred_locs,
+                    )
+                    ref_ev = self._compute_reference_frame_evidence(
+                        current_location=current_location,
+                        feat_enc=lfm_feat_enc,
+                        object_ids=feat_ev.keys(),
+                    )
+                    base_ev = self._blend_reference_frame_evidence(
+                        feat_ev, ref_ev
+                    )
 
                     # 2. Predictive tracking per object
                     #    (lfm_world_disp computed at step 1a, before
                     #    _prev_location was overwritten)
                     prediction_bonus: dict[str, float] = {}
-                    for obj_name in list(feat_ev.keys()):
+                    for obj_name in list(base_ev.keys()):
+                        if (
+                            self._reference_frame_estimator is not None
+                            and self._reference_frame_estimator.has_rotation(
+                                obj_name
+                            )
+                        ):
+                            continue
+
                         if tracker.is_anchored(obj_name):
                             # Track: path integration (world displacement
                             # as object-frame approximation)
@@ -965,7 +1165,7 @@ class CorticalColumnTorch:
 
                     # 4. Accumulate evidence: feature baseline +
                     #    prediction confirmation bonus
-                    for obj_name, score in feat_ev.items():
+                    for obj_name, score in base_ev.items():
                         prev = self._evidence.get(obj_name, 0.0)
                         if self._evidence_decay > 0:
                             prev *= (1 - self._evidence_decay)
@@ -1095,10 +1295,26 @@ class CorticalColumnTorch:
             # Save pre-settle activation
             pre_settle_active = padded.clone()
             self._last_pre_settle = pre_settle_active
+            action_predicted_summary = self._update_action_conditioned_prediction(
+                pre_settle_active
+            )
+            self._prediction_mismatch = self._compute_prediction_mismatch(
+                pre_settle_active,
+                predicted_active=basal_pred.abs(),
+            )
+            if action_predicted_summary is not None:
+                observed_summary = self._summarize_activity_by_minicolumn(
+                    pre_settle_active
+                )
+                self._prediction_mismatch = max(
+                    self._prediction_mismatch,
+                    self._compute_summary_prediction_mismatch(
+                        observed_summary,
+                        action_predicted_summary,
+                    ),
+                )
 
-            # Plateau enrichment before settling
-            if self._use_plateau and self._plateau is not None:
-                padded = self._plateau.enrich_query(padded)
+            query = self._compose_hopfield_query(padded)
 
             # Cortical attractor settling (no phase augmentation)
             def sparsity_fn(x):
@@ -1106,7 +1322,7 @@ class CorticalColumnTorch:
                     x, self.n_minicolumns, self.n_cells_per_minicolumn
                 )
             settled, n_iters = self._hopfield.settle(
-                padded, beta=beta, sparsity_fn=sparsity_fn,
+                query, beta=beta, sparsity_fn=sparsity_fn,
             )
 
             self._active = settled
@@ -1248,7 +1464,11 @@ class CorticalColumnTorch:
             # 10. Object memory + evidence
             if self._mode == "train":
                 self._activation_history.append(pre_settle_active.clone())
-                if not self._current_object and len(self._activation_history) >= 5:
+                if (
+                    not self._defer_sensor_auto_label
+                    and not self._current_object
+                    and len(self._activation_history) >= 5
+                ):
                     self._current_object = (
                         self._associative_memory.auto_label(
                             self._activation_history
@@ -1260,6 +1480,11 @@ class CorticalColumnTorch:
                     )
                     self._sync_cortical_attractors()
             elif self._mode == "eval":
+                if (
+                    (self._defer_sensor_auto_label or self._defer_context_auto_label)
+                    and pre_settle_active.abs().sum() > 0
+                ):
+                    self._activation_history.append(pre_settle_active.clone())
                 scores = self._associative_memory.recall(pre_settle_active)
                 for obj_name, score in scores.items():
                     prev = self._evidence.get(obj_name, 0.0)
@@ -1415,6 +1640,166 @@ class CorticalColumnTorch:
     # Context and output
     # ------------------------------------------------------------------
 
+    def _coerce_activity_signal(self, active_cells):
+        if active_cells is None:
+            return None
+
+        if isinstance(active_cells, np.ndarray):
+            ctx = torch.from_numpy(active_cells.astype(np.float32)).to(self.device)
+        elif isinstance(active_cells, torch.Tensor):
+            ctx = active_cells.to(self.device).float()
+        else:
+            return None
+
+        if ctx.shape[0] != self.n_cells:
+            ctx = torch.nn.functional.interpolate(
+                ctx.unsqueeze(0).unsqueeze(0),
+                size=self.n_cells,
+                mode="linear",
+                align_corners=False,
+            ).squeeze()
+
+        return ctx
+
+    def _compose_hopfield_query(self, base_query: torch.Tensor) -> torch.Tensor:
+        query = base_query
+        if float(self._hopfield_query_bias.abs().sum().item()) > 1e-8:
+            query = query + self._hopfield_query_bias
+        if float(self._action_conditioned_query_bias.abs().sum().item()) > 1e-8:
+            query = query + self._action_conditioned_query_bias
+
+        if self._use_plateau and self._plateau is not None:
+            query = self._plateau.enrich_query(query)
+
+        return query
+
+    def _coerce_action_context(self, action_context):
+        if action_context is None or self._action_context.numel() == 0:
+            return None
+
+        if isinstance(action_context, np.ndarray):
+            ctx = torch.from_numpy(action_context.astype(np.float32)).to(
+                self.device
+            )
+        elif isinstance(action_context, torch.Tensor):
+            ctx = action_context.to(self.device).float()
+        else:
+            return None
+
+        if ctx.ndim != 1:
+            ctx = ctx.reshape(-1)
+
+        target_dim = int(self._action_context.shape[0])
+        if ctx.shape[0] < target_dim:
+            ctx = torch.nn.functional.pad(ctx, (0, target_dim - ctx.shape[0]))
+        elif ctx.shape[0] > target_dim:
+            ctx = ctx[:target_dim]
+
+        return ctx
+
+    def _summarize_activity_by_minicolumn(
+        self,
+        activity: torch.Tensor,
+    ) -> torch.Tensor:
+        summary = activity.detach().float().reshape(
+            self.n_minicolumns,
+            self.n_cells_per_minicolumn,
+        ).abs().amax(dim=1)
+        max_abs = float(summary.abs().max().item())
+        if max_abs > 1.0:
+            summary = summary / max_abs
+        return summary
+
+    def _expand_minicolumn_signal(
+        self,
+        signal: torch.Tensor,
+    ) -> torch.Tensor:
+        return signal.repeat_interleave(self.n_cells_per_minicolumn)
+
+    def _compute_summary_prediction_mismatch(
+        self,
+        observed_summary: torch.Tensor,
+        predicted_summary: torch.Tensor,
+    ) -> float:
+        observed_norm = float(observed_summary.detach().abs().sum().item())
+        predicted_norm = float(predicted_summary.detach().abs().sum().item())
+        if observed_norm <= 1e-8 or predicted_norm <= 1e-8:
+            return float(self._surprise)
+
+        overlap = float(
+            (observed_summary.detach().abs() * predicted_summary.detach().abs())
+            .sum()
+            .item()
+        )
+        mismatch = 1.0 - (overlap / max(observed_norm, 1e-8))
+        return max(0.0, min(1.0, mismatch))
+
+    def _update_action_conditioned_prediction(
+        self,
+        observed_active: torch.Tensor,
+    ) -> torch.Tensor | None:
+        self._action_conditioned_query_bias.zero_()
+        self._action_prediction_error = 0.0
+
+        if self._action_conditioned_prediction is None:
+            return None
+
+        observed_summary = self._summarize_activity_by_minicolumn(observed_active)
+        if float(observed_summary.abs().sum().item()) <= 1e-8:
+            return None
+
+        if float(self._action_context.detach().abs().sum().item()) <= 1e-8:
+            self._action_conditioned_prediction.prime(observed_summary)
+            return None
+
+        had_previous_summary = (
+            self._action_conditioned_prediction._prev_location is not None
+        )
+        result = self._action_conditioned_prediction.step(
+            observed_summary,
+            self._action_context,
+            learn=self._mode == "train",
+        )
+        if not had_previous_summary:
+            return None
+
+        predicted_summary = torch.relu(result["predicted_location"].detach())
+        max_abs = float(predicted_summary.abs().max().item())
+        if max_abs <= 1e-8:
+            return None
+
+        normalized = predicted_summary / max_abs
+        self._action_conditioned_query_bias.copy_(
+            self._expand_minicolumn_signal(normalized)
+            * self._action_prediction_query_weight
+        )
+        self._action_prediction_error = float(result["prediction_error"])
+        return predicted_summary
+
+    def _compute_prediction_mismatch(
+        self,
+        observed_active: torch.Tensor,
+        predicted_active: torch.Tensor | None = None,
+    ) -> float:
+        prediction = predicted_active
+        if prediction is None:
+            prediction = self._predicted.abs()
+            if self._use_apical:
+                prediction = torch.maximum(
+                    prediction,
+                    self._apical_predicted.abs(),
+                )
+
+        observed = observed_active.detach().abs()
+        observed_norm = float(observed.sum().item())
+        prediction_norm = float(prediction.detach().abs().sum().item())
+        if observed_norm <= 1e-8 or prediction_norm <= 1e-8:
+            return float(self._surprise)
+
+        overlap = float((prediction.detach().abs() * observed).sum().item())
+        mismatch = 1.0 - (overlap / max(observed_norm, 1e-8))
+        return max(0.0, min(1.0, mismatch))
+
     def receive_context(self, **context_signal) -> None:
         """Receive top-down context for apical dendrites.
 
@@ -1424,25 +1809,27 @@ class CorticalColumnTorch:
         """
         active_cells = context_signal.get("active_cells")
         if active_cells is not None:
-            if isinstance(active_cells, np.ndarray):
-                ctx = torch.from_numpy(
-                    active_cells.astype(np.float32)
-                ).to(self.device)
-            elif isinstance(active_cells, torch.Tensor):
-                ctx = active_cells.to(self.device).float()
+            ctx = self._coerce_activity_signal(active_cells)
+            if ctx is not None:
+                self._context = ctx
+
+        if "hopfield_query_bias" in context_signal:
+            hopfield_query_bias = context_signal.get("hopfield_query_bias")
+            if hopfield_query_bias is None:
+                self._hopfield_query_bias.zero_()
             else:
-                return
+                bias = self._coerce_activity_signal(hopfield_query_bias)
+                if bias is not None:
+                    self._hopfield_query_bias.copy_(bias)
 
-            # Project to n_cells when sender has a different cell count.
-            if ctx.shape[0] != self.n_cells:
-                ctx = torch.nn.functional.interpolate(
-                    ctx.unsqueeze(0).unsqueeze(0),
-                    size=self.n_cells,
-                    mode="linear",
-                    align_corners=False,
-                ).squeeze()
-
-            self._context = ctx
+        if "action_context" in context_signal:
+            action_context = context_signal.get("action_context")
+            if action_context is None and self._action_context.numel() > 0:
+                self._action_context.zero_()
+            else:
+                action_vec = self._coerce_action_context(action_context)
+                if action_vec is not None:
+                    self._action_context.copy_(action_vec)
 
     def step_from_context(self) -> dict:
         """Run a reduced step using only received context (no sensor input).
@@ -1470,6 +1857,10 @@ class CorticalColumnTorch:
 
             # Save pre-settle for Hopfield storage
             pre_settle_active = self._active.clone()
+            self._last_pre_settle = pre_settle_active
+            self._prediction_mismatch = self._compute_prediction_mismatch(
+                pre_settle_active
+            )
 
             # Hopfield settling
             beta = self._beta
@@ -1481,8 +1872,9 @@ class CorticalColumnTorch:
                     x, self.n_minicolumns, self.n_cells_per_minicolumn,
                 )
 
+            query = self._compose_hopfield_query(self._active)
             settled, n_iters = self._hopfield.settle(
-                self._active, beta=beta, sparsity_fn=sparsity_fn,
+                query, beta=beta, sparsity_fn=sparsity_fn,
             )
             self._active = settled
 
@@ -1500,27 +1892,25 @@ class CorticalColumnTorch:
                 self._episodic_memory.store(
                     pre_settle_active, label=self._current_object,
                 )
+                self._activation_history.append(pre_settle_active.clone())
                 if self._current_object:
                     self._associative_memory.learn(
                         self._active, self._current_object, lr=lr,
                     )
                     self._sync_cortical_attractors()
-                else:
-                    # Auto-label for parent
-                    self._auto_label_patterns.append(
-                        self._active.detach().cpu()
-                    )
-                    if len(self._auto_label_patterns) >= 5:
-                        label = self._associative_memory.auto_label(
-                            self._auto_label_patterns
+                elif not self._defer_context_auto_label:
+                    if len(self._activation_history) >= 5:
+                        self._current_object = self._associative_memory.auto_label(
+                            self._activation_history
                         )
-                        self._current_object = label
                         self._associative_memory.learn(
-                            self._active, label, lr=lr,
+                            self._active, self._current_object, lr=lr,
                         )
                         self._sync_cortical_attractors()
 
             elif self._mode == "eval":
+                if self._defer_context_auto_label and pre_settle_active.abs().sum() > 0:
+                    self._activation_history.append(pre_settle_active.clone())
                 scores = self._associative_memory.recall(self._active)
                 for name, score in scores.items():
                     self._evidence[name] = (
@@ -1551,23 +1941,115 @@ class CorticalColumnTorch:
     def surprise(self) -> float:
         return self._surprise
 
+    @property
+    def prediction_mismatch(self) -> float:
+        return self._prediction_mismatch
+
+    @property
+    def action_prediction_error(self) -> float:
+        return self._action_prediction_error
+
+    @property
+    def action_conditioned_query_bias(self) -> torch.Tensor:
+        return self._action_conditioned_query_bias
+
     def get_current_mlh(self) -> dict:
         """Return most likely hypothesis."""
         return self._get_mlh()
 
-    def get_all_known_object_ids(self) -> list[str]:
+    def _get_known_object_ids(self) -> list[str]:
+        known: list[str] = []
         if self._use_lfm and self._lfm is not None:
-            return self._lfm.known_objects
-        return self._associative_memory.known_objects
+            known.extend(list(self._lfm.known_objects))
+
+        associative_known = list(self._associative_memory.known_objects)
+        if not known:
+            return associative_known
+
+        for object_id in associative_known:
+            if object_id not in known:
+                known.append(object_id)
+        return known
+
+    def get_all_known_object_ids(self) -> list[str]:
+        return self._get_known_object_ids()
+
+    def _get_deferred_episode_scores(self) -> dict[str, float]:
+        if self._mode != "eval":
+            return {}
+
+        if not (self._defer_sensor_auto_label or self._defer_context_auto_label):
+            return {}
+
+        episode_patterns = [
+            pattern.to(self.device)
+            for pattern in self._activation_history
+            if pattern.abs().sum() > 0
+        ]
+        if len(episode_patterns) < 5:
+            return {}
+
+        episode_prototype = torch.stack(episode_patterns).mean(dim=0)
+        return self._associative_memory.recall(episode_prototype)
+
+    @staticmethod
+    def _normalize_score_map(scores: dict[str, float]) -> dict[str, float]:
+        normalized = {
+            str(object_id): max(float(score), 0.0)
+            for object_id, score in scores.items()
+        }
+        if not normalized:
+            return {}
+
+        total = sum(normalized.values())
+        if total <= 1e-12:
+            uniform = 1.0 / len(normalized)
+            return {object_id: uniform for object_id in normalized}
+
+        return {
+            object_id: score / total
+            for object_id, score in normalized.items()
+        }
+
+    @classmethod
+    def _score_separation_margin(cls, scores: dict[str, float]) -> float:
+        normalized = cls._normalize_score_map(scores)
+        if not normalized:
+            return float("-inf")
+
+        ranked = sorted(normalized.values(), reverse=True)
+        if len(ranked) == 1:
+            return 1.0
+
+        return float(ranked[0] - ranked[1])
 
     def _get_mlh(self) -> dict:
-        if not self._evidence:
+        deferred_scores = self._get_deferred_episode_scores()
+        evidence_scores = dict(self._evidence)
+
+        if deferred_scores and evidence_scores:
+            # Prefer the source with the clearer normalized winner instead of
+            # always letting the episode prototype override accumulated evidence.
+            if (
+                self._score_separation_margin(deferred_scores)
+                > self._score_separation_margin(evidence_scores)
+            ):
+                active_scores = deferred_scores
+            else:
+                active_scores = evidence_scores
+        elif deferred_scores:
+            active_scores = deferred_scores
+        else:
+            active_scores = evidence_scores
+
+        if not active_scores:
             return {
                 "graph_id": None,
                 "evidence": 0.0,
                 "active_cells_sdr": set(),
             }
-        best = max(self._evidence.items(), key=lambda x: x[1])
+
+        best = max(active_scores.items(), key=lambda x: x[1])
         return {
             "graph_id": best[0],
             "evidence": best[1],

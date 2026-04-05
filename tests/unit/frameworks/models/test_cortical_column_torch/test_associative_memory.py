@@ -177,6 +177,25 @@ class TestHopfieldAssociativeMemory(unittest.TestCase):
             "Different objects should produce different auto-labels",
         )
 
+    def test_auto_label_same_support_different_strength_profiles_differ(self):
+        """Episodes with the same support but different strong subsets should differ."""
+        mem = HopfieldAssociativeMemory(n_cells=256)
+
+        p1 = torch.zeros(256)
+        p2 = torch.zeros(256)
+        p1[:16] = torch.linspace(1.0, 0.55, steps=16)
+        p2[:16] = torch.linspace(0.55, 1.0, steps=16)
+
+        silent_prefix = [torch.zeros(256) for _ in range(6)]
+        h1 = silent_prefix + [p1.clone() for _ in range(5)]
+        h2 = silent_prefix + [p2.clone() for _ in range(5)]
+
+        self.assertNotEqual(
+            mem.auto_label(h1),
+            mem.auto_label(h2),
+            "Different strength profiles should not collapse to one auto-label",
+        )
+
     def test_state_dict_roundtrip(self):
         mem = HopfieldAssociativeMemory(n_cells=32)
         mem.learn(torch.randn(32), "test_obj")

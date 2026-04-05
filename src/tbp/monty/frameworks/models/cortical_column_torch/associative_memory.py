@@ -162,33 +162,56 @@ class HopfieldAssociativeMemory:
     def auto_label(self, activation_history: list[torch.Tensor]) -> str:
         """Generate a stable label from activation history.
 
-        Uses a structural fingerprint: binarize the prototype (mean of
-        activations) at half the maximum value, then hash the active
-        indices. This is robust because:
-        - Averaging smooths noise across observations
-        - Threshold at max/2 exploits the gap between truly active
-          cells (~1.0) and noise (~0), making it invariant to small
-          perturbations
-        - Sorted indices produce a canonical representation
+        Uses a structural fingerprint built from the mean episode prototype.
+        The fingerprint keeps the broad active support stable while also
+        preserving a small amount of relative-strength structure so two
+        episodes do not collapse simply because they activate the same cells
+        at different strengths.
         """
-        # Compute prototype from all available patterns
-        stacked = torch.stack([p.float() for p in activation_history])
+        # Ignore silent frames when possible so deferred labels reflect the
+        # informative portion of the episode rather than long identical prefixes.
+        usable_patterns = [
+            p.float() for p in activation_history if float(p.abs().sum().item()) > 1e-8
+        ]
+        if not usable_patterns:
+            usable_patterns = [p.float() for p in activation_history]
+
+        # Compute prototype from the usable episode history.
+        stacked = torch.stack(usable_patterns)
         prototype = stacked.mean(dim=0).abs()
 
-        # Threshold at half the peak — exploits the large gap between
-        # active cells and background noise in sparse activations
         peak = prototype.max()
         if peak < 1e-8:
             # Degenerate case: hash raw bytes
             h = hashlib.sha256(prototype.cpu().numpy().tobytes())
             return f"auto_{h.hexdigest()[:12]}"
 
-        threshold = peak * 0.5
-        active_indices = torch.nonzero(prototype > threshold, as_tuple=True)[0]
+        normalized = prototype / peak
 
-        # Hash the sorted active indices
         h = hashlib.sha256()
-        h.update(active_indices.cpu().numpy().tobytes())
+        active_support = None
+        for threshold in (0.5, 0.75, 0.9):
+            active_indices = torch.nonzero(
+                normalized > threshold,
+                as_tuple=True,
+            )[0]
+            if threshold == 0.5:
+                active_support = active_indices
+            h.update(f"thr={threshold:.2f}".encode("ascii"))
+            h.update(active_indices.cpu().numpy().tobytes())
+
+        if active_support is not None and active_support.numel() > 0:
+            # Preserve coarse relative-strength structure on the active support so
+            # episodes with the same support but different dominant subsets do not
+            # collapse to the same label.
+            support_values = normalized[active_support]
+            quantized_values = torch.clamp(
+                torch.round(support_values * 3.0),
+                0,
+                3,
+            ).to(torch.uint8)
+            h.update(b"vals=")
+            h.update(quantized_values.cpu().numpy().tobytes())
         return f"auto_{h.hexdigest()[:12]}"
 
     def _make_label(self, name: str) -> torch.Tensor:

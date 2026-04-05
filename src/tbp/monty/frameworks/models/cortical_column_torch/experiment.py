@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import quaternion
+import torch
 
 from tbp.monty.context import RuntimeContext
 from tbp.monty.frameworks.actions.action_samplers import ConstantSampler
@@ -44,6 +45,7 @@ from tbp.monty.frameworks.actions.actions import (
     LookDown,
     LookUp,
     MoveForward,
+    MoveTangentially,
     TurnLeft,
     TurnRight,
 )
@@ -72,6 +74,50 @@ from tbp.monty.simulators.panda3d.simulator import Panda3DSimulator
 from tbp.monty.simulators.panda3d.transforms import Panda3DDepthNormalize
 
 logger = logging.getLogger(__name__)
+
+
+class AxisAwareConstantSampler(ConstantSampler):
+    """Constant sampler with explicit reverse and tangential axis moves."""
+
+    def __init__(
+        self,
+        *args,
+        allow_backward_actions=False,
+        tangential_directions=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._allow_backward_actions = bool(allow_backward_actions)
+        self._tangential_directions = [
+            tuple(float(value) for value in direction)
+            for direction in (
+                tangential_directions
+                or [
+                    (-1.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                    (0.0, 0.0, -1.0),
+                ]
+            )
+        ]
+
+    def sample_move_forward(self, agent_id, rng):
+        distance = float(self.translation_distance)
+        if self._allow_backward_actions and float(rng.rand()) < 0.5:
+            distance = -distance
+        return MoveForward(agent_id=agent_id, distance=distance)
+
+    def sample_move_tangentially(self, agent_id, rng):
+        direction = self.direction
+        if self._tangential_directions:
+            direction = self._tangential_directions[
+                int(rng.randint(len(self._tangential_directions)))
+            ]
+        return MoveTangentially(
+            agent_id=agent_id,
+            distance=float(self.translation_distance),
+            direction=direction,
+        )
 
 
 class Panda3DTorchExperiment:
@@ -113,6 +159,8 @@ class Panda3DTorchExperiment:
 
     CAMERA_SM_ID = "patch_0"
     CHANGE_SM_ID = "change_detector"
+    _ACTOR_SYNC_RENDER_PASSES = 3
+    _EPISODE_SENSOR_WARMUP_STEPS = 1
 
     def __init__(
         self,
@@ -126,14 +174,32 @@ class Panda3DTorchExperiment:
         object_position=(0.0, 0.0, 0.0),
         object_scale=(1.0, 1.0, 1.0),
         column_kwargs=None,
+        morphology_column_kwargs=None,
+        behavior_column_kwargs=None,
         parent_column_kwargs=None,
         camera_features=None,
         flow_threshold=0.005,
         asset_search_paths=None,
         rotation_degrees=5.0,
         translation_distance=0.004,
+        motor_actions=None,
+        allow_backward_actions=False,
+        tangential_directions=None,
         hopfield_voting=False,
         hopfield_surprise_threshold=0.3,
+        conditional_voting=False,
+        vote_confident_threshold=2,
+        predictive_voting=False,
+        temporal_confusion_threshold=0.5,
+        vote_after_steps=2,
+        vote_cooldown_steps=0,
+        goal_state_driven_actions=False,
+        authoritative_goal_sender_ids=None,
+        allow_action_sampler_fallback=False,
+        lm_kwargs=None,
+        morphology_lm_kwargs=None,
+        behavior_lm_kwargs=None,
+        parent_lm_kwargs=None,
     ):
         self._model_path = Path(model_path)
         self._hierarchical = hierarchical
@@ -145,7 +211,10 @@ class Panda3DTorchExperiment:
         self._object_position = object_position
         self._object_scale = object_scale
         self._column_kwargs = column_kwargs or {}
+        self._morphology_column_kwargs = morphology_column_kwargs or {}
+        self._behavior_column_kwargs = behavior_column_kwargs or {}
         self._parent_column_kwargs = parent_column_kwargs or {}
+        self._seed = int(self._column_kwargs.get("seed", 42))
         self._camera_features = camera_features or [
             "pose_vectors", "on_object", "hsv",
         ]
@@ -153,8 +222,29 @@ class Panda3DTorchExperiment:
         self._asset_search_paths = asset_search_paths or []
         self._rotation_degrees = rotation_degrees
         self._translation_distance = translation_distance
+        self._motor_actions = list(
+            motor_actions
+            or [MoveForward, TurnLeft, TurnRight, LookUp, LookDown]
+        )
+        self._allow_backward_actions = bool(allow_backward_actions)
+        self._tangential_directions = list(tangential_directions or [])
         self._hopfield_voting = hopfield_voting
         self._hopfield_surprise_threshold = hopfield_surprise_threshold
+        self._conditional_voting = conditional_voting
+        self._vote_confident_threshold = int(vote_confident_threshold)
+        self._predictive_voting = predictive_voting
+        self._temporal_confusion_threshold = temporal_confusion_threshold
+        self._vote_after_steps = vote_after_steps
+        self._vote_cooldown_steps = int(vote_cooldown_steps)
+        self._goal_state_driven_actions = bool(goal_state_driven_actions)
+        self._authoritative_goal_sender_ids = list(
+            authoritative_goal_sender_ids or []
+        )
+        self._allow_action_sampler_fallback = allow_action_sampler_fallback
+        self._lm_kwargs = lm_kwargs or {}
+        self._morphology_lm_kwargs = morphology_lm_kwargs or {}
+        self._behavior_lm_kwargs = behavior_lm_kwargs or {}
+        self._parent_lm_kwargs = parent_lm_kwargs or {}
 
         self._agent_id = AgentID("agent_id_0")
         self._panda3d_sensor_id = SensorID("sensor_0")
@@ -165,6 +255,39 @@ class Panda3DTorchExperiment:
         self._depth_transform = None
         self._d3d_transform = None
         self._monty = None
+
+    def _sync_render(self, passes=None):
+        if self._sim is None:
+            return
+
+        render_passes = int(
+            self._ACTOR_SYNC_RENDER_PASSES if passes is None else passes
+        )
+        for _ in range(max(1, render_passes)):
+            self._sim._render()
+
+    def _warmup_episode_observation(self, anim_name=None, frame=None, steps=None):
+        if self._sim is None:
+            return
+
+        warmup_steps = int(
+            self._EPISODE_SENSOR_WARMUP_STEPS if steps is None else steps
+        )
+        if warmup_steps <= 0:
+            return
+
+        warmup_frame = 0 if frame is None else int(frame)
+        # Fresh Panda3D offscreen buffers can be one observation behind the
+        # newly positioned camera on a cold start. Discard a small number of
+        # no-op reads before the first LM step so training/eval begins from a
+        # settled sensor frame.
+        for idx in range(warmup_steps):
+            self._step_environment(
+                [],
+                frame=warmup_frame,
+                anim_name=anim_name,
+                step=-(idx + 1),
+            )
 
     # ======================== Setup ========================
 
@@ -195,6 +318,11 @@ class Panda3DTorchExperiment:
         )
         self._obj_id = info.object_id
         self._anim_obj = self._sim.get_animated_object(self._obj_id)
+        # Newly swapped animated Actors can report stale transforms until the
+        # scene graph has been advanced at least once. Give Panda3D a few sync
+        # render passes here so subsequent animation inspection and the first
+        # episode start from a settled pose state.
+        self._sync_render()
 
         self._depth_transform = Panda3DDepthNormalize(
             agent_id=self._agent_id,
@@ -235,13 +363,14 @@ class Panda3DTorchExperiment:
             n_cells_per_minicolumn=8,
             sparsity=0.03,
             use_apical=False,
-            seed=42,
+            seed=self._seed,
         )
         col_kw.update(self._column_kwargs)
 
         lm = CorticalColumnTorchLM(
             column_kwargs=col_kw,
             learning_module_id="lm_0",
+            **self._lm_kwargs,
         )
 
         motor_system = self._build_motor_system()
@@ -258,8 +387,15 @@ class Panda3DTorchExperiment:
             min_train_steps=9999,
             num_exploratory_steps=9999,
             max_total_steps=99999,
+            conditional_voting=self._conditional_voting,
+            vote_confident_threshold=self._vote_confident_threshold,
             hopfield_voting=self._hopfield_voting,
             hopfield_surprise_threshold=self._hopfield_surprise_threshold,
+            predictive_voting=self._predictive_voting,
+            temporal_confusion_threshold=self._temporal_confusion_threshold,
+            vote_after_steps=self._vote_after_steps,
+            vote_cooldown_steps=self._vote_cooldown_steps,
+            authoritative_goal_sender_ids=self._authoritative_goal_sender_ids,
         )
 
     def _setup_hierarchical(self):
@@ -278,17 +414,25 @@ class Panda3DTorchExperiment:
             n_cells_per_minicolumn=8,
             sparsity=0.03,
             use_apical=True,
-            seed=42,
+            seed=self._seed,
         )
         child_kw.update(self._column_kwargs)
+        behavior_seed = int(child_kw.get("seed", self._seed)) + 1
+        morphology_child_kw = dict(child_kw)
+        morphology_child_kw.update(self._morphology_column_kwargs)
+        behavior_child_kw = dict(child_kw)
+        behavior_child_kw.update(self._behavior_column_kwargs)
+        behavior_child_kw.setdefault("seed", behavior_seed)
 
         lm_morph = CorticalColumnTorchLM(
-            column_kwargs=child_kw,
+            column_kwargs=morphology_child_kw,
             learning_module_id="lm_morphology",
+            **self._morphology_lm_kwargs,
         )
         lm_behav = CorticalColumnTorchLM(
-            column_kwargs={**child_kw, "seed": 43},
+            column_kwargs=behavior_child_kw,
             learning_module_id="lm_behavior",
+            **self._behavior_lm_kwargs,
         )
 
         parent_kw = dict(
@@ -296,13 +440,22 @@ class Panda3DTorchExperiment:
             n_cells_per_minicolumn=8,
             sparsity=0.03,
             use_apical=True,
-            seed=44,
+            defer_context_auto_label=True,
+            seed=behavior_seed + 1,
         )
         parent_kw.update(self._parent_column_kwargs)
+
+        parent_lm_kwargs = dict(
+            expected_context_sender_ids=["lm_morphology", "lm_behavior"],
+            context_identity_weight=0.35,
+            use_child_graph_context_labels=True,
+        )
+        parent_lm_kwargs.update(self._parent_lm_kwargs)
 
         lm_parent = CorticalColumnTorchLM(
             column_kwargs=parent_kw,
             learning_module_id="lm_parent",
+            **parent_lm_kwargs,
         )
 
         motor_system = self._build_motor_system()
@@ -329,22 +482,439 @@ class Panda3DTorchExperiment:
             min_train_steps=9999,
             num_exploratory_steps=9999,
             max_total_steps=99999,
+            conditional_voting=self._conditional_voting,
+            vote_confident_threshold=self._vote_confident_threshold,
             hopfield_voting=self._hopfield_voting,
             hopfield_surprise_threshold=self._hopfield_surprise_threshold,
+            predictive_voting=self._predictive_voting,
+            temporal_confusion_threshold=self._temporal_confusion_threshold,
+            vote_after_steps=self._vote_after_steps,
+            vote_cooldown_steps=self._vote_cooldown_steps,
+            authoritative_goal_sender_ids=self._authoritative_goal_sender_ids,
         )
 
     def _build_motor_system(self):
-        action_sampler = ConstantSampler(
-            actions=[MoveForward, TurnLeft, TurnRight, LookUp, LookDown],
+        action_sampler = AxisAwareConstantSampler(
+            actions=self._motor_actions,
             rotation_degrees=self._rotation_degrees,
             translation_distance=self._translation_distance,
+            allow_backward_actions=self._allow_backward_actions,
+            tangential_directions=self._tangential_directions,
         )
         motor_policy = InformedPolicy(
             action_sampler=action_sampler,
             agent_id=self._agent_id,
-            use_goal_state_driven_actions=False,
+            use_goal_state_driven_actions=self._goal_state_driven_actions,
+            view_finder_id="view_finder",
         )
         return MotorSystem(policy=motor_policy)
+
+    def _resolve_frame_schedule(self, anim_name=None, n_steps=None, frame_schedule=None):
+        animated = anim_name is not None
+        n_frames = self._anim_obj.get_num_frames(anim_name) if animated else 1
+
+        if frame_schedule is not None:
+            frames = [int(frame) % max(n_frames, 1) for frame in frame_schedule]
+        elif animated:
+            total_steps = n_steps or n_frames
+            frames = [step % n_frames for step in range(total_steps)]
+        else:
+            total_steps = n_steps or 30
+            frames = [0 for _ in range(total_steps)]
+
+        return frames, n_frames
+
+    def _apply_stepwise_targets(
+        self,
+        object_name,
+        step,
+        frame,
+        total_steps,
+        n_frames,
+        state_provider=None,
+    ):
+        state_targets = {}
+
+        for lm in self._monty.learning_modules:
+            lm.stepwise_target_object = object_name
+            lm.stepwise_target_state = None
+
+        if state_provider is None:
+            return state_targets
+
+        state_targets = state_provider(
+            step=step,
+            frame=frame,
+            total_steps=total_steps,
+            n_frames=n_frames,
+            object_name=object_name,
+            experiment=self,
+        )
+        if state_targets is None:
+            return {}
+        if not isinstance(state_targets, dict):
+            raise TypeError("state_provider must return a dict or None")
+
+        for lm in self._monty.learning_modules:
+            if lm.learning_module_id in state_targets:
+                lm.stepwise_target_state = state_targets[lm.learning_module_id]
+
+        return dict(state_targets)
+
+    @staticmethod
+    def _encode_action_context(actions):
+        context = np.zeros(8, dtype=np.float32)
+        if not actions:
+            return context
+
+        for action in actions:
+            name = str(getattr(action, "name", "")).lower()
+            rotation = float(getattr(action, "rotation_degrees", 0.0))
+            distance = float(getattr(action, "distance", 0.0))
+            context[5] += 1.0
+
+            if name == "move_forward":
+                context[0] += distance
+                context[6] += 1.0
+                continue
+
+            if name == "turn_left":
+                context[1] -= rotation
+                context[7] += 1.0
+                continue
+
+            if name == "turn_right":
+                context[1] += rotation
+                context[7] += 1.0
+                continue
+
+            if name == "look_up":
+                context[2] += rotation
+                context[7] += 1.0
+                continue
+
+            if name == "look_down":
+                context[2] -= rotation
+                context[7] += 1.0
+                continue
+
+            if name == "move_tangentially":
+                direction = np.asarray(
+                    getattr(action, "direction", (0.0, 0.0, 0.0)),
+                    dtype=np.float32,
+                ).reshape(-1)
+                if direction.size > 0:
+                    context[3] += distance * float(direction[0])
+                if direction.size > 1:
+                    context[0] += distance * float(direction[1])
+                if direction.size > 2:
+                    context[4] += distance * float(direction[2])
+                context[6] += 1.0
+                continue
+
+            if name == "orient_horizontal":
+                context[1] += rotation
+                context[3] += float(getattr(action, "left_distance", 0.0))
+                context[0] += float(getattr(action, "forward_distance", 0.0))
+                context[6] += 1.0
+                context[7] += 1.0
+                continue
+
+            if name == "orient_vertical":
+                context[2] -= rotation
+                context[4] -= float(getattr(action, "down_distance", 0.0))
+                context[0] += float(getattr(action, "forward_distance", 0.0))
+                context[6] += 1.0
+                context[7] += 1.0
+                continue
+
+            if name in {"set_agent_pitch", "set_sensor_pitch"}:
+                context[2] += rotation
+                context[7] += 1.0
+                continue
+
+            if name == "set_yaw":
+                context[1] += rotation
+                context[7] += 1.0
+
+        return context
+
+    @staticmethod
+    def _simplify_temporal_context(context):
+        if not context:
+            return None
+
+        keep = [
+            "current_label",
+            "predicted_label",
+            "current_dwell",
+            "event_detected",
+            "step_count",
+            "mean_surprise",
+            "known_states",
+            "match_score",
+            "trace_norm",
+            "boundary_pressure",
+            "trace_discontinuity",
+            "trace_scales",
+        ]
+        simplified = {}
+        for key in keep:
+            if key not in context:
+                continue
+            value = context[key]
+            if isinstance(value, np.generic):
+                value = value.item()
+            simplified[key] = value
+
+        return simplified or None
+
+    @staticmethod
+    def _copy_context_signal(context_signal):
+        if not context_signal:
+            return None
+
+        simplified = {
+            "sender_id": context_signal.get("sender_id"),
+            "graph_id": context_signal.get("graph_id"),
+            "confidence": float(context_signal.get("confidence", 0.0)),
+            "sender_step_count": int(context_signal.get("sender_step_count", 0)),
+        }
+
+        active_cells = context_signal.get("active_cells")
+        if isinstance(active_cells, np.ndarray):
+            simplified["active_cells"] = active_cells.astype(np.float32).copy()
+        elif isinstance(active_cells, torch.Tensor):
+            simplified["active_cells"] = (
+                active_cells.detach().cpu().float().numpy().copy()
+            )
+        else:
+            simplified["active_cells"] = None
+
+        return simplified
+
+    def _collect_step_trace(
+        self,
+        step,
+        frame,
+        state_targets=None,
+        collect_context_signals=False,
+    ):
+        trace = {
+            "step": int(step),
+            "frame": int(frame),
+            "state_targets": dict(state_targets or {}),
+            "learning_modules": {},
+        }
+
+        for lm in self._monty.learning_modules:
+            lm_trace = {}
+            if hasattr(lm, "get_current_mlh"):
+                mlh = lm.get_current_mlh()
+                lm_trace["graph_id"] = mlh.get("graph_id")
+                lm_trace["evidence"] = float(mlh.get("evidence", 0.0))
+            if hasattr(lm, "get_temporal_prediction_status"):
+                lm_trace["temporal_status"] = lm.get_temporal_prediction_status()
+            if hasattr(lm, "get_temporal_surprise"):
+                lm_trace["temporal_surprise"] = float(lm.get_temporal_surprise())
+            if hasattr(lm, "get_temporal_context"):
+                context = self._simplify_temporal_context(lm.get_temporal_context())
+                if context is not None:
+                    lm_trace["temporal_context"] = context
+            if hasattr(lm, "get_evidence_debug"):
+                evidence_debug = lm.get_evidence_debug()
+                if evidence_debug is not None:
+                    lm_trace["evidence_debug"] = evidence_debug
+            if collect_context_signals and hasattr(lm, "get_context_signal"):
+                context_signal = self._copy_context_signal(lm.get_context_signal())
+                if context_signal is not None:
+                    lm_trace["context_signal"] = context_signal
+
+            trace["learning_modules"][lm.learning_module_id] = lm_trace
+
+        return trace
+
+    def _sample_fallback_actions(self, ctx):
+        if self._monty is None:
+            return []
+
+        policy = self._monty.motor_system._policy
+        action_sampler = getattr(policy, "action_sampler", None)
+        agent_id = getattr(policy, "agent_id", self._agent_id)
+        if action_sampler is None or not hasattr(action_sampler, "sample"):
+            return []
+
+        action = action_sampler.sample(agent_id, ctx.rng)
+        if action is None:
+            return []
+
+        if hasattr(policy, "fixme_undo_last_action"):
+            try:
+                policy._undo_action = policy.fixme_undo_last_action(action)
+            except AttributeError:
+                pass
+
+        return [action]
+
+    def run_episode(
+        self,
+        mode,
+        object_name=None,
+        anim_name=None,
+        n_steps=None,
+        frame_schedule=None,
+        state_provider=None,
+        collect_trace=False,
+        collect_context_signals=False,
+        collect_action_history=False,
+        forced_action_sequences=None,
+        action_context_mode="executed",
+    ):
+        """Run a real animated-mesh episode with optional per-step targets."""
+        if self._sim is None:
+            self._setup()
+
+        if action_context_mode not in {"executed", "none"}:
+            raise ValueError(
+                "action_context_mode must be 'executed' or 'none'"
+            )
+
+        frames, n_frames = self._resolve_frame_schedule(
+            anim_name=anim_name,
+            n_steps=n_steps,
+            frame_schedule=frame_schedule,
+        )
+        total_steps = len(frames)
+        if (
+            forced_action_sequences is not None
+            and len(forced_action_sequences) != total_steps
+        ):
+            raise ValueError(
+                "forced_action_sequences must match the episode length"
+            )
+
+        ctx = RuntimeContext(rng=np.random.RandomState(self._seed))
+        target_name = object_name
+        if mode is ExperimentMode.EVAL and target_name is None:
+            target_name = "placeholder"
+        target = {"object": target_name, "quat_rotation": [1, 0, 0, 0]}
+
+        self._monty.set_experiment_mode(mode)
+        self._monty.pre_episode(primary_target=target)
+
+        if mode is ExperimentMode.TRAIN:
+            self._monty.switch_to_exploratory_step()
+            for sm in self._monty.sensor_modules:
+                sm.is_exploring = True
+
+        initial_frame = frames[0] if anim_name is not None and frames else None
+        self._position_camera_initial(anim_name=anim_name, frame=initial_frame)
+        self._warmup_episode_observation(
+            anim_name=anim_name,
+            frame=initial_frame,
+        )
+
+        pending_actions = []
+        trace = []
+        action_history = []
+        action_context_history = []
+        for step, frame in enumerate(frames):
+            state_targets = self._apply_stepwise_targets(
+                object_name=object_name,
+                step=step,
+                frame=frame,
+                total_steps=total_steps,
+                n_frames=n_frames,
+                state_provider=state_provider,
+            )
+
+            if forced_action_sequences is None:
+                actions_to_apply = pending_actions
+            else:
+                actions_to_apply = list(forced_action_sequences[step])
+
+            obs = self._step_environment(
+                actions_to_apply,
+                frame=frame,
+                anim_name=anim_name,
+                step=step,
+            )
+            if action_context_mode == "none":
+                action_context = np.zeros(8, dtype=np.float32)
+            else:
+                action_context = self._encode_action_context(actions_to_apply)
+            for lm in self._monty.learning_modules:
+                if hasattr(lm, "set_action_context"):
+                    lm.set_action_context(action_context)
+            generated_actions = self._monty.step(ctx, obs)
+            if (
+                not generated_actions
+                and self._allow_action_sampler_fallback
+            ):
+                generated_actions = self._sample_fallback_actions(ctx)
+            pending_actions = generated_actions
+
+            if collect_action_history:
+                action_history.append(list(actions_to_apply))
+                action_context_history.append(action_context.copy())
+
+            if object_name is not None:
+                for lm in self._monty.learning_modules:
+                    lm.stepwise_target_object = object_name
+
+            if collect_trace:
+                trace.append(
+                    self._collect_step_trace(
+                        step=step,
+                        frame=frame,
+                        state_targets=state_targets,
+                        collect_context_signals=collect_context_signals,
+                    )
+                )
+
+        result = {"total_steps": total_steps}
+
+        if mode is ExperimentMode.TRAIN:
+            for lm in self._monty.learning_modules:
+                lm.detected_object = object_name
+                lm.detected_rotation_r = None
+                if lm.buffer.get_num_observations_on_object() > 0:
+                    lm.buffer.stats["detected_location_rel_body"] = (
+                        lm.buffer.get_current_location(input_channel="first")
+                    )
+                else:
+                    lm.buffer.stats["detected_location_rel_body"] = np.zeros(3)
+
+        self._monty.post_episode()
+
+        if mode is ExperimentMode.TRAIN:
+            for lm in self._monty.learning_modules:
+                result[lm.learning_module_id] = {
+                    "known_objects": lm.get_all_known_object_ids(),
+                }
+        else:
+            for lm in self._monty.learning_modules:
+                if hasattr(lm, "get_current_mlh"):
+                    result[lm.learning_module_id] = dict(lm.get_current_mlh())
+
+            primary_lm = self._monty.learning_modules[0]
+            result["graph_id"] = primary_lm.get_current_mlh().get("graph_id")
+            result["evidence"] = {
+                lm.learning_module_id: dict(lm.evidence)
+                for lm in self._monty.learning_modules
+            }
+
+        if collect_trace:
+            result["trace"] = trace
+            if collect_context_signals:
+                result["trace_contains_context_signals"] = True
+        if collect_action_history:
+            result["action_history"] = action_history
+            result["action_context_history"] = action_context_history
+            result["action_context_mode"] = action_context_mode
+            result["forced_action_replay"] = forced_action_sequences is not None
+
+        return result
 
     # ======================== Public API ========================
 
@@ -353,61 +923,13 @@ class Panda3DTorchExperiment:
 
         Returns dict with training results per LM.
         """
-        if self._sim is None:
-            self._setup()
-
-        animated = anim_name is not None
-        if animated:
-            n_frames = self._anim_obj.get_num_frames(anim_name)
-            total_steps = n_steps or n_frames
-        else:
-            total_steps = n_steps or 30
-
-        ctx = RuntimeContext(rng=np.random.RandomState(42))
-        target = {"object": object_name, "quat_rotation": [1, 0, 0, 0]}
-
-        self._monty.set_experiment_mode(ExperimentMode.TRAIN)
-        self._monty.pre_episode(primary_target=target)
-
-        for lm in self._monty.learning_modules:
-            lm.stepwise_target_object = object_name
-
-        self._monty.switch_to_exploratory_step()
-        for sm in self._monty.sensor_modules:
-            sm.is_exploring = True
-
-        self._position_camera_initial(
-            anim_name=anim_name, frame=0 if animated else None,
+        result = self.run_episode(
+            mode=ExperimentMode.TRAIN,
+            object_name=object_name,
+            anim_name=anim_name,
+            n_steps=n_steps,
         )
-
-        actions = []
-        for step in range(total_steps):
-            frame = step % n_frames if animated else 0
-            obs = self._step_environment(
-                actions, frame=frame, anim_name=anim_name,
-            )
-            actions = self._monty.step(ctx, obs)
-
-            for lm in self._monty.learning_modules:
-                lm.stepwise_target_object = object_name
-
-        for lm in self._monty.learning_modules:
-            lm.detected_object = object_name
-            lm.detected_rotation_r = None
-            if lm.buffer.get_num_observations_on_object() > 0:
-                lm.buffer.stats["detected_location_rel_body"] = (
-                    lm.buffer.get_current_location(input_channel="first")
-                )
-            else:
-                lm.buffer.stats["detected_location_rel_body"] = np.zeros(3)
-
-        self._monty.post_episode()
-
-        result = {"total_steps": total_steps}
-        for lm in self._monty.learning_modules:
-            result[lm.learning_module_id] = {
-                "known_objects": lm.get_all_known_object_ids(),
-            }
+        total_steps = result["total_steps"]
         logger.info("Trained '%s' in %d steps: %s", object_name, total_steps, result)
         return result
 
@@ -416,58 +938,35 @@ class Panda3DTorchExperiment:
 
         Returns dict with per-LM MLH and evidence.
         """
-        if self._sim is None:
-            self._setup()
-
-        animated = anim_name is not None
-        if animated:
-            n_frames = self._anim_obj.get_num_frames(anim_name)
-            total_steps = n_steps or n_frames
-        else:
-            total_steps = n_steps or 30
-
-        ctx = RuntimeContext(rng=np.random.RandomState(42))
-        target = {"object": "placeholder", "quat_rotation": [1, 0, 0, 0]}
-
-        self._monty.set_experiment_mode(ExperimentMode.EVAL)
-        self._monty.pre_episode(primary_target=target)
-
-        self._position_camera_initial(
-            anim_name=anim_name, frame=0 if animated else None,
+        result = self.run_episode(
+            mode=ExperimentMode.EVAL,
+            anim_name=anim_name,
+            n_steps=n_steps,
         )
-
-        actions = []
-        for step in range(total_steps):
-            frame = step % n_frames if animated else 0
-            obs = self._step_environment(
-                actions, frame=frame, anim_name=anim_name,
-            )
-            actions = self._monty.step(ctx, obs)
-
-        result = {}
-        for lm in self._monty.learning_modules:
-            if hasattr(lm, "get_current_mlh"):
-                mlh = dict(lm.get_current_mlh())
-                result[lm.learning_module_id] = mlh
-
-        primary_lm = self._monty.learning_modules[0]
-        result["graph_id"] = primary_lm.get_current_mlh().get("graph_id")
-        result["evidence"] = {
-            lm.learning_module_id: dict(lm.evidence)
-            for lm in self._monty.learning_modules
-        }
 
         logger.info("Evaluate result: %s", result.get("graph_id"))
         return result
 
-    def swap_model(self, model_path, object_scale=None):
-        """Replace the 3D model without rebuilding Monty."""
+    def swap_model(self, model_path, object_scale=None, initial_distance=None):
+        """Replace the 3D model without rebuilding Monty.
+
+        Parameters
+        ----------
+        model_path : str or Path
+            Path to the new glTF/GLB model.
+        object_scale : tuple or None
+            Optional new object scale.
+        initial_distance : float or None
+            Optional new camera distance to use for subsequent episodes.
+        """
         if self._sim is None:
             self._setup()
 
         self._model_path = Path(model_path)
         if object_scale is not None:
             self._object_scale = object_scale
+        if initial_distance is not None:
+            self._initial_distance = float(initial_distance)
 
         self._sim.remove_all_objects()
         info = self._sim.add_object(
@@ -478,6 +977,7 @@ class Panda3DTorchExperiment:
         )
         self._obj_id = info.object_id
         self._anim_obj = self._sim.get_animated_object(self._obj_id)
+        self._sync_render()
 
     @property
     def monty(self):
@@ -499,6 +999,12 @@ class Panda3DTorchExperiment:
 
         if anim_name is not None and frame is not None:
             self._anim_obj.pose(frame, anim_name)
+            # Animated Actor joint transforms are not always stable
+            # immediately after pose() on the first episode after a model
+            # swap. Force a few render/update passes before querying bounds so
+            # camera placement is based on the posed mesh, not stale or
+            # singular transforms.
+            self._sync_render()
 
         obj_np = self._sim._objects[self._obj_id]
         bounds = obj_np.getTightBounds()
@@ -553,7 +1059,7 @@ class Panda3DTorchExperiment:
             {self._agent_id: agent_state}
         )
 
-    def _step_environment(self, actions, frame, anim_name):
+    def _step_environment(self, actions, frame, anim_name, step=0):
         for action in actions:
             action.act(self._sim)
 
@@ -564,7 +1070,7 @@ class Panda3DTorchExperiment:
         self._sync_motor_state()
 
         transform_ctx = TransformContext(
-            rng=np.random.RandomState(0), state=proprio,
+            rng=np.random.RandomState(self._seed + int(step)), state=proprio,
         )
         raw_obs = self._depth_transform(raw_obs, transform_ctx)
         raw_obs = self._d3d_transform(raw_obs, transform_ctx)

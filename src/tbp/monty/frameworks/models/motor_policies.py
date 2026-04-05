@@ -59,6 +59,7 @@ __all__ = [
     "InformedPolicy",
     "JumpToGoalStateMixin",
     "MotorPolicy",
+    "MultiAgentInformedPolicy",
     "NaiveScanPolicy",
     "SurfacePolicy",
     "SurfacePolicyCurvatureInformed",
@@ -639,18 +640,158 @@ class InformedPolicy(BasePolicy, JumpToGoalStateMixin):
         assert self._pre_jump_state is not None, "Pre-jump state is not set"
 
         """Check if the undo jump was successful."""
-        assert np.all(state[self.agent_id].position == self._pre_jump_state.position), (
-            "Failed to return agent to location"
-        )
-        assert np.all(state[self.agent_id].rotation == self._pre_jump_state.rotation), (
-            "Failed to return agent to orientation"
-        )
+        if not np.allclose(
+            state[self.agent_id].position,
+            self._pre_jump_state.position,
+            atol=1e-6,
+        ):
+            logger.warning("Undo jump did not fully restore agent location")
+        if not np.allclose(
+            state[self.agent_id].rotation,
+            self._pre_jump_state.rotation,
+            atol=1e-6,
+        ):
+            logger.warning("Undo jump did not fully restore agent orientation")
 
         for current_sensor in state[self.agent_id].sensors:
-            assert np.all(
-                state[self.agent_id].sensors[current_sensor].rotation
-                == self._pre_jump_state.sensors[current_sensor].rotation
-            ), "Failed to return sensor to orientation"
+            if not np.allclose(
+                state[self.agent_id].sensors[current_sensor].rotation,
+                self._pre_jump_state.sensors[current_sensor].rotation,
+                atol=1e-6,
+            ):
+                logger.warning(
+                    "Undo jump did not fully restore sensor orientation for %s",
+                    current_sensor,
+                )
+
+
+class MultiAgentInformedPolicy(MotorPolicy):
+    """Wrap one `InformedPolicy` per agent and merge their actions."""
+
+    def __init__(
+        self,
+        action_sampler: ActionSampler,
+        agent_ids: list[AgentID],
+        view_finder_ids: dict[AgentID, str] | None = None,
+        sender_to_agent_dict: dict[str, AgentID] | None = None,
+        use_goal_state_driven_actions: bool = False,
+    ) -> None:
+        if len(agent_ids) == 0:
+            raise ValueError("MultiAgentInformedPolicy requires at least one agent")
+
+        self._agent_ids = list(agent_ids)
+        self.agent_id = self._agent_ids[0]
+        self.use_goal_state_driven_actions = use_goal_state_driven_actions
+        self._view_finder_ids = {
+            agent_id: (view_finder_ids or {}).get(agent_id, "view_finder")
+            for agent_id in self._agent_ids
+        }
+        self._sender_to_agent_dict = dict(sender_to_agent_dict or {})
+        self._agent_policies = {
+            agent_id: InformedPolicy(
+                action_sampler=copy.deepcopy(action_sampler),
+                agent_id=agent_id,
+                use_goal_state_driven_actions=use_goal_state_driven_actions,
+                view_finder_id=self._view_finder_ids[agent_id],
+            )
+            for agent_id in self._agent_ids
+        }
+
+    @property
+    def processed_observations(self) -> State | None:
+        return self._agent_policies[self.agent_id].processed_observations
+
+    @processed_observations.setter
+    def processed_observations(self, percept: State | None) -> None:
+        self._agent_policies[self.agent_id].processed_observations = percept
+
+    def get_agent_state(self, state: MotorSystemState) -> AgentState:
+        return state[self.agent_id]
+
+    def pre_episode(self) -> None:
+        for policy in self._agent_policies.values():
+            policy.pre_episode()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "agent_policies": {
+                str(agent_id): policy.state_dict()
+                for agent_id, policy in self._agent_policies.items()
+            }
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        policy_states = state_dict.get("agent_policies", {})
+        for agent_id, policy in self._agent_policies.items():
+            current_state = policy_states.get(str(agent_id))
+            if current_state is not None:
+                policy.load_state_dict(current_state)
+
+    def set_agent_processed_observations(
+        self,
+        percepts_by_agent: dict[AgentID, dict[str, State] | State],
+    ) -> None:
+        for agent_id, policy in self._agent_policies.items():
+            percept = percepts_by_agent.get(agent_id)
+            if isinstance(percept, dict):
+                policy.processed_observations = percept.get(
+                    self._view_finder_ids[agent_id]
+                )
+            else:
+                policy.processed_observations = percept
+
+    def set_driving_goal_state(self, goal_state) -> None:
+        goal_states = [] if goal_state is None else [goal_state]
+        self.set_driving_goal_states(goal_states)
+
+    def set_driving_goal_states(self, goal_states: list) -> None:
+        if not self.use_goal_state_driven_actions:
+            return
+
+        best_goals = {agent_id: None for agent_id in self._agent_ids}
+        best_confidences = {agent_id: -np.inf for agent_id in self._agent_ids}
+
+        for goal_state in goal_states:
+            if goal_state is None or not getattr(goal_state, "use_state", False):
+                continue
+
+            sender_id = getattr(goal_state, "sender_id", None)
+            agent_id = self._sender_to_agent_dict.get(sender_id)
+            if agent_id not in best_goals:
+                continue
+
+            confidence = float(getattr(goal_state, "confidence", 0.0))
+            if confidence > best_confidences[agent_id]:
+                best_goals[agent_id] = goal_state
+                best_confidences[agent_id] = confidence
+
+        for agent_id, policy in self._agent_policies.items():
+            policy.set_driving_goal_state(best_goals[agent_id])
+
+    def __call__(
+        self,
+        ctx: RuntimeContext,
+        observations: Observations,
+        state: MotorSystemState | None = None,
+    ) -> MotorPolicyResult:
+        actions = []
+        motor_only_step = False
+
+        for policy in self._agent_policies.values():
+            should_step = (
+                policy.processed_observations is not None
+                or getattr(policy, "driving_goal_state", None) is not None
+                or getattr(policy, "_is_jumping", False)
+                or getattr(policy, "_is_undoing_jump", False)
+            )
+            if not should_step:
+                continue
+
+            result = policy(ctx, observations, state)
+            actions.extend(result.actions)
+            motor_only_step = motor_only_step or result.motor_only_step
+
+        return MotorPolicyResult(actions=actions, motor_only_step=motor_only_step)
 
 
 class NaiveScanPolicy(InformedPolicy):

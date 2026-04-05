@@ -165,6 +165,7 @@ COLUMN_KWARGS = {
     "sparsity": 0.03,
     "use_apical": False,
     "use_location_feature_memory": True,   # Phase 11: LFM + predictive tracking
+    "use_reference_frame_estimator": True,  # Phase 12: optional full-query sharpening
     "beta": 12.0,
     "max_settle_iters": 12,
     "evidence_decay": 0.01,
@@ -173,6 +174,12 @@ COLUMN_KWARGS = {
     "lfm_kwargs": {
         "beta": 30.0,              # was 12.0; key for convergence (see analysis above)
         "novelty_threshold": 0.5,  # was 0.7; store more diverse training patterns
+    },
+    "reference_frame_kwargs": {
+        "min_pairs": 3,
+        "evidence_threshold": 0.15,
+        "confidence_threshold": 0.5,
+        "max_pairs": 30,
     },
 }
 
@@ -465,6 +472,7 @@ def print_summary(exp: MontyObjectRecognitionExperiment, object_names: list[str]
     logger.info("  [OK] DepthTo3DLocations + Panda3DDepthNormalize transforms")
     logger.info("  [OK] use_goal_state_driven_actions=True   -- LFM-guided hypothesis jumps enabled")
     logger.info("  [OK] Training on %d rotations per object  -- 45°-spaced Y-axis coverage", len(TRAIN_ROTATIONS))
+    logger.info("  [OK] use_reference_frame_estimator=True  -- full-query sharpening after pose bootstrap")
     logger.info("  [!!] InformedPolicy = random surface walk -- not orbital coverage")
     logger.info("  [!!] action_space_type='distant_agent'    -- pan/tilt only, no physical move")
 

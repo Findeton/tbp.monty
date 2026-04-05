@@ -79,6 +79,7 @@ class AnimatedObject:
         model_np.writeBamFile(self._bam_path)
 
         self._actor = Actor(self._bam_path)
+        self._base = base
         self._anim_names = list(self._actor.getAnimNames())
         self._controlled_joints: Dict[str, NodePath] = {}
         self._current_anim: Optional[str] = None
@@ -175,6 +176,15 @@ class AnimatedObject:
                 raise ValueError(f"Joint '{joint_name}' not found")
             self._controlled_joints[joint_name] = ctrl_np
         return self._controlled_joints[joint_name]
+
+    def expose_joint(
+        self, joint_name: str, part_name: str = "modelRoot"
+    ) -> NodePath:
+        """Return a live NodePath for reading a joint's animated transform."""
+        joint_np = self._actor.exposeJoint(None, part_name, joint_name)
+        if joint_np is None or joint_np.isEmpty():
+            raise ValueError(f"Joint '{joint_name}' not found")
+        return joint_np
 
     def release_joint(
         self, joint_name: str, part_name: str = "modelRoot"

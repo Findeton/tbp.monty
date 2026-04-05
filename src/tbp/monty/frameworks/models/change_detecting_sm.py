@@ -7,9 +7,11 @@
 """Change-detecting sensor module for behavior modeling.
 
 Analogous to the magnocellular visual pathway, this SM detects local changes
-(movement, feature changes) and only outputs when change is detected. It
-provides the input to behavior-learning LMs, following the TBP theory that
-morphology and behavior use the same LM algorithm with different SM inputs.
+(movement, feature changes) and provides the input to behavior-learning LMs.
+Once primed by an initial observation, it can emit low-confidence steady-state
+context even when no thresholded change is detected. This keeps the behavior
+stream anchored to absolute sensory context rather than reducing it to sparse
+change events only.
 
 Key features:
 - Computes animation-induced flow using point correspondence between frames
@@ -26,9 +28,15 @@ import logging
 from typing import Any, Dict, Optional
 
 import numpy as np
+from skimage.color import rgb2hsv
 
 from tbp.monty.frameworks.models.abstract_monty_classes import SensorModule
 from tbp.monty.frameworks.models.states import State
+from tbp.monty.frameworks.utils.sensor_processing import (
+    log_sign,
+    principal_curvatures,
+    surface_normal_naive,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +70,12 @@ class ChangeDetectingSM(SensorModule):
     min_persistent_points : int
         Minimum number of persistent (matched) points required to compute
         correspondence-based flow. Falls back to centroid flow if fewer.
+    include_absolute_features : bool
+        If True, include current absolute appearance features such as HSV in the
+        emitted state in addition to change descriptors.
+    emit_low_confidence_state_on_no_change : bool
+        If True, emit a low-confidence state on quiet frames after the first
+        observation rather than suppressing the state entirely.
     """
 
     def __init__(
@@ -72,6 +86,8 @@ class ChangeDetectingSM(SensorModule):
         global_flow_suppression: bool = True,
         correspondence_threshold: float = 0.05,
         min_persistent_points: int = 5,
+        include_absolute_features: bool = True,
+        emit_low_confidence_state_on_no_change: bool = True,
     ):
         self.sensor_module_id = sensor_module_id
         self._flow_threshold = flow_threshold
@@ -79,6 +95,10 @@ class ChangeDetectingSM(SensorModule):
         self._global_flow_suppression = global_flow_suppression
         self._correspondence_threshold = correspondence_threshold
         self._min_persistent_points = min_persistent_points
+        self._include_absolute_features = bool(include_absolute_features)
+        self._emit_low_confidence_state_on_no_change = bool(
+            emit_low_confidence_state_on_no_change
+        )
 
         self._prev_observation: Optional[Dict[str, Any]] = None
         self._prev_location: Optional[np.ndarray] = None
@@ -90,6 +110,10 @@ class ChangeDetectingSM(SensorModule):
         return {
             "sensor_module_id": self.sensor_module_id,
             "flow_threshold": self._flow_threshold,
+            "include_absolute_features": self._include_absolute_features,
+            "emit_low_confidence_state_on_no_change": (
+                self._emit_low_confidence_state_on_no_change
+            ),
         }
 
     def update_state(self, agent) -> None:
@@ -106,8 +130,10 @@ class ChangeDetectingSM(SensorModule):
     def step(self, ctx, observation, motor_only_step=False):
         """Process observation and detect changes.
 
-        Returns a State with change-describing features when a significant
-        local change is detected, or a State with use_state=False otherwise.
+        Returns a State with mixed absolute-plus-change features when a
+        significant local change is detected. After the first observation, it
+        can also emit a low-confidence state on quiet frames so the behavior LM
+        retains stable identity context instead of seeing only sparse events.
 
         The observation should contain "semantic_3d" (N, 4) array with
         [x, y, z, semantic_id] for each point.
@@ -154,6 +180,10 @@ class ChangeDetectingSM(SensorModule):
         change_detected = (
             flow_magnitude > self._flow_threshold or feature_changed
         )
+        signal_strength = self._compute_change_signal_strength(
+            flow_magnitude,
+            feature_deltas,
+        )
 
         # Update previous state
         self._prev_location = current_location.copy()
@@ -163,12 +193,22 @@ class ChangeDetectingSM(SensorModule):
         if change_detected:
             return self._make_change_state(
                 location=current_location,
+                current_features=current_features,
                 flow_direction=flow_direction,
                 flow_magnitude=flow_magnitude,
                 feature_deltas=feature_deltas,
+                signal_strength=signal_strength,
             )
-        else:
-            return self._make_no_change_state()
+        if self._emit_low_confidence_state_on_no_change:
+            return self._make_quiet_state(
+                location=current_location,
+                current_features=current_features,
+                flow_direction=flow_direction,
+                flow_magnitude=flow_magnitude,
+                feature_deltas=feature_deltas,
+                signal_strength=signal_strength,
+            )
+        return self._make_no_change_state()
 
     # ======================== Private ========================
 
@@ -207,7 +247,7 @@ class ChangeDetectingSM(SensorModule):
         return on_object_points.mean(axis=0)
 
     def _extract_features(self, observation) -> Dict[str, np.ndarray]:
-        """Extract features from observation for change detection."""
+        """Extract absolute features from the current observation."""
         features = {}
         if "rgba" in observation:
             rgba = observation["rgba"]
@@ -215,10 +255,63 @@ class ChangeDetectingSM(SensorModule):
                 # Use center pixel or mean
                 if rgba.ndim == 3:
                     h, w = rgba.shape[:2]
-                    features["rgba"] = rgba[h // 2, w // 2].astype(float)
+                    center_rgba = rgba[h // 2, w // 2]
                 else:
-                    features["rgba"] = rgba.astype(float)
+                    center_rgba = np.asarray(rgba)
+                features["rgba"] = np.asarray(center_rgba, dtype=float)
+
+                rgb = np.asarray(center_rgba).reshape(-1)[:3]
+                if rgb.size == 3:
+                    features["hsv"] = np.asarray(rgb2hsv(rgb), dtype=float)
+
+        semantic_3d = observation.get("semantic_3d")
+        if isinstance(semantic_3d, np.ndarray):
+            features.update(self._extract_center_patch_geometry(semantic_3d))
+
         return features
+
+    def _extract_center_patch_geometry(
+        self,
+        semantic_3d: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """Extract center-patch geometry features when a square patch is available."""
+        if semantic_3d.ndim != 2 or semantic_3d.shape[1] < 4:
+            return {}
+
+        n_points = int(semantic_3d.shape[0])
+        if n_points <= 0:
+            return {}
+
+        obs_dim = int(np.sqrt(n_points))
+        if obs_dim * obs_dim != n_points:
+            return {}
+
+        center_id = (obs_dim // 2) + obs_dim * (obs_dim // 2)
+        if semantic_3d[center_id, 3] <= 0:
+            return {}
+
+        try:
+            surface_normal, valid_sn = surface_normal_naive(semantic_3d)
+            if not valid_sn:
+                return {}
+
+            k1, k2, _dir1, _dir2, valid_pc = principal_curvatures(
+                semantic_3d,
+                center_id,
+                surface_normal,
+                weighted=True,
+            )
+        except (FloatingPointError, IndexError, ValueError, ZeroDivisionError, np.linalg.LinAlgError):
+            return {}
+
+        if not valid_pc:
+            return {}
+
+        return {
+            "principal_curvatures_log": log_sign(
+                np.asarray([k1, k2], dtype=float)
+            )
+        }
 
     def _compute_correspondence_flow(
         self, current_points, current_location
@@ -343,33 +436,104 @@ class ChangeDetectingSM(SensorModule):
         """Deep copy feature dict."""
         return {k: v.copy() for k, v in features.items()}
 
-    def _make_change_state(
+    def _compute_change_signal_strength(
         self,
-        location: np.ndarray,
+        flow_magnitude: float,
+        feature_deltas: Dict[str, np.ndarray],
+    ) -> float:
+        """Return a threshold-relative salience score for the current step."""
+        scores = []
+        if self._flow_threshold > 0:
+            scores.append(float(flow_magnitude) / float(self._flow_threshold))
+
+        for key, delta in feature_deltas.items():
+            threshold = self._feature_change_thresholds.get(key)
+            if threshold is None or threshold <= 0:
+                continue
+            scores.append(float(np.linalg.norm(delta)) / float(threshold))
+
+        return max(scores, default=0.0)
+
+    def _build_non_morph_features(
+        self,
+        current_features: Dict[str, np.ndarray],
         flow_direction: np.ndarray,
         flow_magnitude: float,
         feature_deltas: Dict[str, np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        """Build the mixed absolute-plus-change feature payload."""
+        non_morph = {
+            "flow_direction": np.asarray(flow_direction, dtype=float),
+            "flow_magnitude": np.array([flow_magnitude], dtype=float),
+        }
+        if self._include_absolute_features:
+            for key, value in current_features.items():
+                non_morph[key] = np.asarray(value, dtype=float).copy()
+        for key, delta in feature_deltas.items():
+            non_morph[f"delta_{key}"] = np.asarray(delta, dtype=float).copy()
+        return non_morph
+
+    def _make_change_state(
+        self,
+        location: np.ndarray,
+        current_features: Dict[str, np.ndarray],
+        flow_direction: np.ndarray,
+        flow_magnitude: float,
+        feature_deltas: Dict[str, np.ndarray],
+        signal_strength: float,
     ) -> State:
         """Create a State representing detected change."""
         # Use flow direction as the primary pose vector (direction of movement)
         # Construct orthonormal basis from flow direction
         pose_vectors = self._flow_to_pose_vectors(flow_direction)
-
-        non_morph = {
-            "flow_direction": flow_direction,
-            "flow_magnitude": np.array([flow_magnitude]),
-        }
-        for key, delta in feature_deltas.items():
-            non_morph[f"delta_{key}"] = delta
+        non_morph = self._build_non_morph_features(
+            current_features,
+            flow_direction,
+            flow_magnitude,
+            feature_deltas,
+        )
+        pose_fully_defined = bool(np.linalg.norm(flow_direction) > 1e-10)
 
         return State(
             location=location,
             morphological_features={
                 "pose_vectors": pose_vectors,
-                "pose_fully_defined": True,
+                "pose_fully_defined": pose_fully_defined,
             },
             non_morphological_features=non_morph,
-            confidence=min(flow_magnitude / self._flow_threshold, 1.0),
+            confidence=min(max(signal_strength, 0.0), 1.0),
+            use_state=True,
+            sender_id=self.sensor_module_id,
+            sender_type="SM",
+        )
+
+    def _make_quiet_state(
+        self,
+        location: np.ndarray,
+        current_features: Dict[str, np.ndarray],
+        flow_direction: np.ndarray,
+        flow_magnitude: float,
+        feature_deltas: Dict[str, np.ndarray],
+        signal_strength: float,
+    ) -> State:
+        """Create a low-confidence steady-state context observation."""
+        pose_vectors = self._flow_to_pose_vectors(flow_direction)
+        pose_fully_defined = bool(np.linalg.norm(flow_direction) > 1e-10)
+        quiet_confidence = 0.05 + 0.2 * min(max(signal_strength, 0.0), 1.0)
+
+        return State(
+            location=location,
+            morphological_features={
+                "pose_vectors": pose_vectors,
+                "pose_fully_defined": pose_fully_defined,
+            },
+            non_morphological_features=self._build_non_morph_features(
+                current_features,
+                flow_direction,
+                flow_magnitude,
+                feature_deltas,
+            ),
+            confidence=min(quiet_confidence, 0.25),
             use_state=True,
             sender_id=self.sensor_module_id,
             sender_type="SM",
