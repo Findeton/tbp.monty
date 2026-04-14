@@ -42,6 +42,7 @@ Usage::
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -396,6 +397,10 @@ class Panda3DBehaviorExperiment:
             self._hpc_kwargs is not None,
         )
 
+    def _reset_episode_transforms(self):
+        if self._depth_transform is not None and hasattr(self._depth_transform, "reset"):
+            self._depth_transform.reset()
+
     # ======================== Public API ========================
 
     def train_behavior(
@@ -446,6 +451,7 @@ class Panda3DBehaviorExperiment:
         n_frames = self._anim_obj.get_num_frames(anim_name)
         total_frames = n_frames * n_repetitions
         ctx = RuntimeContext(rng=np.random.RandomState(42))
+        self._reset_episode_transforms()
 
         target = {
             "object": morphology_name,
@@ -559,6 +565,7 @@ class Panda3DBehaviorExperiment:
             n_frames = min(n_frames, n_steps)
 
         ctx = RuntimeContext(rng=np.random.RandomState(42))
+        self._reset_episode_transforms()
 
         target = {
             "object": "placeholder",
@@ -594,8 +601,8 @@ class Panda3DBehaviorExperiment:
         # Legacy alias
         result["graph_id"] = result["behavior_id"]
 
-        result["morphology_evidence"] = morph_lm.evidence
-        result["behavior_evidence"] = behav_lm.evidence
+        result["morphology_evidence"] = copy.deepcopy(morph_lm.evidence)
+        result["behavior_evidence"] = copy.deepcopy(behav_lm.evidence)
 
         # Temporal memory results (if enabled on behavior LM)
         if hasattr(behav_lm, "_temporal_memory") and behav_lm._temporal_memory:

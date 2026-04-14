@@ -22,6 +22,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import pytest
 
 from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.sensors import SensorID
@@ -34,6 +35,9 @@ except ImportError:
 
 from tbp.monty.simulators.panda3d.agents import Panda3DAgent
 from tbp.monty.simulators.panda3d.simulator import Panda3DSimulator
+
+
+pytestmark = pytest.mark.xdist_group(name="panda3d")
 
 
 AGENT_ID = AgentID("test_cam")

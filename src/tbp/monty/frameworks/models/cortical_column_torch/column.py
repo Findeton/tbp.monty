@@ -857,7 +857,10 @@ class CorticalColumnTorch:
 
             # 1. Encode
             input_vec = self._encoder.encode(state)
-            current_location = np.asarray(state.location, dtype=np.float64)
+            current_location = np.asarray(
+                self._encoder.extract_location(state),
+                dtype=np.float64,
+            )
 
             # 1a. Split for location-feature memory (Phase 11)
             lfm_loc_enc = lfm_feat_enc = None
@@ -1213,7 +1216,10 @@ class CorticalColumnTorch:
 
             # 1. Encode
             input_vec = self._encoder.encode(state)
-            current_location = np.asarray(state.location, dtype=np.float64)
+            current_location = np.asarray(
+                self._encoder.extract_location(state),
+                dtype=np.float64,
+            )
 
             # 1b. Motor prediction
             motor_pred_error = 0.0

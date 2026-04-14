@@ -32,6 +32,7 @@ Usage::
 
 from __future__ import annotations
 
+import inspect
 import logging
 from pathlib import Path
 
@@ -59,6 +60,11 @@ from tbp.monty.frameworks.models.cortical_column_torch.learning_module import (
 )
 from tbp.monty.frameworks.models.evidence_matching.model import (
     MontyForEvidenceGraphMatching,
+)
+from tbp.monty.frameworks.models.predictive_hypothesis_torch import (
+    DetailAwareCameraSM,
+    DetailAwareChangeDetectingSM,
+    PredictiveHypothesisTorchLM,
 )
 from tbp.monty.frameworks.models.motor_policies import InformedPolicy
 from tbp.monty.frameworks.models.motor_system import MotorSystem
@@ -161,6 +167,8 @@ class Panda3DTorchExperiment:
     CHANGE_SM_ID = "change_detector"
     _ACTOR_SYNC_RENDER_PASSES = 3
     _EPISODE_SENSOR_WARMUP_STEPS = 1
+    _CAMERA_BOUNDS_RETRY_ATTEMPTS = 4
+    _CAMERA_BOUNDS_ABS_LIMIT_FACTOR = 50.0
 
     def __init__(
         self,
@@ -196,6 +204,9 @@ class Panda3DTorchExperiment:
         goal_state_driven_actions=False,
         authoritative_goal_sender_ids=None,
         allow_action_sampler_fallback=False,
+        lm_family="cortical_column_torch",
+        detail_grid_shape=(5, 5),
+        use_detail_aware_sensors=False,
         lm_kwargs=None,
         morphology_lm_kwargs=None,
         behavior_lm_kwargs=None,
@@ -241,6 +252,9 @@ class Panda3DTorchExperiment:
             authoritative_goal_sender_ids or []
         )
         self._allow_action_sampler_fallback = allow_action_sampler_fallback
+        self._lm_family = str(lm_family)
+        self._detail_grid_shape = tuple(detail_grid_shape)
+        self._use_detail_aware_sensors = bool(use_detail_aware_sensors)
         self._lm_kwargs = lm_kwargs or {}
         self._morphology_lm_kwargs = morphology_lm_kwargs or {}
         self._behavior_lm_kwargs = behavior_lm_kwargs or {}
@@ -255,6 +269,7 @@ class Panda3DTorchExperiment:
         self._depth_transform = None
         self._d3d_transform = None
         self._monty = None
+        self._last_camera_init_debug = None
 
     def _sync_render(self, passes=None):
         if self._sim is None:
@@ -353,10 +368,7 @@ class Panda3DTorchExperiment:
         )
 
     def _setup_flat(self):
-        sm = CameraSM(
-            sensor_module_id=self.CAMERA_SM_ID,
-            features=self._camera_features,
-        )
+        sm = self._build_camera_sensor_module()
 
         col_kw = dict(
             n_minicolumns=2048,
@@ -367,10 +379,10 @@ class Panda3DTorchExperiment:
         )
         col_kw.update(self._column_kwargs)
 
-        lm = CorticalColumnTorchLM(
-            column_kwargs=col_kw,
+        lm = self._build_learning_module(
             learning_module_id="lm_0",
-            **self._lm_kwargs,
+            column_kwargs=col_kw,
+            lm_kwargs=self._lm_kwargs,
         )
 
         motor_system = self._build_motor_system()
@@ -399,15 +411,8 @@ class Panda3DTorchExperiment:
         )
 
     def _setup_hierarchical(self):
-        sm_camera = CameraSM(
-            sensor_module_id=self.CAMERA_SM_ID,
-            features=self._camera_features,
-        )
-        sm_change = ChangeDetectingSM(
-            sensor_module_id=self.CHANGE_SM_ID,
-            flow_threshold=self._flow_threshold,
-            global_flow_suppression=False,
-        )
+        sm_camera = self._build_camera_sensor_module()
+        sm_change = self._build_change_sensor_module()
 
         child_kw = dict(
             n_minicolumns=2048,
@@ -424,15 +429,15 @@ class Panda3DTorchExperiment:
         behavior_child_kw.update(self._behavior_column_kwargs)
         behavior_child_kw.setdefault("seed", behavior_seed)
 
-        lm_morph = CorticalColumnTorchLM(
-            column_kwargs=morphology_child_kw,
+        lm_morph = self._build_learning_module(
             learning_module_id="lm_morphology",
-            **self._morphology_lm_kwargs,
+            column_kwargs=morphology_child_kw,
+            lm_kwargs=self._morphology_lm_kwargs,
         )
-        lm_behav = CorticalColumnTorchLM(
-            column_kwargs=behavior_child_kw,
+        lm_behav = self._build_learning_module(
             learning_module_id="lm_behavior",
-            **self._behavior_lm_kwargs,
+            column_kwargs=behavior_child_kw,
+            lm_kwargs=self._behavior_lm_kwargs,
         )
 
         parent_kw = dict(
@@ -452,16 +457,16 @@ class Panda3DTorchExperiment:
         )
         parent_lm_kwargs.update(self._parent_lm_kwargs)
 
-        lm_parent = CorticalColumnTorchLM(
-            column_kwargs=parent_kw,
+        lm_parent = self._build_learning_module(
             learning_module_id="lm_parent",
-            **parent_lm_kwargs,
+            column_kwargs=parent_kw,
+            lm_kwargs=parent_lm_kwargs,
         )
 
         motor_system = self._build_motor_system()
 
         # Enable hopfield_voting on child LMs when requested
-        if self._hopfield_voting:
+        if self._hopfield_voting and hasattr(lm_morph, "_hopfield_voting"):
             lm_morph._hopfield_voting = True
             lm_morph._surprise_vote_threshold = self._hopfield_surprise_threshold
             lm_behav._hopfield_voting = True
@@ -508,6 +513,131 @@ class Panda3DTorchExperiment:
             view_finder_id="view_finder",
         )
         return MotorSystem(policy=motor_policy)
+
+    def _use_predictive_hypothesis_family(self) -> bool:
+        return getattr(self, "_lm_family", "cortical_column_torch") == "predictive_hypothesis_torch"
+
+    def _use_detail_aware_sensor_modules(self) -> bool:
+        lm_family = str(getattr(self, "_lm_family", "cortical_column_torch"))
+        if lm_family == "predictive_hypothesis_torch":
+            return True
+        return bool(getattr(self, "_use_detail_aware_sensors", False))
+
+    def _get_detail_grid_shape(self) -> tuple[int, int]:
+        return tuple(getattr(self, "_detail_grid_shape", (5, 5)))
+
+    def _build_camera_sensor_module(self):
+        if self._use_predictive_hypothesis_family():
+            return DetailAwareCameraSM(
+                sensor_module_id=self.CAMERA_SM_ID,
+                features=self._camera_features,
+                detail_grid_shape=self._get_detail_grid_shape(),
+            )
+        if self._use_detail_aware_sensor_modules():
+            return DetailAwareCameraSM(
+                sensor_module_id=self.CAMERA_SM_ID,
+                features=self._camera_features,
+                detail_grid_shape=self._get_detail_grid_shape(),
+                include_world_pose=False,
+            )
+        return CameraSM(
+            sensor_module_id=self.CAMERA_SM_ID,
+            features=self._camera_features,
+        )
+
+    def _build_change_sensor_module(self):
+        if self._use_predictive_hypothesis_family():
+            return DetailAwareChangeDetectingSM(
+                sensor_module_id=self.CHANGE_SM_ID,
+                flow_threshold=self._flow_threshold,
+                global_flow_suppression=False,
+                detail_grid_shape=self._get_detail_grid_shape(),
+            )
+        if self._use_detail_aware_sensor_modules():
+            return DetailAwareChangeDetectingSM(
+                sensor_module_id=self.CHANGE_SM_ID,
+                flow_threshold=self._flow_threshold,
+                global_flow_suppression=False,
+                detail_grid_shape=self._get_detail_grid_shape(),
+                include_world_pose=False,
+            )
+        return ChangeDetectingSM(
+            sensor_module_id=self.CHANGE_SM_ID,
+            flow_threshold=self._flow_threshold,
+            global_flow_suppression=False,
+        )
+
+    def _build_learning_module(
+        self,
+        learning_module_id,
+        column_kwargs,
+        lm_kwargs,
+    ):
+        effective_lm_kwargs = dict(lm_kwargs or {})
+        if self._use_predictive_hypothesis_family():
+            user_core_kwargs = dict(effective_lm_kwargs.pop("core_kwargs", {}))
+            user_core_kwargs.setdefault(
+                "context_dim",
+                int(column_kwargs.get("n_minicolumns", 256)),
+            )
+            user_core_kwargs.setdefault(
+                "device",
+                str(column_kwargs.get("device", "cpu")),
+            )
+            user_core_kwargs.setdefault(
+                "seed",
+                int(column_kwargs.get("seed", self._seed)),
+            )
+            for key in [
+                "expected_context_sender_ids",
+                "context_identity_weight",
+                "use_child_graph_context_labels",
+            ]:
+                effective_lm_kwargs.pop(key, None)
+            supported_lm_kwargs = set(
+                inspect.signature(PredictiveHypothesisTorchLM.__init__).parameters
+            )
+            supported_lm_kwargs.discard("self")
+            supported_lm_kwargs.discard("core_kwargs")
+            supported_lm_kwargs.discard("learning_module_id")
+            unsupported_keys = sorted(
+                set(effective_lm_kwargs) - supported_lm_kwargs
+            )
+            if unsupported_keys:
+                logger.info(
+                    "Ignoring unsupported PredictiveHypothesisTorchLM kwargs for %s: %s",
+                    learning_module_id,
+                    ", ".join(unsupported_keys),
+                )
+            effective_lm_kwargs = {
+                key: value
+                for key, value in effective_lm_kwargs.items()
+                if key in supported_lm_kwargs
+            }
+            return PredictiveHypothesisTorchLM(
+                core_kwargs=user_core_kwargs,
+                learning_module_id=learning_module_id,
+                **effective_lm_kwargs,
+            )
+
+        if self._use_detail_aware_sensor_modules():
+            column_kwargs = dict(column_kwargs)
+            encoder_kwargs = dict(column_kwargs.get("encoder_kwargs", {}))
+            encoder_kwargs.setdefault(
+                "observation_packet_location_mode",
+                "sensor_frame_centroid",
+            )
+            encoder_kwargs.setdefault(
+                "ignore_pose_vectors_for_observation_packets",
+                True,
+            )
+            column_kwargs["encoder_kwargs"] = encoder_kwargs
+
+        return CorticalColumnTorchLM(
+            column_kwargs=column_kwargs,
+            learning_module_id=learning_module_id,
+            **effective_lm_kwargs,
+        )
 
     def _resolve_frame_schedule(self, anim_name=None, n_steps=None, frame_schedule=None):
         animated = anim_name is not None
@@ -657,6 +787,10 @@ class Panda3DTorchExperiment:
             "boundary_pressure",
             "trace_discontinuity",
             "trace_scales",
+            "appearance_prediction_error",
+            "change_prediction_error",
+            "predicted_appearance_norm",
+            "predicted_change_norm",
         ]
         simplified = {}
         for key in keep:
@@ -691,7 +825,59 @@ class Panda3DTorchExperiment:
         else:
             simplified["active_cells"] = None
 
+        for key in (
+            "predicted_appearance_signature",
+            "predicted_change_signature",
+        ):
+            value = context_signal.get(key)
+            if isinstance(value, np.ndarray):
+                simplified[key] = value.astype(np.float32).copy()
+            elif isinstance(value, torch.Tensor):
+                simplified[key] = value.detach().cpu().float().numpy().copy()
+
         return simplified
+
+    @staticmethod
+    def _copy_output_state(output_state):
+        if output_state is None:
+            return None
+
+        morph = getattr(output_state, "morphological_features", None) or {}
+        non_morph = getattr(output_state, "non_morphological_features", None) or {}
+        copied = {
+            "location": np.asarray(
+                getattr(output_state, "location", np.zeros(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).copy(),
+            "pose_vectors": np.asarray(
+                morph.get("pose_vectors", np.eye(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).copy(),
+            "confidence": float(getattr(output_state, "confidence", 0.0)),
+            "graph_id": non_morph.get("graph_id"),
+        }
+        for key in (
+            "appearance_signature",
+            "behavior_signature",
+            "predicted_appearance_signature",
+            "predicted_change_signature",
+            "appearance_residual",
+            "change_residual",
+        ):
+            value = non_morph.get(key)
+            if value is None:
+                continue
+            copied[key] = np.asarray(value, dtype=np.float32).copy()
+        for key in (
+            "residual",
+            "evidence",
+            "appearance_prediction_error",
+            "change_prediction_error",
+        ):
+            value = non_morph.get(key)
+            if value is not None:
+                copied[key] = float(value)
+        return copied
 
     def _collect_step_trace(
         self,
@@ -729,6 +915,10 @@ class Panda3DTorchExperiment:
                 context_signal = self._copy_context_signal(lm.get_context_signal())
                 if context_signal is not None:
                     lm_trace["context_signal"] = context_signal
+            if collect_context_signals and hasattr(lm, "get_output"):
+                output_state = self._copy_output_state(lm.get_output())
+                if output_state is not None:
+                    lm_trace["output_state"] = output_state
 
             trace["learning_modules"][lm.learning_module_id] = lm_trace
 
@@ -992,29 +1182,109 @@ class Panda3DTorchExperiment:
 
     # ======================== Private ========================
 
+    def _camera_bounds_abs_limit(self):
+        initial_distance = max(float(getattr(self, "_initial_distance", 0.0)), 1.0)
+        return max(10.0, initial_distance * self._CAMERA_BOUNDS_ABS_LIMIT_FACTOR)
+
+    def _bounds_to_debug_payload(self, bounds):
+        if not bounds:
+            return None
+
+        lo = np.asarray(bounds[0], dtype=np.float64).reshape(-1)
+        hi = np.asarray(bounds[1], dtype=np.float64).reshape(-1)
+        if lo.size < 3 or hi.size < 3:
+            return None
+
+        lo = lo[:3]
+        hi = hi[:3]
+        center = 0.5 * (lo + hi)
+        extents = hi - lo
+        return {
+            "lo": lo.astype(float).tolist(),
+            "hi": hi.astype(float).tolist(),
+            "center": center.astype(float).tolist(),
+            "extents": extents.astype(float).tolist(),
+        }
+
+    def _bounds_are_sane(self, bounds):
+        payload = self._bounds_to_debug_payload(bounds)
+        if payload is None:
+            return False
+
+        lo = np.asarray(payload["lo"], dtype=np.float64)
+        hi = np.asarray(payload["hi"], dtype=np.float64)
+        center = np.asarray(payload["center"], dtype=np.float64)
+        extents = hi - lo
+        if not np.isfinite(lo).all() or not np.isfinite(hi).all():
+            return False
+        if np.any(extents <= 1e-6):
+            return False
+
+        abs_limit = self._camera_bounds_abs_limit()
+        if float(np.max(np.abs(extents))) > abs_limit:
+            return False
+
+        object_position = np.asarray(self._object_position, dtype=np.float64)
+        if float(np.max(np.abs(center - object_position))) > abs_limit:
+            return False
+
+        return True
+
+    def _resolve_camera_target_center(self, anim_name=None, frame=None):
+        obj_np = self._sim._objects[self._obj_id]
+        debug = {
+            "animation": anim_name,
+            "frame": None if frame is None else int(frame),
+            "attempts": [],
+            "selected_source": None,
+            "selected_attempt": None,
+            "selected_bounds": None,
+            "selected_center": None,
+        }
+
+        attempt_count = 1
+        if anim_name is not None and frame is not None and self._anim_obj is not None:
+            attempt_count = max(1, int(self._CAMERA_BOUNDS_RETRY_ATTEMPTS))
+
+        for attempt in range(1, attempt_count + 1):
+            if anim_name is not None and frame is not None and self._anim_obj is not None:
+                self._anim_obj.pose(frame, anim_name)
+                self._sync_render()
+
+            bounds = obj_np.getTightBounds()
+            payload = self._bounds_to_debug_payload(bounds)
+            sane = self._bounds_are_sane(bounds)
+            debug["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "bounds": payload,
+                    "sane": sane,
+                }
+            )
+            if sane and payload is not None:
+                center = tuple(float(value) for value in payload["center"])
+                debug["selected_source"] = "tight_bounds"
+                debug["selected_attempt"] = attempt
+                debug["selected_bounds"] = payload
+                debug["selected_center"] = list(center)
+                self._last_camera_init_debug = debug
+                return center
+
+        fallback_center = tuple(float(value) for value in self._object_position)
+        debug["selected_source"] = "object_position_fallback"
+        debug["selected_center"] = list(fallback_center)
+        self._last_camera_init_debug = debug
+        return fallback_center
+
     def _position_camera_initial(self, anim_name=None, frame=None):
         from panda3d.core import LVector3f
 
         cam_np = self._sim._agent_buffers[self._agent_id]["camera_np"]
 
-        if anim_name is not None and frame is not None:
-            self._anim_obj.pose(frame, anim_name)
-            # Animated Actor joint transforms are not always stable
-            # immediately after pose() on the first episode after a model
-            # swap. Force a few render/update passes before querying bounds so
-            # camera placement is based on the posed mesh, not stale or
-            # singular transforms.
-            self._sync_render()
-
-        obj_np = self._sim._objects[self._obj_id]
-        bounds = obj_np.getTightBounds()
-        if bounds:
-            lo, hi = bounds
-            cx = float((lo[0] + hi[0]) / 2)
-            cy = float((lo[1] + hi[1]) / 2)
-            cz = float((lo[2] + hi[2]) / 2)
-        else:
-            cx, cy, cz = self._object_position
+        cx, cy, cz = self._resolve_camera_target_center(
+            anim_name=anim_name,
+            frame=frame,
+        )
 
         cam_np.setPos(cx, cy - self._initial_distance, cz)
         cam_np.lookAt(LVector3f(cx, cy, cz))

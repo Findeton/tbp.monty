@@ -1,0 +1,118 @@
+benchmarks:
+  default_all_noise_params:
+    features:
+      pose_vectors: 2
+      hsv: 0.1
+      principal_curvatures_log: 0.1
+      pose_fully_defined: 0.01
+    location: 0.002
+  default_sensor_features:
+  - pose_vectors
+  - pose_fully_defined
+  - on_object
+  - hsv
+  - principal_curvatures_log
+  min_eval_steps: 20
+  pretrained_dir: ${path.expanduser:${oc.env:MONTY_MODELS}/pretrained_ycb_v12}
+  rotations_all_count: 14
+  rotations_all:
+  - - 0
+    - 0
+    - 0
+  - - 0
+    - 90
+    - 0
+  - - 0
+    - 180
+    - 0
+  - - 0
+    - 270
+    - 0
+  - - 90
+    - 0
+    - 0
+  - - 90
+    - 180
+    - 0
+  - - 35
+    - 45
+    - 0
+  - - 325
+    - 45
+    - 0
+  - - 35
+    - 315
+    - 0
+  - - 325
+    - 315
+    - 0
+  - - 35
+    - 135
+    - 0
+  - - 325
+    - 135
+    - 0
+  - - 35
+    - 225
+    - 0
+  - - 325
+    - 225
+    - 0
+  rotations_3_count: 3
+  rotations_3:
+  - - 0
+    - 0
+    - 0
+  - - 0
+    - 90
+    - 0
+  - - 0
+    - 180
+    - 0
+experiment:
+  objects:
+  - 025_mug
+  - 011_banana
+  - 013_apple
+  - 035_power_drill
+  - 003_cracker_box
+  experiment:
+    model_path: __SET_AT_RUNTIME__
+    hierarchical: false
+    resolution:
+    - 128
+    - 128
+    fov: 90.0
+    near: 0.01
+    far: 10.0
+    initial_distance: 0.3
+    object_position:
+    - 0.0
+    - 0.0
+    - 0.0
+    object_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+    rotation_degrees: 5.0
+    translation_distance: 0.004
+    column_kwargs:
+      n_minicolumns: 2048
+      n_cells_per_minicolumn: 8
+      sparsity: 0.03
+      seed: 42
+      use_apical: false
+      base_learning_rate: 0.01
+      evidence_decay: 0.01
+  train:
+    n_steps: 50
+  eval:
+    n_steps: 30
+  criteria:
+    min_accuracy: 0.8
+    max_steps: 100
+    novelty_surprise_min: 0.3
+episodes: all
+num_parallel: 16
+print_cfg: false
+quiet_habitat_logs: true

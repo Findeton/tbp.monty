@@ -24,6 +24,7 @@ from tbp.monty.frameworks.models.abstract_monty_classes import ObjectModel
 from tbp.monty.frameworks.utils.graph_matching_utils import get_correct_k_n
 from tbp.monty.frameworks.utils.object_model_utils import (
     NumpyGraph,
+    SparseVoxelGrid,
     build_point_cloud_graph,
     circular_mean,
     expand_index_dims,
@@ -32,6 +33,7 @@ from tbp.monty.frameworks.utils.object_model_utils import (
     get_values_from_dense_last_dim,
     increment_sparse_tensor_by_count,
     pose_vector_mean,
+    replace_sparse_tensor_entries,
     remove_close_points,
     torch_graph_to_numpy,
 )
@@ -147,14 +149,25 @@ class GraphObjectModel(ObjectModel):
         if self._graph is not None:
             return self._graph.feature_mapping
 
+    def _graph_has_field(self, field_name):
+        if self._graph is None:
+            return False
+
+        keys = getattr(self._graph, "keys", None)
+        if callable(keys):
+            return field_name in keys()
+        if keys is not None:
+            return field_name in keys
+        return hasattr(self._graph, field_name)
+
     @property
     def edge_index(self):
-        if (self._graph is not None) and ("edge_index" in self._graph.keys):
+        if self._graph_has_field("edge_index"):
             return self._graph.edge_index
 
     @property
     def edge_attr(self):
-        if (self._graph is not None) and ("edge_attr" in self._graph.keys):
+        if self._graph_has_field("edge_attr"):
             return self._graph.edge_attr
 
     @property
@@ -732,30 +745,25 @@ class GridObjectModel(GraphObjectModel):
                 )
                 new_features.append(new_avg_feat)
 
-        (
-            prev_sparse_locs,
-            new_sparse_locs,
-        ) = self._old_new_lists_to_sparse_tensors(
-            indices=new_indices,
-            new_values=new_locations,
-            old_values=previous_locations_at_indices,
-            target_mat_shape=self._location_grid.shape,
-        )
-        # Subtract old locations since new ones already contain them in their average
-        # Don't just overwrite with new_sparse_locs since we may have voxels in the
-        # _location_grid that did not get updated and should not be set to 0 now.
-        self._location_grid = self._location_grid - prev_sparse_locs + new_sparse_locs
-
-        (
-            prev_sparse_feats,
-            new_sparse_feats,
-        ) = self._old_new_lists_to_sparse_tensors(
+        location_indices_4d = expand_index_dims(
             new_indices,
-            new_features,
-            previous_features_at_indices,
-            self._feature_grid.shape,
+            last_dim_size=self._location_grid.shape[-1],
         )
-        self._feature_grid = self._feature_grid - prev_sparse_feats + new_sparse_feats
+        self._location_grid = replace_sparse_tensor_entries(
+            self._location_grid,
+            location_indices_4d,
+            np.array(new_locations).flatten(),
+        )
+
+        feature_indices_4d = expand_index_dims(
+            new_indices,
+            last_dim_size=self._feature_grid.shape[-1],
+        )
+        self._feature_grid = replace_sparse_tensor_entries(
+            self._feature_grid,
+            feature_indices_4d,
+            np.array(new_features).flatten(),
+        )
         self._current_feature_mapping = updated_fm
 
     def _build_graph_from_grids(self):
@@ -766,12 +774,16 @@ class GridObjectModel(GraphObjectModel):
         """
         top_voxel_idxs = self._get_top_k_voxel_indices()
 
-        locations_at_ids = self._location_grid.to_dense()[
-            top_voxel_idxs[0], top_voxel_idxs[1], top_voxel_idxs[2]
-        ]
-        features_at_ids = self._feature_grid.to_dense()[
-            top_voxel_idxs[0], top_voxel_idxs[1], top_voxel_idxs[2]
-        ]
+        if isinstance(self._location_grid, SparseVoxelGrid):
+            locations_at_ids = self._location_grid.rows_for_indices_3d(top_voxel_idxs)
+            features_at_ids = self._feature_grid.rows_for_indices_3d(top_voxel_idxs)
+        else:
+            locations_at_ids = self._location_grid.to_dense()[
+                top_voxel_idxs[0], top_voxel_idxs[1], top_voxel_idxs[2]
+            ]
+            features_at_ids = self._feature_grid.to_dense()[
+                top_voxel_idxs[0], top_voxel_idxs[1], top_voxel_idxs[2]
+            ]
         graph = build_point_cloud_graph(
             locations=np.array(locations_at_ids),
             features=np.array(features_at_ids),
@@ -827,14 +839,16 @@ class GridObjectModel(GraphObjectModel):
         return feature_array, feature_mapping
 
     def _generate_empty_grid(self, num_voxels, n_entries):
-        # NOTE: torch sparse is made for 2D tensors. We use it for 4D tensors.
-        # Some operations may not work as expected on these.
+        # GridObjectModel intentionally uses SparseVoxelGrid here. The original 4D
+        # torch sparse COO representation can segfault during sparse_coo_tensor(...)
+        # reconstruction on the supported macOS / torch 1.13.1 runtime, even before
+        # graph extraction begins.
         shape = (num_voxels, num_voxels, num_voxels, n_entries)
-        # Create empty sparse tensor
-        sparse_tensor = torch.sparse_coo_tensor(
-            torch.zeros((4, 0), dtype=torch.long), torch.tensor([]), size=shape
+        return SparseVoxelGrid(
+            shape,
+            dtype=torch.float32,
+            device="cpu",
         )
-        return sparse_tensor.coalesce()
 
     def _resize_sparse_last_dim(self, sparse_tensor, new_last_dim_size):
         """Return a sparse tensor with the same entries and a wider last dimension."""
@@ -842,11 +856,13 @@ class GridObjectModel(GraphObjectModel):
             return sparse_tensor
 
         new_shape = (*sparse_tensor.shape[:-1], new_last_dim_size)
+        if isinstance(sparse_tensor, SparseVoxelGrid):
+            return sparse_tensor.with_shape(new_shape)
         return torch.sparse_coo_tensor(
-            sparse_tensor.indices(),
-            sparse_tensor.values(),
+            sparse_tensor._indices(),
+            sparse_tensor._values(),
             size=new_shape,
-        ).coalesce()
+        )
 
     def _get_new_voxel_location(
         self, new_locations_in_voxel, previous_loc_in_voxel, voxel
@@ -894,8 +910,11 @@ class GridObjectModel(GraphObjectModel):
             feats = new_features_in_voxel[:, ids[0] : ids[1]]
             if feature == "hsv":
                 avg_feat = np.zeros(3)
-                avg_feat[0] = circular_mean(feats[:, 0])
-                avg_feat[1:] = np.mean(feats[:, 1:], axis=0)
+                valid_hues = feats[:, 0][~np.isnan(feats[:, 0])]
+                if len(valid_hues) > 0:
+                    avg_feat[0] = circular_mean(valid_hues)
+                if not np.all(np.isnan(feats[:, 1:])):
+                    avg_feat[1:] = np.nanmean(feats[:, 1:], axis=0)
             elif feature == "pose_vectors":
                 avg_feat = pv_mean
             elif feature in ["on_object", "pose_fully_defined"]:
@@ -905,7 +924,13 @@ class GridObjectModel(GraphObjectModel):
             elif feature == "object_id":
                 avg_feat = get_most_common_value(feats)
             else:
-                avg_feat = np.mean(feats, axis=0)
+                if np.issubdtype(feats.dtype, np.floating) and np.any(np.isnan(feats)):
+                    if np.all(np.isnan(feats)):
+                        avg_feat = np.zeros(feats.shape[1])
+                    else:
+                        avg_feat = np.nanmean(feats, axis=0)
+                else:
+                    avg_feat = np.mean(feats, axis=0)
             # Only take average if there was a feature stored here before.
             # since self._observation_count already includes the new obs
             # this needs to be > the number of new feature obs in the voxel.
@@ -938,7 +963,27 @@ class GridObjectModel(GraphObjectModel):
                     else:
                         previous_average = avg_feat
                 # NOTE: could weight these
+                if avg_feat is not None:
+                    avg_arr = np.asarray(avg_feat)
+                    prev_arr = np.asarray(previous_average)
+                    if np.issubdtype(avg_arr.dtype, np.floating) or np.issubdtype(
+                        prev_arr.dtype, np.floating
+                    ):
+                        avg_feat = avg_arr.astype(float, copy=False)
+                        previous_average = prev_arr.astype(float, copy=False)
+                        avg_feat = np.where(
+                            np.isnan(avg_feat), previous_average, avg_feat
+                        )
+                        previous_average = np.where(
+                            np.isnan(previous_average), avg_feat, previous_average
+                        )
                 avg_feat = (avg_feat + previous_average) / 2
+            if avg_feat is None:
+                avg_feat = np.zeros(ids[1] - ids[0])
+            else:
+                avg_arr = np.asarray(avg_feat)
+                if np.issubdtype(avg_arr.dtype, np.floating) and np.any(np.isnan(avg_arr)):
+                    avg_feat = np.nan_to_num(avg_arr, nan=0.0)
             target_ids = target_fm[feature]
             new_feature_avg[target_ids[0] : target_ids[1]] = avg_feat
         return new_feature_avg
@@ -972,12 +1017,19 @@ class GridObjectModel(GraphObjectModel):
         Returns:
             Indices of the top k voxels with content.
         """
-        num_non_zero_voxels = len(self._observation_count.values())
+        if isinstance(self._observation_count, SparseVoxelGrid):
+            num_non_zero_voxels = self._observation_count._nnz()
+        else:
+            num_non_zero_voxels = len(self._observation_count.values())
         if num_non_zero_voxels < self._max_nodes:
             print("There are less than max_nodes voxels with content.")
             k = num_non_zero_voxels
         else:
             k = self._max_nodes
+
+        if isinstance(self._observation_count, SparseVoxelGrid):
+            return self._observation_count.top_k_indices_3d(k)
+
         _counts, top_k_indices = self._observation_count.values().topk(k)
         return self._observation_count.indices()[:3, top_k_indices]
 
@@ -1013,12 +1065,12 @@ class GridObjectModel(GraphObjectModel):
             indices_4d,
             np.array(new_values).flatten(),
             target_mat_shape,
-        ).coalesce()
+        )
         old_sparse_mat = torch.sparse_coo_tensor(
             indices_4d,
             np.array(old_values).flatten(),
             target_mat_shape,
-        ).coalesce()
+        )
         return old_sparse_mat, new_sparse_mat
 
     # ----------------------- Logging --------------------------

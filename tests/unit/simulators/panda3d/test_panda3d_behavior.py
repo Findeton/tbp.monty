@@ -19,6 +19,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import pytest
 
 from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.sensors import SensorID
@@ -32,6 +33,9 @@ except ImportError:
 from tbp.monty.simulators.panda3d.agents import Panda3DAgent
 from tbp.monty.simulators.panda3d.simulator import Panda3DSimulator
 from tbp.monty.simulators.panda3d.transforms import Panda3DDepthNormalize
+
+
+pytestmark = pytest.mark.xdist_group(name="panda3d")
 
 AGENT_ID = AgentID("test_cam")
 SENSOR_ID = "sensor_0"
@@ -200,7 +204,7 @@ class TestChangeDetectingSMWithPanda3D(unittest.TestCase):
     """Test ChangeDetectingSM detects animated object movement."""
 
     def test_static_scene_no_change(self):
-        """Static object → ChangeDetectingSM reports no change."""
+        """Static object -> ChangeDetectingSM emits a quiet low-confidence state."""
         from tbp.monty.frameworks.models.change_detecting_sm import (
             ChangeDetectingSM,
         )
@@ -221,8 +225,27 @@ class TestChangeDetectingSMWithPanda3D(unittest.TestCase):
             sm.step(None, obs1)
             state = sm.step(None, obs2)
 
-            # No motion in static scene
-            self.assertFalse(state.use_state)
+            # No motion in static scene: the current contract emits a
+            # low-confidence quiet state so the behavior stream keeps
+            # anchored absolute context across calm frames.
+            self.assertTrue(state.use_state)
+            self.assertLessEqual(state.confidence, 0.1)
+            np.testing.assert_allclose(
+                state.non_morphological_features["flow_direction"],
+                np.zeros(3),
+            )
+            np.testing.assert_allclose(
+                state.non_morphological_features["flow_magnitude"],
+                np.zeros(1),
+            )
+            np.testing.assert_allclose(
+                state.non_morphological_features["delta_rgba"],
+                np.zeros(4),
+            )
+            np.testing.assert_allclose(
+                state.non_morphological_features["delta_hsv"],
+                np.zeros(3),
+            )
         finally:
             sim.close()
 

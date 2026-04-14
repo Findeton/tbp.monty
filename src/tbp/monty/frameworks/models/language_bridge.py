@@ -32,16 +32,23 @@ Usage:
 """
 
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
+
+
+def _resolve_identity_id(identity_ref: Union[str, Mapping[str, Any]]) -> str:
+    if isinstance(identity_ref, Mapping):
+        resolved = identity_ref.get("latent_id", identity_ref.get("graph_id", "unknown"))
+        return str(resolved) if resolved is not None else "unknown"
+    return str(identity_ref)
 
 
 class LanguageBridge:
     """Maps Monty object IDs and categories to human-readable words.
 
     Attributes:
-        object_names: Maps graph_id -> human-readable object name.
+        object_names: Maps latent_id or graph_id -> human-readable object name.
         category_names: Maps category_id -> human-readable category name.
-        category_taxonomy: Maps graph_id -> category_id.
+        category_taxonomy: Maps latent_id or graph_id -> category_id.
     """
 
     def __init__(
@@ -54,23 +61,24 @@ class LanguageBridge:
         self.category_names = category_names or {}
         self.category_taxonomy = category_taxonomy or {}
 
-        # Auto-generate missing object names from graph IDs
+        # Auto-generate missing object names from identity IDs
         # e.g. "Alphabet_of_the_Magi_3" -> "Alphabet of the Magi 3"
-        for graph_id in self.category_taxonomy:
-            if graph_id not in self.object_names:
-                self.object_names[graph_id] = graph_id.replace("_", " ")
+        for identity_id in self.category_taxonomy:
+            if identity_id not in self.object_names:
+                self.object_names[identity_id] = identity_id.replace("_", " ")
 
         # Auto-generate missing category names from category IDs
         for cat_id in set(self.category_taxonomy.values()):
             if cat_id not in self.category_names:
                 self.category_names[cat_id] = cat_id.replace("_", " ")
 
-    def name_object(self, graph_id: str) -> str:
+    def name_object(self, identity_ref: Union[str, Mapping[str, Any]]) -> str:
         """T3.1: Return human-readable name for a recognized object.
 
-        Falls back to the raw graph_id if no mapping exists.
+        Falls back to the raw latent_id/graph_id if no mapping exists.
         """
-        return self.object_names.get(graph_id, graph_id)
+        identity_id = _resolve_identity_id(identity_ref)
+        return self.object_names.get(identity_id, identity_id)
 
     def name_category(
         self, evidence_per_graph: Dict[str, float]
@@ -78,7 +86,7 @@ class LanguageBridge:
         """T3.2: Aggregate evidence by category and name the winning category.
 
         Args:
-            evidence_per_graph: Maps graph_id -> max evidence for that graph.
+            evidence_per_graph: Maps latent_id or graph_id -> max evidence for that identity.
 
         Returns:
             Tuple of (category_name, total_evidence, all_category_evidence).
@@ -88,8 +96,8 @@ class LanguageBridge:
             return ("unknown", 0.0, {})
 
         cat_evidence = defaultdict(float)
-        for graph_id, ev in evidence_per_graph.items():
-            cat_id = self.category_taxonomy.get(graph_id)
+        for identity_id, ev in evidence_per_graph.items():
+            cat_id = self.category_taxonomy.get(identity_id)
             if cat_id is not None and ev > 0:
                 cat_evidence[cat_id] += ev
 
@@ -104,27 +112,28 @@ class LanguageBridge:
 
     def describe_recognition(
         self,
-        graph_id: str,
+        identity_ref: Union[str, Mapping[str, Any]],
         evidence: float,
         evidence_per_graph: Optional[Dict[str, float]] = None,
     ) -> str:
         """Produce a human-readable sentence describing what was recognized.
 
         Args:
-            graph_id: The winning graph ID from the LM.
+            identity_ref: The winning latent_id/graph_id or an LM result payload.
             evidence: The evidence score for the winning graph.
             evidence_per_graph: Optional per-graph evidence for category naming.
 
         Returns:
             A natural language description of the recognition result.
         """
-        obj_name = self.name_object(graph_id)
+        identity_id = _resolve_identity_id(identity_ref)
+        obj_name = self.name_object(identity_id)
         parts = [f'Recognized "{obj_name}" (evidence: {evidence:.1f})']
 
         if evidence_per_graph and self.category_taxonomy:
             cat_name, cat_ev, cat_evidence = self.name_category(evidence_per_graph)
             if cat_name != "unknown":
-                obj_cat = self.category_taxonomy.get(graph_id)
+                obj_cat = self.category_taxonomy.get(identity_id)
                 obj_cat_name = self.category_names.get(obj_cat, obj_cat)
                 if obj_cat_name != cat_name:
                     parts.append(

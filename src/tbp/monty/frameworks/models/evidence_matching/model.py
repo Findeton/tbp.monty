@@ -96,24 +96,59 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
         for i in range(len(self.learning_modules)):
             lm_state_votes = {}
             aggregated_ranked_hypotheses = {}
+            aggregated_active_cells = []
+            aggregated_sender_ids = set()
             if votes_per_lm[i] is not None:
                 receiving_lm_pose = votes_per_lm[i]["sensed_pose_rel_body"]
                 for j in self.lm_to_lm_vote_matrix[i]:
                     if votes_per_lm[j] is not None:
+                        sender_id = votes_per_lm[j].get("sender_id")
+                        if sender_id is not None:
+                            aggregated_sender_ids.add(str(sender_id))
+
+                        active_cells = votes_per_lm[j].get("active_cells")
+                        if active_cells is not None:
+                            active_cells_array = np.asarray(
+                                active_cells,
+                                dtype=np.float32,
+                            ).reshape(-1)
+                            if active_cells_array.size > 0:
+                                aggregated_active_cells.append(active_cells_array)
+
                         for hypothesis in votes_per_lm[j].get(
                             "ranked_hypotheses", []
                         ):
                             object_id = str(hypothesis.get("object_id", ""))
                             if not object_id:
                                 continue
+                            chart_id = hypothesis.get("chart_id")
+                            chart_id = None if chart_id is None else str(chart_id)
+                            source_rank = int(hypothesis.get("rank", 10**6))
+                            entry_key = (object_id, chart_id)
                             entry = aggregated_ranked_hypotheses.setdefault(
-                                object_id,
+                                entry_key,
                                 {
                                     "object_id": object_id,
+                                    "latent_id": str(
+                                        hypothesis.get("latent_id", object_id)
+                                    ),
+                                    "chart_id": chart_id,
                                     "probability": 0.0,
                                     "evidence": 0.0,
-                                    "source_rank": int(hypothesis.get("rank", 10**6)),
+                                    "source_rank": source_rank,
                                     "sender_ids": set(),
+                                    "behavior_label": hypothesis.get(
+                                        "behavior_label"
+                                    ),
+                                    "behavior_signature": hypothesis.get(
+                                        "behavior_signature"
+                                    ),
+                                    "appearance_signature": hypothesis.get(
+                                        "appearance_signature"
+                                    ),
+                                    "inferred_state": hypothesis.get(
+                                        "inferred_state"
+                                    ),
                                 },
                             )
                             entry["probability"] += float(
@@ -123,10 +158,20 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
                                 entry["evidence"],
                                 float(hypothesis.get("evidence", 0.0)),
                             )
-                            entry["source_rank"] = min(
-                                entry["source_rank"],
-                                int(hypothesis.get("rank", 10**6)),
-                            )
+                            if source_rank <= entry["source_rank"]:
+                                entry["source_rank"] = source_rank
+                                entry["behavior_label"] = hypothesis.get(
+                                    "behavior_label"
+                                )
+                                entry["behavior_signature"] = hypothesis.get(
+                                    "behavior_signature"
+                                )
+                                entry["appearance_signature"] = hypothesis.get(
+                                    "appearance_signature"
+                                )
+                                entry["inferred_state"] = hypothesis.get(
+                                    "inferred_state"
+                                )
                             sender_id = hypothesis.get(
                                 "sender_id",
                                 votes_per_lm[j].get("sender_id"),
@@ -183,6 +228,16 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
                                 lm_state_votes[obj] = transformed_lm_states_for_object
             logger.debug(f"VOTE from LMs {self.lm_to_lm_vote_matrix[i]} to LM {i}")
             vote = {"possible_states": lm_state_votes}
+            if aggregated_active_cells:
+                if len(aggregated_active_cells) == 1:
+                    vote["active_cells"] = aggregated_active_cells[0].copy()
+                else:
+                    vote["active_cells"] = np.mean(
+                        np.stack(aggregated_active_cells),
+                        axis=0,
+                    ).astype(np.float32)
+            if len(aggregated_sender_ids) == 1:
+                vote["sender_id"] = next(iter(aggregated_sender_ids))
             if aggregated_ranked_hypotheses:
                 ranked_hypotheses = sorted(
                     aggregated_ranked_hypotheses.values(),
@@ -190,6 +245,7 @@ class MontyForEvidenceGraphMatching(MontyForGraphMatching):
                         -float(item["probability"]),
                         int(item["source_rank"]),
                         str(item["object_id"]),
+                        "" if item.get("chart_id") is None else str(item["chart_id"]),
                     ),
                 )
                 for rank, hypothesis in enumerate(ranked_hypotheses, start=1):

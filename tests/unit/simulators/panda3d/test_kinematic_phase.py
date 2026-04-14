@@ -9,6 +9,8 @@
 from pathlib import Path
 import unittest
 
+import pytest
+
 from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.sensors import SensorID
 from tbp.monty.simulators.panda3d.agents import Panda3DAgent
@@ -25,6 +27,9 @@ try:
     import gltf  # noqa: F401
 except ImportError:
     raise unittest.SkipTest("Panda3D or panda3d-gltf not installed")
+
+
+pytestmark = pytest.mark.xdist_group(name="panda3d")
 
 
 AGENT_ID = AgentID("test_cam")

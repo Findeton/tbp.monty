@@ -15,6 +15,12 @@ from tbp.monty.frameworks.models.cortical_column_torch.experiment import (
     AxisAwareConstantSampler,
     Panda3DTorchExperiment,
 )
+from tbp.monty.frameworks.models.change_detecting_sm import ChangeDetectingSM
+from tbp.monty.frameworks.models.sensor_modules import CameraSM
+from tbp.monty.frameworks.models.predictive_hypothesis_torch import (
+    DetailAwareCameraSM,
+    DetailAwareChangeDetectingSM,
+)
 
 
 class TestPanda3DTorchExperimentInitialCamera(unittest.TestCase):
@@ -53,6 +59,65 @@ class TestPanda3DTorchExperimentInitialCamera(unittest.TestCase):
         camera_np.setPos.assert_called_once_with(1.0, -1.0, 3.0)
         camera_np.lookAt.assert_called_once()
         exp._sync_motor_state.assert_called_once_with()
+
+    def test_resolve_camera_target_center_retries_until_bounds_are_sane(self):
+        exp = Panda3DTorchExperiment.__new__(Panda3DTorchExperiment)
+
+        sim = Mock()
+        sim._objects = {"obj": Mock()}
+        sim._objects["obj"].getTightBounds.side_effect = [
+            ((0.0, -3200.0, -3200.0), (10.0, -3100.0, -3100.0)),
+            ((0.0, 1.0, 2.0), (2.0, 3.0, 4.0)),
+        ]
+        sim._render = Mock()
+
+        exp._sim = sim
+        exp._anim_obj = Mock()
+        exp._obj_id = "obj"
+        exp._object_position = (10.0, 20.0, 30.0)
+        exp._initial_distance = 3.0
+        exp._last_camera_init_debug = None
+
+        center = exp._resolve_camera_target_center(anim_name="Walk", frame=7)
+
+        self.assertEqual(center, (1.0, 2.0, 3.0))
+        self.assertEqual(exp._anim_obj.pose.call_count, 2)
+        self.assertEqual(
+            sim._render.call_count,
+            2 * Panda3DTorchExperiment._ACTOR_SYNC_RENDER_PASSES,
+        )
+        self.assertEqual(exp._last_camera_init_debug["selected_source"], "tight_bounds")
+        self.assertEqual(exp._last_camera_init_debug["selected_attempt"], 2)
+
+    def test_resolve_camera_target_center_falls_back_after_invalid_bounds(self):
+        exp = Panda3DTorchExperiment.__new__(Panda3DTorchExperiment)
+
+        sim = Mock()
+        sim._objects = {"obj": Mock()}
+        sim._objects["obj"].getTightBounds.side_effect = [
+            ((0.0, -3200.0, -3200.0), (10.0, -3100.0, -3100.0)),
+        ] * Panda3DTorchExperiment._CAMERA_BOUNDS_RETRY_ATTEMPTS
+        sim._render = Mock()
+
+        exp._sim = sim
+        exp._anim_obj = Mock()
+        exp._obj_id = "obj"
+        exp._object_position = (10.0, 20.0, 30.0)
+        exp._initial_distance = 3.0
+        exp._last_camera_init_debug = None
+
+        center = exp._resolve_camera_target_center(anim_name="Walk", frame=7)
+
+        self.assertEqual(center, (10.0, 20.0, 30.0))
+        self.assertEqual(
+            exp._last_camera_init_debug["selected_source"],
+            "object_position_fallback",
+        )
+        self.assertIsNone(exp._last_camera_init_debug["selected_attempt"])
+        self.assertEqual(
+            len(exp._last_camera_init_debug["attempts"]),
+            Panda3DTorchExperiment._CAMERA_BOUNDS_RETRY_ATTEMPTS,
+        )
 
     def test_swap_model_renders_after_loading_animated_object(self):
         exp = Panda3DTorchExperiment.__new__(Panda3DTorchExperiment)
@@ -148,6 +213,51 @@ class TestPanda3DTorchExperimentInitialCamera(unittest.TestCase):
                 (0.0, 0.0, 1.0),
                 (0.0, 0.0, -1.0),
             },
+        )
+
+    def test_track12_uses_legacy_sensor_modules_by_default(self):
+        exp = Panda3DTorchExperiment.__new__(Panda3DTorchExperiment)
+        exp._camera_features = ["pose_vectors", "on_object", "hsv"]
+        exp._flow_threshold = 1e-6
+
+        camera_sm = exp._build_camera_sensor_module()
+        change_sm = exp._build_change_sensor_module()
+
+        self.assertIsInstance(camera_sm, CameraSM)
+        self.assertIsInstance(change_sm, ChangeDetectingSM)
+
+    def test_track12_can_opt_into_detail_aware_sensor_modules(self):
+        exp = Panda3DTorchExperiment.__new__(Panda3DTorchExperiment)
+        exp._camera_features = ["pose_vectors", "on_object", "hsv"]
+        exp._flow_threshold = 1e-6
+        exp._use_detail_aware_sensors = True
+
+        camera_sm = exp._build_camera_sensor_module()
+        change_sm = exp._build_change_sensor_module()
+
+        self.assertIsInstance(camera_sm, DetailAwareCameraSM)
+        self.assertIsInstance(change_sm, DetailAwareChangeDetectingSM)
+        self.assertEqual(camera_sm._detail_grid_shape, (5, 5))
+        self.assertEqual(change_sm._detail_grid_shape, (5, 5))
+        self.assertFalse(camera_sm._include_world_pose)
+        self.assertFalse(change_sm._include_world_pose)
+
+    def test_track12_detail_aware_encoder_uses_sensor_frame_location(self):
+        exp = Panda3DTorchExperiment.__new__(Panda3DTorchExperiment)
+        exp._use_detail_aware_sensors = True
+
+        lm = exp._build_learning_module(
+            learning_module_id="lm_0",
+            column_kwargs={"n_minicolumns": 64, "sparsity": 0.1, "seed": 42},
+            lm_kwargs={},
+        )
+
+        self.assertEqual(
+            lm._column._encoder._observation_packet_location_mode,
+            "sensor_frame_centroid",
+        )
+        self.assertTrue(
+            lm._column._encoder._ignore_pose_vectors_for_observation_packets
         )
 
     def test_setup_hierarchical_applies_child_specific_column_kwargs(self):

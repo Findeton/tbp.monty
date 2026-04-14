@@ -10,6 +10,7 @@
 
 import copy
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -18,6 +19,11 @@ from tbp.monty.frameworks.models.object_model import (
     GraphObjectModel,
     GridObjectModel,
     GridTooSmallError,
+)
+from tbp.monty.frameworks.utils.object_model_utils import (
+    SparseVoxelGrid,
+    increment_sparse_tensor_by_count,
+    replace_sparse_tensor_entries,
 )
 from tbp.monty.frameworks.utils.spatial_arithmetics import check_orthonormal
 
@@ -89,6 +95,101 @@ class ObjectModelTest(unittest.TestCase):
             self.assertIn(
                 feature, model.feature_mapping.keys(), f"{feature} not stored in model."
             )
+
+    def test_sparse_voxel_grid_helpers_avoid_native_sparse_constructor(self):
+        count_grid = SparseVoxelGrid((5, 5, 5, 1))
+        feature_grid = SparseVoxelGrid((5, 5, 5, 2))
+
+        with patch(
+            "tbp.monty.frameworks.utils.object_model_utils.torch.sparse_coo_tensor",
+            side_effect=AssertionError(
+                "GridObjectModel should not rebuild 4D torch sparse COO tensors"
+            ),
+        ):
+            count_grid = increment_sparse_tensor_by_count(
+                count_grid,
+                np.array([[1, 2, 3], [1, 2, 3], [2, 2, 3]]),
+            )
+            feature_grid = replace_sparse_tensor_entries(
+                feature_grid,
+                np.array(
+                    [
+                        [1, 1, 2, 2],
+                        [2, 2, 2, 2],
+                        [3, 3, 3, 3],
+                        [0, 1, 0, 1],
+                    ]
+                ),
+                np.array([0.25, 0.75, 0.5, 0.5], dtype=np.float32),
+            )
+
+        self.assertIsInstance(count_grid, SparseVoxelGrid)
+        self.assertIsInstance(feature_grid, SparseVoxelGrid)
+        self.assertEqual(float(count_grid[1, 2, 3, 0]), 2.0)
+        self.assertEqual(float(count_grid[2, 2, 3, 0]), 1.0)
+        np.testing.assert_allclose(
+            feature_grid.rows_for_indices_3d(np.array([[1, 2, 3], [2, 2, 3]])),
+            np.array([[0.25, 0.75], [0.5, 0.5]]),
+        )
+
+    def test_grid_object_model_uses_sparse_voxel_grid_through_updates(self):
+        model = GridObjectModel(
+            "test_model", max_nodes=10, max_size=10, num_voxels_per_dim=5
+        )
+        base_pose = self.dummy_pv.flatten()
+        build_locations = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])
+        increment_calls = []
+        replace_calls = []
+
+        def checked_increment(old_tensor, indices):
+            self.assertIsInstance(old_tensor, SparseVoxelGrid)
+            increment_calls.append(len(indices))
+            return increment_sparse_tensor_by_count(old_tensor, indices)
+
+        def checked_replace(old_tensor, indices, values):
+            self.assertIsInstance(old_tensor, SparseVoxelGrid)
+            replace_calls.append(len(values))
+            return replace_sparse_tensor_entries(old_tensor, indices, values)
+
+        with patch(
+            "tbp.monty.frameworks.models.object_model.increment_sparse_tensor_by_count",
+            side_effect=checked_increment,
+        ), patch(
+            "tbp.monty.frameworks.models.object_model.replace_sparse_tensor_entries",
+            side_effect=checked_replace,
+        ):
+            model.build_model(
+                build_locations,
+                {
+                    "pose_vectors": np.array([base_pose, base_pose]),
+                    "pose_fully_defined": np.array([True, True]),
+                    "object_id": np.array(
+                        [[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]]
+                    ),
+                },
+            )
+            model.update_model(
+                locations=np.array([[0.0, 0.0, 0.0]]),
+                features={
+                    "pose_vectors": np.array([base_pose]),
+                    "pose_fully_defined": np.array([True]),
+                    "object_id": np.array([[1.0, 0.0, 1.0, 0.0]]),
+                    "object_support": np.array([[0.7, 0.3, 0.0, 0.0]]),
+                },
+                location_rel_model=np.array([0.0, 0.0, 0.0]),
+                object_location_rel_body=np.array([0.0, 0.0, 0.0]),
+                object_rotation=Rotation.identity(),
+            )
+
+        self.assertEqual(len(increment_calls), 2)
+        self.assertEqual(len(replace_calls), 4)
+        self.assertIsInstance(model._observation_count, SparseVoxelGrid)
+        self.assertIsInstance(model._feature_grid, SparseVoxelGrid)
+        self.assertIsInstance(model._location_grid, SparseVoxelGrid)
+        np.testing.assert_allclose(
+            model.get_values_for_feature("object_support")[0],
+            np.array([0.7, 0.3, 0.0, 0.0]),
+        )
 
     def test_apply_delta_thresholds_correctly(self):
         # Test distance.
@@ -208,11 +309,13 @@ class ObjectModelTest(unittest.TestCase):
             "Average of pose_fully_defined should be True (majority vote).",
         )
         avg_hsv = model.get_values_for_feature("hsv")[0]
-        self.assertListEqual(
-            list(avg_hsv),
-            [0.95, 1, 1],
-            "hsv not averaged correctly. "
-            "(keep in mind we want the circular average where 0==1).",
+        np.testing.assert_allclose(
+            avg_hsv,
+            np.array([0.95, 1.0, 1.0]),
+            err_msg=(
+                "hsv not averaged correctly. "
+                "(keep in mind we want the circular average where 0==1)."
+            ),
         )
         self.assertEqual(
             model.get_values_for_feature("curvature")[0],

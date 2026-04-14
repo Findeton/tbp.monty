@@ -64,9 +64,9 @@ class NamingLogger(BaseMontyLogger):
 
         Args:
             handlers: List of output handlers (passed to BaseMontyLogger).
-            object_names: Maps graph_id -> human-readable object name.
+            object_names: Maps latent_id or graph_id -> human-readable object name.
             category_names: Maps category_id -> human-readable category name.
-            category_taxonomy: Maps graph_id -> category_id.
+            category_taxonomy: Maps latent_id or graph_id -> category_id.
             print_output: Whether to print results to stdout.
         """
         super().__init__(handlers)
@@ -85,7 +85,8 @@ class NamingLogger(BaseMontyLogger):
 
         for i, lm in enumerate(model.learning_modules):
             mlh = lm.get_current_mlh()
-            graph_id = mlh.get("graph_id", "unknown")
+            latent_id = mlh.get("latent_id", mlh.get("graph_id", "unknown"))
+            graph_id = mlh.get("graph_id", latent_id)
             evidence = mlh.get("evidence", 0.0)
 
             # Get per-graph evidence for category naming (T3.2)
@@ -102,7 +103,7 @@ class NamingLogger(BaseMontyLogger):
                     pass
 
             # T3.1: Object naming
-            obj_name = self.bridge.name_object(graph_id)
+            obj_name = self.bridge.name_object(mlh)
 
             # T3.2: Category naming
             cat_name, cat_ev, cat_evidence = self.bridge.name_category(
@@ -111,11 +112,12 @@ class NamingLogger(BaseMontyLogger):
 
             # Full description
             description = self.bridge.describe_recognition(
-                graph_id, evidence, evidence_per_graph
+                mlh, evidence, evidence_per_graph
             )
 
             result = {
                 "lm_id": f"LM_{i}",
+                "latent_id": latent_id,
                 "graph_id": graph_id,
                 "object_name": obj_name,
                 "evidence": float(evidence),

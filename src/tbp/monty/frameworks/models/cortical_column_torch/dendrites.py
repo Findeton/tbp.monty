@@ -4,17 +4,19 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
-"""Sparse dendritic segments as sparse matrix operations.
+"""Sparse dendritic segments with a cached connected-synapse table.
 
-Reformulates dendritic prediction as sparse matmul for GPU efficiency:
+Track 14 originally expressed dendritic prediction as sparse COO matmul,
+but torch 1.13.1 on this macOS runtime can segfault while constructing CPU
+sparse tensors after online segment growth. The cache below keeps the same
+segment semantics using padded source/permanence tables:
 
-    seg_overlap = D @ x               (total_segments,)
+    seg_overlap = sum(x[source] * permanence)   (total_segments,)
     seg_active  = sigmoid((overlap - threshold) / temp)
     cell_depol  = scatter_max(seg_active, seg_to_cell)  (n_cells,)
 
-The connectivity matrix D is a sparse COO tensor of shape
-(total_segments, n_cells) with permanence values. It is rebuilt lazily
-after mutations (grow, learn, prune) and cached for fast prediction.
+The cache is rebuilt lazily after mutations (grow, learn, prune) and keeps
+the hot path vectorized on both CPU and CUDA without relying on sparse COO.
 """
 
 from __future__ import annotations
@@ -23,11 +25,11 @@ import torch
 
 
 class SparseDendrites:
-    """Dendritic segments implemented as sparse matrix operations.
+    """Dendritic segments implemented with a cached connected-synapse table.
 
     Each cell can have multiple segments. Each segment connects to a subset
-    of cells via synapses with permanence values. Prediction = sparse matmul
-    of the connectivity matrix with the current activation pattern.
+    of cells via synapses with permanence values. Prediction = weighted
+    source gather followed by a per-cell max across segments.
 
     Parameters
     ----------
@@ -90,8 +92,10 @@ class SparseDendrites:
             n_cells, dtype=torch.int32, device="cpu"
         )
 
-        # Cached sparse tensors for fast prediction — rebuilt lazily
-        self._D: torch.Tensor | None = None   # sparse COO (n_seg, n_cells)
+        # Cached connected-synapse tables for fast prediction — rebuilt lazily.
+        self._D: torch.Tensor | None = None
+        self._segment_sources: torch.Tensor | None = None
+        self._segment_permanences: torch.Tensor | None = None
         self._seg_to_cell: torch.Tensor | None = None  # (n_seg,)
         self._dirty = True
 
@@ -100,66 +104,65 @@ class SparseDendrites:
         return len(self._segments)
 
     def _invalidate_cache(self) -> None:
-        """Mark the sparse tensor cache as stale after a mutation."""
+        """Mark the connected-synapse cache as stale after a mutation."""
         self._dirty = True
 
     def _rebuild_sparse(self) -> None:
-        """Rebuild the sparse connectivity matrix D from raw segments.
+        """Rebuild the connected-synapse cache from raw segments.
 
-        D is a sparse COO tensor of shape (total_segments, n_cells).
         Only synapses with permanence >= connected_threshold are included,
-        mirroring biological synapse maturation.
+        mirroring biological synapse maturation. The historical method name
+        stays in place because callers already use it during cache rebuilds.
         """
         if not self._dirty:
             return
 
         if not self._segments:
             self._D = None
+            self._segment_sources = None
+            self._segment_permanences = None
             self._seg_to_cell = None
             self._dirty = False
             return
 
-        rows: list[int] = []
-        cols: list[int] = []
-        vals: list[float] = []
+        n_seg = len(self._segments)
+        self._segment_sources = torch.zeros(
+            (n_seg, self.max_synapses_per_segment),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._segment_permanences = torch.zeros(
+            (n_seg, self.max_synapses_per_segment),
+            dtype=torch.float32,
+            device=self.device,
+        )
         seg_to_cell: list[int] = []
 
         for seg_idx, (parent_cell, synapses) in enumerate(self._segments):
             seg_to_cell.append(parent_cell)
-            for src, perm in synapses.items():
-                if perm >= self.connected_threshold:
-                    rows.append(seg_idx)
-                    cols.append(src)
-                    vals.append(perm)
+            connected_synapses = [
+                (src, perm)
+                for src, perm in synapses.items()
+                if perm >= self.connected_threshold
+            ]
+            if not connected_synapses:
+                continue
 
-        n_seg = len(self._segments)
-
-        if rows:
-            indices = torch.tensor(
-                [rows, cols], dtype=torch.long, device=self.device,
-            )
-            values = torch.tensor(vals, dtype=torch.float32, device=self.device)
-            self._D = torch.sparse_coo_tensor(
-                indices, values, (n_seg, self.n_cells), device=self.device,
-            ).coalesce()
-        else:
-            # All permanences below threshold — empty connectivity
-            self._D = torch.sparse_coo_tensor(
-                torch.zeros(2, 0, dtype=torch.long, device=self.device),
-                torch.zeros(0, dtype=torch.float32, device=self.device),
-                (n_seg, self.n_cells), device=self.device,
-            )
+            for synapse_index, (src, perm) in enumerate(connected_synapses):
+                self._segment_sources[seg_idx, synapse_index] = int(src)
+                self._segment_permanences[seg_idx, synapse_index] = float(perm)
 
         self._seg_to_cell = torch.tensor(
             seg_to_cell, dtype=torch.long, device=self.device,
         )
+        self._D = None
         self._dirty = False
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute graded depolarization for each cell via sparse matmul.
+        """Compute graded depolarization for each cell via cached gathers.
 
         Pipeline:
-            seg_overlap = D @ x               (total_segments,)
+            seg_overlap = sum(x[source] * permanence)   (total_segments,)
             seg_active  = sigmoid((overlap - threshold) / temp)
             cell_depol  = scatter_max(seg_active, seg_to_cell)  (n_cells,)
 
@@ -181,8 +184,14 @@ class SparseDendrites:
 
         x_dev = x.to(self.device)
 
-        # Sparse matmul: D @ x → (total_segments,)
-        seg_overlap = torch.mv(self._D, x_dev)
+        source_activations = x_dev.index_select(
+            0,
+            self._segment_sources.reshape(-1),
+        ).reshape_as(self._segment_sources)
+        seg_overlap = torch.sum(
+            source_activations * self._segment_permanences,
+            dim=1,
+        )
 
         # Graded sigmoid activation (not binary)
         seg_active = torch.sigmoid(

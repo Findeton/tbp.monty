@@ -32,6 +32,130 @@ class NumpyGraph:
             setattr(self, key, my_dict[key])
 
 
+class SparseVoxelGrid:
+    """Minimal sparse-grid wrapper used by object-model voxel aggregation.
+
+    GridObjectModel only needs a small subset of tensor-like sparse operations.
+    The original implementation stored these voxel grids as 4D torch sparse COO
+    tensors with a dense last dimension. On our macOS / torch 1.13.1 runtime,
+    reconstructing those 4D sparse tensors can segfault in native code during
+    normal object-model updates. This mapping-backed wrapper avoids that unstable
+    sparse-constructor path while keeping the rest of the object-model logic mostly
+    unchanged.
+    """
+
+    def __init__(self, shape, dtype=torch.float32, device="cpu", entries=None):
+        self.shape = tuple(int(dim) for dim in shape)
+        self.dtype = dtype
+        self.device = torch.device(device)
+        self._entries = dict(entries or {})
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def _sorted_keys(self):
+        return sorted(self._entries.keys())
+
+    def _indices(self):
+        if len(self._entries) == 0:
+            return torch.zeros(
+                (len(self.shape), 0),
+                dtype=torch.long,
+                device=self.device,
+            )
+        return torch.as_tensor(
+            np.array(self._sorted_keys(), dtype=np.int64).T,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    def indices(self):
+        return self._indices()
+
+    def _values(self):
+        if len(self._entries) == 0:
+            return torch.zeros((0,), dtype=self.dtype, device=self.device)
+        return torch.as_tensor(
+            [self._entries[key] for key in self._sorted_keys()],
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def values(self):
+        return self._values()
+
+    def _nnz(self):
+        return len(self._entries)
+
+    def rows_for_indices_3d(self, indices_3d):
+        indices_3d = np.asarray(indices_3d, dtype=np.int64)
+        if indices_3d.size == 0:
+            return np.zeros((0, self.shape[-1]), dtype=np.float32)
+
+        rows = np.zeros((indices_3d.shape[0], self.shape[-1]), dtype=np.float32)
+        for row_id, index_3d in enumerate(indices_3d):
+            index_prefix = tuple(int(item) for item in index_3d)
+            for feature_idx in range(self.shape[-1]):
+                rows[row_id, feature_idx] = self._entries.get(
+                    index_prefix + (feature_idx,),
+                    0.0,
+                )
+        return rows
+
+    def top_k_indices_3d(self, k):
+        if k <= 0 or len(self._entries) == 0:
+            return np.zeros((0, 3), dtype=np.int64)
+
+        counts_by_voxel = {}
+        for index, value in self._entries.items():
+            counts_by_voxel[index[:3]] = counts_by_voxel.get(index[:3], 0.0) + value
+
+        sorted_voxels = sorted(
+            counts_by_voxel.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        top_voxels = [voxel for voxel, _count in sorted_voxels[:k]]
+        return np.asarray(top_voxels, dtype=np.int64)
+
+    def to_dense(self):
+        dense = torch.zeros(self.shape, dtype=self.dtype, device=self.device)
+        for index, value in self._entries.items():
+            dense[index] = value
+        return dense
+
+    def coalesce(self):
+        return self
+
+    def with_shape(self, new_shape):
+        clipped_entries = {}
+        for index, value in self._entries.items():
+            if index[-1] < new_shape[-1]:
+                clipped_entries[index] = value
+        return SparseVoxelGrid(
+            new_shape,
+            dtype=self.dtype,
+            device=self.device,
+            entries=clipped_entries,
+        )
+
+    def __getitem__(self, item):
+        if not isinstance(item, tuple):
+            item = (item,)
+        key = []
+        for part in item:
+            if torch.is_tensor(part):
+                key.append(int(part.item()))
+            else:
+                key.append(int(part))
+        return torch.as_tensor(
+            self._entries.get(tuple(key), 0.0),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+
 def torch_graph_to_numpy(torch_graph):
     """Turn a torch geometric data structure into a dict with numpy arrays.
 
@@ -219,6 +343,49 @@ def remove_close_points(point_cloud, features, graph_delta_thresholds, old_graph
 
 
 def increment_sparse_tensor_by_count(old_tensor, indices):
+    """Increment per-voxel counts without relying on 4D sparse COO arithmetic.
+
+    The object-model count grid is logically 3D with a dense singleton last
+    dimension. Reconstructing those 4D sparse tensors via
+    torch.sparse_coo_tensor(...) has been observed to segfault on the supported
+    macOS / torch 1.13.1 runtime, so GridObjectModel uses SparseVoxelGrid and
+    this helper rebuilds counts from Python data instead.
+    """
+
+    def _build_sparse_tensor_from_map(index_value_map):
+        if isinstance(old_tensor, SparseVoxelGrid):
+            return SparseVoxelGrid(
+                old_tensor.shape,
+                dtype=old_tensor.dtype,
+                device=old_tensor.device,
+                entries=index_value_map,
+            )
+        if len(index_value_map) == 0:
+            return torch.sparse_coo_tensor(
+                torch.zeros((len(old_tensor.shape), 0), dtype=torch.long),
+                torch.zeros((0,), dtype=old_tensor.dtype),
+                size=old_tensor.shape,
+                device=old_tensor.device,
+            )
+
+        sorted_indices = sorted(index_value_map.keys())
+        new_indices = torch.as_tensor(
+            np.array(sorted_indices, dtype=np.int64).T,
+            dtype=torch.long,
+            device=old_tensor.device,
+        )
+        new_values = torch.as_tensor(
+            [index_value_map[index] for index in sorted_indices],
+            dtype=old_tensor.dtype,
+            device=old_tensor.device,
+        )
+        return torch.sparse_coo_tensor(
+            new_indices,
+            new_values,
+            old_tensor.shape,
+            device=old_tensor.device,
+        )
+
     # If an index is in indices multiple times, it will be counted multiple times
     unique_indices, counts = np.unique(indices, axis=0, return_counts=True)
     # If indices don't have dimensionality of grid, add column of zeros.
@@ -227,18 +394,87 @@ def increment_sparse_tensor_by_count(old_tensor, indices):
     if unique_indices.shape[-1] != old_tensor.ndim:
         zeros_column = np.zeros((unique_indices.shape[0], 1))
         unique_indices = np.hstack((unique_indices, zeros_column))
-    # Build a new sparse tensor with the new indices and values
-    new_indices = torch.tensor(unique_indices.T, dtype=torch.long)
-    new_values = torch.tensor(counts, dtype=torch.int64)
-    # Return coalesced tensor (make representation more efficient)
-    # Mostly removes duplicate entries which we should never have here but also allows
-    # us to call .indices() instead of needing to use ._indices(). May remove this
-    # if time overhead is too high but is pretty small atm (5.1e-5s).
-    new_sparse_tensor = torch.sparse_coo_tensor(
-        new_indices, new_values, old_tensor.shape
-    ).coalesce()
-    # Add the new sparse tensor to the old one
-    return old_tensor + new_sparse_tensor
+    if counts.size == 0:
+        return old_tensor
+
+    merged_values_by_index = {}
+    for index, value in zip(
+        old_tensor._indices().t().cpu().tolist(),
+        old_tensor._values().cpu().tolist(),
+    ):
+        key = tuple(index)
+        merged_values_by_index[key] = merged_values_by_index.get(key, 0.0) + value
+
+    for index, value in zip(unique_indices.tolist(), counts.tolist()):
+        key = tuple(int(item) for item in index)
+        merged_values_by_index[key] = merged_values_by_index.get(key, 0.0) + value
+
+    return _build_sparse_tensor_from_map(merged_values_by_index)
+
+
+def replace_sparse_tensor_entries(old_tensor, indices, values):
+    """Return a sparse tensor with specific entries replaced.
+
+    This avoids sparse addition/subtraction and sparse_coo_tensor reconstruction on
+    4D COO tensors, which can segfault in native torch code on the supported object-
+    model runtime. Instead we rebuild a single unique sparse tensor with the
+    replacement values.
+    """
+    target_indices = np.asarray(indices, dtype=np.int64).T.tolist()
+    target_values = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+
+    if len(target_values) == 0:
+        return old_tensor
+
+    merged_values_by_index = {}
+    for index, value in zip(
+        old_tensor._indices().t().cpu().tolist(),
+        old_tensor._values().cpu().tolist(),
+    ):
+        merged_values_by_index[tuple(index)] = value
+
+    for index, value in zip(target_indices, target_values):
+        merged_values_by_index[tuple(int(item) for item in index)] = value
+
+    if len(merged_values_by_index) == 0:
+        if isinstance(old_tensor, SparseVoxelGrid):
+            return SparseVoxelGrid(
+                old_tensor.shape,
+                dtype=old_tensor.dtype,
+                device=old_tensor.device,
+            )
+        return torch.sparse_coo_tensor(
+            torch.zeros((len(old_tensor.shape), 0), dtype=torch.long),
+            torch.zeros((0,), dtype=old_tensor.dtype),
+            size=old_tensor.shape,
+            device=old_tensor.device,
+        )
+
+    if isinstance(old_tensor, SparseVoxelGrid):
+        return SparseVoxelGrid(
+            old_tensor.shape,
+            dtype=old_tensor.dtype,
+            device=old_tensor.device,
+            entries=merged_values_by_index,
+        )
+
+    sorted_indices = sorted(merged_values_by_index.keys())
+    merged_indices = torch.as_tensor(
+        np.array(sorted_indices, dtype=np.int64).T,
+        dtype=torch.long,
+        device=old_tensor.device,
+    )
+    merged_values = torch.as_tensor(
+        [merged_values_by_index[index] for index in sorted_indices],
+        dtype=old_tensor.dtype,
+        device=old_tensor.device,
+    )
+    return torch.sparse_coo_tensor(
+        merged_indices,
+        merged_values,
+        old_tensor.shape,
+        device=old_tensor.device,
+    )
 
 
 def get_values_from_dense_last_dim(tensor, index_3d):

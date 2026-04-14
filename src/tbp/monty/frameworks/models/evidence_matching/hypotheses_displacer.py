@@ -316,14 +316,24 @@ class DefaultHypothesesDisplacer:
         )
         if self.max_nneighbors == 1:
             nearest_node_ids = np.expand_dims(nearest_node_ids, axis=1)
+        nearest_node_ids = np.asarray(nearest_node_ids, dtype=int)
 
-        nearest_node_locs = self.graph_memory.get_locations_in_graph(
+        all_node_locs = self.graph_memory.get_locations_in_graph(
             graph_id, input_channel, state_id=state_id
         ) if hasattr(self.graph_memory, "get_channel_model") and state_id is not None \
             else self.graph_memory.get_locations_in_graph(
                 graph_id, input_channel
             )
-        nearest_node_locs = nearest_node_locs[nearest_node_ids]
+        if len(all_node_locs) == 0:
+            return np.full(search_locations.shape[0], -1.0, dtype=float)
+
+        invalid_neighbor_mask = np.logical_or(
+            nearest_node_ids < 0,
+            nearest_node_ids >= len(all_node_locs),
+        )
+        safe_nearest_node_ids = nearest_node_ids.copy()
+        safe_nearest_node_ids[invalid_neighbor_mask] = 0
+        nearest_node_locs = all_node_locs[safe_nearest_node_ids]
         max_abs_curvature = get_relevant_curvature(channel_features)
         custom_nearest_node_dists = get_custom_distances(
             nearest_node_locs,
@@ -337,6 +347,7 @@ class DefaultHypothesesDisplacer:
         )
         # Get IDs where custom_nearest_node_dists > max_match_distance
         mask = node_distance_weights <= 0
+        mask = np.logical_or(mask, invalid_neighbor_mask)
 
         # Get pose features — use state-specific methods if available
         if state_id is not None and hasattr(
@@ -345,7 +356,7 @@ class DefaultHypothesesDisplacer:
             new_pos_features = self.graph_memory.get_features_at_node(
                 graph_id,
                 input_channel,
-                nearest_node_ids,
+                safe_nearest_node_ids,
                 feature_keys=["pose_vectors", "pose_fully_defined"],
                 state_id=state_id,
             )
@@ -353,7 +364,7 @@ class DefaultHypothesesDisplacer:
             new_pos_features = self.graph_memory.get_features_at_node(
                 graph_id,
                 input_channel,
-                nearest_node_ids,
+                safe_nearest_node_ids,
                 feature_keys=["pose_vectors", "pose_fully_defined"],
             )
         # Calculate the pose error for each hypothesis
@@ -399,7 +410,9 @@ class DefaultHypothesesDisplacer:
                 channel_tolerances=self.tolerances[input_channel],
                 input_channel=input_channel,
             )
-            hypothesis_radius_feature_evidence = node_feature_evidence[nearest_node_ids]
+            hypothesis_radius_feature_evidence = node_feature_evidence[
+                safe_nearest_node_ids
+            ]
             # Set feature evidence of nearest neighbors that are too far away to 0
             hypothesis_radius_feature_evidence[mask] = 0
             # Take the maximum feature evidence out of the nearest neighbors in the

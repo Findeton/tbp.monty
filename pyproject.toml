@@ -136,7 +136,7 @@ ipython = 'IPython'
 
 [tool.pytest.ini_options]
 minversion = '6.0'
-addopts = '-ra -n auto'
+addopts = '-ra -n auto --dist loadgroup'
 testpaths = [
     'tests/conf',
     'tests/unit',

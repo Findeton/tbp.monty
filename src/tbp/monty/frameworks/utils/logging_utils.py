@@ -747,8 +747,8 @@ def get_stats_per_lm(model, target, episode_seed: int):
     performance_dict = {}
     primary_target_dict = target_data_to_dict(target)
     for i, lm in enumerate(model.learning_modules):
-        # Skip LMs without evidence-based matching (e.g., HippocampalModule)
-        if not hasattr(lm, "evidence"):
+        # Skip non-graph modules that do not expose graph-matching episode state.
+        if not hasattr(lm, "graph_id_to_target") or not hasattr(lm, "detected_pose"):
             continue
         lm_stats = get_graph_lm_episode_stats(lm)
         if hasattr(lm, "evidence"):

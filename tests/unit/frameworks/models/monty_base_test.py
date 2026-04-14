@@ -113,3 +113,13 @@ class MontyBasePrivateTest(unittest.TestCase):
             }
         )
         self.assertEqual(set(self.monty_base.gsg_outputs), expected)
+
+    def test_pre_episode_resets_motor_system_before_modules(self) -> None:
+        self.monty_base.pre_episode()
+
+        self.motor_system.pre_episode.assert_called_once_with()
+        self.lm1.pre_episode.assert_called_once_with()
+        self.lm2.pre_episode.assert_called_once_with()
+        self.lm3.pre_episode.assert_called_once_with()
+        self.sm1.pre_episode.assert_called_once_with()
+        self.sm2.pre_episode.assert_called_once_with()

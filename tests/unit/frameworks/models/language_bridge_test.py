@@ -38,6 +38,29 @@ class TestObjectNaming(unittest.TestCase):
         bridge = LanguageBridge()
         self.assertEqual(bridge.name_object("anything"), "anything")
 
+    def test_name_object_prefers_latent_id_from_payload(self):
+        bridge = LanguageBridge(
+            object_names={
+                "latent_object_7": "latent fox",
+                "fox_graph": "legacy fox",
+            }
+        )
+
+        self.assertEqual(
+            bridge.name_object(
+                {"latent_id": "latent_object_7", "graph_id": "fox_graph"}
+            ),
+            "latent fox",
+        )
+
+    def test_name_object_payload_falls_back_to_graph_id(self):
+        bridge = LanguageBridge(object_names={"fox_graph": "legacy fox"})
+
+        self.assertEqual(
+            bridge.name_object({"graph_id": "fox_graph"}),
+            "legacy fox",
+        )
+
 
 class TestCategoryNaming(unittest.TestCase):
     """T3.2: Category naming tests."""
@@ -109,6 +132,22 @@ class TestDescribeRecognition(unittest.TestCase):
         desc = self.bridge.describe_recognition("fork_2", 1.0, evidence)
         self.assertIn("cups", desc)  # category winner
         self.assertIn("utensil", desc)  # instance category
+
+    def test_description_accepts_identity_payload(self):
+        bridge = LanguageBridge(
+            object_names={"latent_object_2": "latent mug"},
+            category_names={"cup": "cups"},
+            category_taxonomy={"latent_object_2": "cup"},
+        )
+
+        desc = bridge.describe_recognition(
+            {"latent_id": "latent_object_2", "graph_id": "mug_1"},
+            4.5,
+            {"latent_object_2": 4.5},
+        )
+
+        self.assertIn("latent mug", desc)
+        self.assertIn("cups", desc)
 
 
 class TestOmniglotNaming(unittest.TestCase):

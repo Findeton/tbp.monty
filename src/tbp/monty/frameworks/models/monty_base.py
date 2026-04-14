@@ -388,6 +388,8 @@ class MontyBase(Monty):
         self._is_done = False
         self.reset_episode_steps()
         self.switch_to_matching_step()
+        if self.motor_system is not None and hasattr(self.motor_system, "pre_episode"):
+            self.motor_system.pre_episode()
         for lm in self.learning_modules:
             lm.pre_episode()
 

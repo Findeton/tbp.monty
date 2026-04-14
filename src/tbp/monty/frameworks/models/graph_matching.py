@@ -123,6 +123,9 @@ class MontyForGraphMatching(MontyBase):
         self.primary_target = primary_target
         self.semantic_id_to_label = semantic_id_to_label
 
+        if self.motor_system is not None and hasattr(self.motor_system, "pre_episode"):
+            self.motor_system.pre_episode()
+
         for lm in self.learning_modules:
             lm.pre_episode(primary_target)
 
@@ -352,15 +355,17 @@ class MontyForGraphMatching(MontyBase):
                 )
 
         # After all LMs have stepped, dispatch context signals from any
-        # HippocampalModule (or any LM with get_context_signal) to all others.
+        # LM with get_context_signal(). Predictive Track 14 LMs can opt into
+        # targeted routing via signal metadata; legacy users still broadcast.
         self._dispatch_context_signals()
 
     def _dispatch_context_signals(self):
-        """Broadcast context signals from hippocampal/top-level LMs downward.
+        """Dispatch context signals using optional per-signal routing metadata.
 
         Any LM that implements ``get_context_signal()`` and returns a non-None
-        dict will have its signal broadcast to all other LMs via their
-        ``receive_context()`` method.
+        dict can either broadcast to all other LMs (legacy behavior), skip
+        automatic dispatch, or target a specific set of receiver IDs via the
+        ``routing_scope`` and ``target_sender_ids`` fields.
         """
         for i, lm in enumerate(self.learning_modules):
             if not hasattr(lm, "get_context_signal"):
@@ -368,6 +373,55 @@ class MontyForGraphMatching(MontyBase):
             signal = lm.get_context_signal()
             if signal is None:
                 continue
+
+            routing_scope = None
+            target_sender_ids = set()
+            if isinstance(signal, dict):
+                routing_scope = signal.get("routing_scope")
+                target_sender_ids = {
+                    str(item)
+                    for item in (signal.get("target_sender_ids") or [])
+                    if item is not None
+                }
+
+            if routing_scope == "none":
+                continue
+
+            if routing_scope == "targeted":
+                if not target_sender_ids:
+                    continue
+                for j, target_lm in enumerate(self.learning_modules):
+                    if j == i:
+                        continue
+                    if getattr(target_lm, "learning_module_id", None) in target_sender_ids:
+                        target_lm.receive_context(**signal)
+                continue
+
+            if routing_scope == "lateral_vote_peers":
+                vote_matrix = getattr(self, "lm_to_lm_vote_matrix", [])
+                for j, target_lm in enumerate(self.learning_modules):
+                    if j == i:
+                        continue
+                    target_receivers = vote_matrix[j] if j < len(vote_matrix) else []
+                    if i in target_receivers:
+                        target_lm.receive_context(**signal)
+                continue
+
+            if routing_scope == "graph_neighbors":
+                target_indices = set()
+                vote_matrix = getattr(self, "lm_to_lm_vote_matrix", [])
+                lm_matrix = getattr(self, "lm_to_lm_matrix", [])
+                for j in range(len(self.learning_modules)):
+                    if j == i:
+                        continue
+                    lateral_sources = vote_matrix[j] if j < len(vote_matrix) else []
+                    upstream_sources = lm_matrix[j] if j < len(lm_matrix) else []
+                    if i in lateral_sources or i in upstream_sources:
+                        target_indices.add(j)
+                for j in sorted(target_indices):
+                    self.learning_modules[j].receive_context(**signal)
+                continue
+
             # Broadcast to all other LMs
             for j, target_lm in enumerate(self.learning_modules):
                 if j != i:

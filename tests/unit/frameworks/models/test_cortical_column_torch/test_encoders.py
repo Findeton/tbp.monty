@@ -184,6 +184,148 @@ class TestTorchFeatureEncoder(unittest.TestCase):
 
         np.testing.assert_allclose(result[: len(expected)], expected, atol=1e-6)
 
+    def test_extract_features_prefers_structured_visual_packet(self):
+        class MockState:
+            location = [1.0, 2.0, 3.0]
+            use_state = True
+            sender_type = "SM"
+            morphological_features = {"pose_vectors": np.eye(3)}
+            non_morphological_features = {
+                "hsv": [0.1, 0.2, 0.3],
+                "observation_packet_v2": {
+                    "packet_type": "visual_observation_packet_v2",
+                    "frame_support_mean": 0.75,
+                    "cells": [
+                        {
+                            "rgb_patch": np.full((2, 2, 3), [0.75, 0.25, 0.5]),
+                            "sensor_frame_patch": np.full((2, 2, 3), [0.0, 0.0, 0.3]),
+                        }
+                    ],
+                },
+            }
+
+        result = TorchFeatureEncoder._extract_features(MockState())
+        expected = [
+            0.1,
+            0.2,
+            0.3,
+            1.0,
+            0.0,
+            0.0,
+            -0.144,
+            0.5,
+            0.0,
+            0.0,
+        ]
+
+        np.testing.assert_allclose(result[: len(expected)], expected, atol=1e-4)
+
+    def test_extract_features_emphasizes_temporal_change_packet(self):
+        class MockState:
+            location = [1.0, 2.0, 3.0]
+            use_state = True
+            sender_type = "SM"
+            morphological_features = {"pose_vectors": np.eye(3)}
+            non_morphological_features = {
+                "flow_direction": [0.0, 0.0, 0.0],
+                "flow_magnitude": [0.1],
+                "observation_packet_v2": {
+                    "packet_type": "change_observation_packet_v2",
+                    "cells": [
+                        {
+                            "rgb_patch": np.full((2, 2, 3), [0.75, 0.25, 0.5]),
+                            "sensor_frame_patch": np.full((2, 2, 3), [0.0, 0.0, 0.3]),
+                        }
+                    ],
+                    "temporal_context": {
+                        "flow_direction": [0.25, -0.5, 0.75],
+                        "flow_magnitude": 0.4,
+                        "feature_deltas": {
+                            "hsv": [0.1, -0.2, 0.3],
+                        },
+                    },
+                },
+            }
+
+        result = TorchFeatureEncoder._extract_features(MockState())
+        expected = [
+            0.25,
+            -0.5,
+            0.75,
+            0.4,
+            1.0,
+            0.0,
+            0.0,
+            float(np.tanh(2.0 * np.linalg.norm([0.1, -0.2, 0.3]))),
+            0.0,
+            0.0,
+        ]
+
+        np.testing.assert_allclose(result[: len(expected)], expected, atol=1e-6)
+
+    def test_extract_location_can_use_sensor_frame_centroid(self):
+        enc = TorchFeatureEncoder(
+            observation_packet_location_mode="sensor_frame_centroid",
+        )
+
+        class MockState:
+            location = [9.0, 9.0, 9.0]
+            use_state = True
+            sender_type = "SM"
+            morphological_features = {}
+            non_morphological_features = {
+                "observation_packet_v2": {
+                    "cells": [
+                        {
+                            "sensor_frame_patch": np.array(
+                                [
+                                    [[1.0, 0.0, 0.5], [3.0, 0.0, 0.5]],
+                                    [[5.0, 0.0, 0.5], [7.0, 0.0, 0.5]],
+                                ],
+                                dtype=np.float32,
+                            ),
+                            "support_patch": np.array(
+                                [[1.0, 1.0], [0.0, 0.0]],
+                                dtype=np.float32,
+                            ),
+                        }
+                    ]
+                }
+            }
+
+        result = enc.extract_location(MockState())
+        np.testing.assert_allclose(result, [2.0, 0.0, 0.5], atol=1e-6)
+
+    def test_extract_features_can_ignore_pose_vectors_for_packet_states(self):
+        class MockState:
+            location = [1.0, 2.0, 3.0]
+            use_state = True
+            sender_type = "SM"
+            morphological_features = {
+                "pose_vectors": np.array(
+                    [[9.0, 8.0, 7.0], [6.0, 5.0, 4.0], [3.0, 2.0, 1.0]],
+                    dtype=np.float32,
+                )
+            }
+            non_morphological_features = {
+                "observation_packet_v2": {
+                    "packet_type": "visual_observation_packet_v2",
+                    "cells": [
+                        {
+                            "rgb_patch": np.full((2, 2, 3), [0.75, 0.25, 0.5]),
+                        }
+                    ],
+                }
+            }
+
+        result = TorchFeatureEncoder._extract_features(
+            MockState(),
+            ignore_pose_vectors_with_packet=True,
+        )
+
+        self.assertEqual(len(result), 4)
+        np.testing.assert_allclose(result, [-0.144, 0.5, 0.0, 0.0], atol=1e-4)
+
     def test_hash_label_deterministic(self):
         a = TorchFeatureEncoder.hash_label("test_object")
         b = TorchFeatureEncoder.hash_label("test_object")

@@ -36,19 +36,37 @@ The summary-head temporal event fraction is retained only as a secondary
 comparator.
 
 Motion-grounded phase decoding is retained only as a secondary report.
+
+The benchmark can also run the newer Track 14 predictive-hypothesis LM family
+through the same hierarchical Panda3D full-Monty path.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
+from collections.abc import Mapping
 from copy import deepcopy
 from itertools import combinations
 import json
+import os
 import random
 from pathlib import Path
 import subprocess
 import sys
+
+
+# The Track 14 benchmark showed real cross-run drift under multithreaded CPU
+# reductions even with a fixed seed. Default to single-threaded numeric kernels
+# so the benchmark is reproducible unless the caller explicitly opts out.
+for _thread_var in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_var, "1")
 
 import numpy as np
 import torch
@@ -68,6 +86,10 @@ from tbp.monty.frameworks.models.cortical_column_torch.learning_module import (
 from tbp.monty.frameworks.models.cortical_column_torch.experiment import (
     Panda3DTorchExperiment,
 )
+from tbp.monty.frameworks.models.predictive_hypothesis_torch.learning_module import (
+    PredictiveHypothesisTorchLM,
+)
+from tbp.monty.frameworks.models.states import State
 from tbp.monty.simulators.panda3d.kinematic_phase import (
     extract_foot_cycle_phase_info,
     extract_joint_phase_info,
@@ -113,6 +135,29 @@ MODEL_SPECS = {
 # Tuned to the current direct-query Track 12 pressure range so the thresholded
 # metric is informative instead of staying pinned at zero.
 BOUNDARY_PRESSURE_ACTIVE_THRESHOLD = 0.37
+VALID_LM_FAMILIES = (
+    "cortical_column_torch",
+    "predictive_hypothesis_torch",
+)
+TRACK14_TRAINING_MAX_ATTEMPTS = 8
+_BENCHMARK_THREADING_CONFIGURED = False
+BEHAVIOR_OBJECT_DECODER_AMBIGUITY_RATIO = 1.25
+BEHAVIOR_OBJECT_DECODER_AMBIGUITY_MIN_SUPPORT = 2
+
+
+def _configure_benchmark_threading() -> None:
+    global _BENCHMARK_THREADING_CONFIGURED
+
+    if _BENCHMARK_THREADING_CONFIGURED:
+        return
+
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch only allows setting interop threads once per process.
+        pass
+    _BENCHMARK_THREADING_CONFIGURED = True
 
 
 def _default_predictive_child_lm_kwargs():
@@ -144,6 +189,201 @@ def _default_predictive_child_lm_kwargs():
             "boundary_weight": 0.75,
         },
     }
+
+
+def _default_predictive_hypothesis_lm_kwargs():
+    return {
+        "output_evidence_threshold": 0.0,
+        "core_kwargs": {
+            "max_hypotheses": 4,
+        },
+    }
+
+
+def _normalize_detail_grid_shape(detail_grid_shape):
+    if len(detail_grid_shape) != 2:
+        raise ValueError("detail_grid_shape must have exactly two integers")
+
+    rows = max(int(detail_grid_shape[0]), 1)
+    cols = max(int(detail_grid_shape[1]), 1)
+    return (rows, cols)
+
+
+def _is_predictive_hypothesis_family(lm_family):
+    return str(lm_family) == "predictive_hypothesis_torch"
+
+
+def _apply_family_lm_defaults(lm_family, lm_kwargs, *, is_parent=False):
+    merged = deepcopy(lm_kwargs or {})
+    if not _is_predictive_hypothesis_family(lm_family):
+        return merged
+
+    defaults = _default_predictive_hypothesis_lm_kwargs()
+    merged.setdefault(
+        "output_evidence_threshold",
+        defaults["output_evidence_threshold"],
+    )
+    core_kwargs = dict(merged.get("core_kwargs", {}))
+    core_kwargs.setdefault(
+        "max_hypotheses",
+        6 if is_parent else defaults["core_kwargs"]["max_hypotheses"],
+    )
+    merged["core_kwargs"] = core_kwargs
+    return merged
+
+
+def _apply_family_resolution_defaults(resolution, lm_family):
+    rows = max(int(resolution[0]), 1)
+    cols = max(int(resolution[1]), 1)
+    if not _is_predictive_hypothesis_family(lm_family):
+        return (rows, cols)
+
+    # Track 14 depends on center-pixel on-object states plus richer packet fields.
+    # The Track 12 smoke resolution is too sparse for small meshes like Fox.glb.
+    return (max(rows, 24), max(cols, 24))
+
+
+def _apply_family_model_geometry_defaults(spec, lm_family):
+    adjusted = dict(spec)
+    if not _is_predictive_hypothesis_family(lm_family):
+        return adjusted
+
+    object_scale = np.asarray(adjusted.get("object_scale", (1.0, 1.0, 1.0)), dtype=np.float32)
+    if object_scale.size > 0 and float(np.max(np.abs(object_scale))) <= 0.05:
+        adjusted["initial_distance"] = min(
+            float(adjusted.get("initial_distance", 3.0)),
+            2.0,
+        )
+    return adjusted
+
+
+def _learning_modules_missing_target_object(exp, target_name, lm_family):
+    if not _is_predictive_hypothesis_family(lm_family):
+        return []
+
+    normalized_target = _normalize_graph_id(target_name)
+    if normalized_target is None or exp is None:
+        return []
+
+    monty = getattr(exp, "monty", None)
+    if monty is None:
+        return []
+
+    missing_learning_modules = []
+    saw_predictive_learning_module = False
+    for lm in getattr(monty, "learning_modules", []):
+        lm_exposes_target_catalog = False
+        graph_id_to_target = getattr(lm, "graph_id_to_target", None)
+        mapped_targets = set()
+        if isinstance(graph_id_to_target, Mapping):
+            lm_exposes_target_catalog = True
+            saw_predictive_learning_module = True
+            mapped_targets = {
+                normalized
+                for normalized in (
+                    _normalize_graph_id(target_object)
+                    for target_objects in graph_id_to_target.values()
+                    for target_object in (target_objects or [])
+                )
+                if normalized is not None
+            }
+        else:
+            get_all_known_object_ids = getattr(lm, "get_all_known_object_ids", None)
+            if callable(get_all_known_object_ids):
+                lm_exposes_target_catalog = True
+                saw_predictive_learning_module = True
+                mapped_targets = {
+                    normalized
+                    for normalized in (
+                        _normalize_graph_id(object_id)
+                        for object_id in (get_all_known_object_ids() or [])
+                    )
+                    if normalized is not None
+                }
+
+        if not lm_exposes_target_catalog:
+            continue
+        if normalized_target not in mapped_targets:
+            missing_learning_modules.append(
+                getattr(lm, "learning_module_id", lm.__class__.__name__)
+            )
+
+    if not saw_predictive_learning_module:
+        return []
+    return missing_learning_modules
+
+
+def _snapshot_graph_id_target_mappings(exp):
+    monty = getattr(exp, "monty", None)
+    if monty is None:
+        return {}
+
+    per_lm = {}
+    for lm in getattr(monty, "learning_modules", []):
+        graph_id_to_target = getattr(lm, "graph_id_to_target", None)
+        if not graph_id_to_target:
+            continue
+
+        lm_mapping = {}
+        for raw_graph_id, target_objects in graph_id_to_target.items():
+            normalized_graph_id = _normalize_graph_id(raw_graph_id)
+            if normalized_graph_id is None:
+                continue
+
+            normalized_targets = sorted(
+                {
+                    normalized_target
+                    for normalized_target in (
+                        _normalize_graph_id(target_object)
+                        for target_object in (target_objects or [])
+                    )
+                    if normalized_target is not None
+                }
+            )
+            if normalized_targets:
+                lm_mapping[normalized_graph_id] = normalized_targets
+
+        if lm_mapping:
+            per_lm[str(getattr(lm, "learning_module_id", "unknown_lm"))] = lm_mapping
+
+    return per_lm
+
+
+def _snapshot_reporting_alias_diagnostics(exp):
+    monty = getattr(exp, "monty", None)
+    if monty is None:
+        return {}
+
+    per_lm = {}
+    for lm in getattr(monty, "learning_modules", []):
+        getter = getattr(lm, "get_reporting_alias_diagnostics", None)
+        if not callable(getter):
+            continue
+        diagnostics = getter() or {}
+        if not isinstance(diagnostics, Mapping):
+            continue
+        if (
+            int(diagnostics.get("total_steps", 0)) <= 0
+            and not diagnostics.get("per_target")
+        ):
+            continue
+        per_lm[str(getattr(lm, "learning_module_id", "unknown_lm"))] = deepcopy(
+            diagnostics
+        )
+
+    return per_lm
+
+
+def _result_has_processed_learning_step(result):
+    for step_trace in result.get("trace", []):
+        for lm_trace in (step_trace.get("learning_modules") or {}).values():
+            evidence_debug = lm_trace.get("evidence_debug")
+            if not isinstance(evidence_debug, dict):
+                continue
+            if evidence_debug.get("step_skipped"):
+                continue
+            return True
+    return False
 
 
 def _resolve_child_lm_kwargs(
@@ -423,6 +663,32 @@ def _mean(values):
     if not usable:
         return None
     return sum(usable) / len(usable)
+
+
+def _prediction_is_resolved(prediction):
+    if not prediction:
+        return False
+    if "final_prediction_resolved" in prediction:
+        return bool(prediction.get("final_prediction_resolved"))
+    return prediction.get("final_prediction_correct") is not None
+
+
+def _prediction_accuracy_summary(predictions):
+    predictions = list(predictions)
+    return {
+        "accuracy_mean": _mean(
+            prediction.get("final_prediction_correct")
+            for prediction in predictions
+        ),
+        "resolved_fraction_mean": _mean(
+            int(_prediction_is_resolved(prediction))
+            for prediction in predictions
+        ),
+        "strict_accuracy_mean": _mean(
+            int(bool(prediction.get("final_prediction_correct")))
+            for prediction in predictions
+        ),
+    }
 
 
 def _extract_boundary_pressure(lm_trace):
@@ -884,30 +1150,31 @@ def _condition_report(
         result,
         target_name,
         object_decoders=object_decoders,
+        object_decoder_diagnostics=object_decoder_diagnostics,
     )
+    parent_prediction_info = lm_object_predictions.get("lm_parent", {})
     final_prediction_info = dict(
         lm_object_predictions.get(
             target_lm_id,
             {
+                "final_prediction_latent_id": None,
                 "final_prediction_graph_id": None,
                 "final_prediction": None,
                 "final_prediction_correct": False,
                 "final_prediction_decoded": False,
+                "has_latent_id": False,
                 "has_graph_id": False,
             },
         )
     )
-    final_prediction_lm_id = (
-        target_lm_id if final_prediction_info.get("has_graph_id") else None
-    )
-    if not final_prediction_info.get("has_graph_id"):
-        raw_graph_id = result.get("graph_id")
-        raw_graph_id = None if raw_graph_id is None else str(raw_graph_id)
+    if not final_prediction_info.get("has_latent_id"):
+        raw_graph_id, has_identity = _extract_raw_identity(result)
         decoded_object = _decode_object_name(
             raw_graph_id,
             (object_decoders or {}).get(target_lm_id),
         )
         final_prediction_info = {
+            "final_prediction_latent_id": raw_graph_id,
             "final_prediction_graph_id": raw_graph_id,
             "final_prediction": (
                 decoded_object if decoded_object is not None else raw_graph_id
@@ -921,71 +1188,67 @@ def _condition_report(
                 and _normalize_graph_id(raw_graph_id) is not None
                 and decoded_object is not None
             ),
-            "has_graph_id": raw_graph_id is not None,
+            "final_prediction_ambiguous": False,
+            "final_prediction_candidate_objects": [],
+            "final_prediction_resolved": raw_graph_id is not None,
+            "has_latent_id": has_identity,
+            "has_graph_id": has_identity,
         }
-        final_prediction_lm_id = None
-
-    target_prediction_ambiguous = _is_decoder_graph_id_ambiguous(
-        final_prediction_info.get("final_prediction_graph_id"),
-        (object_decoder_diagnostics or {}).get(target_lm_id),
-    )
-    if (
-        joint_object_decoder
-        and target_prediction_ambiguous
-    ):
-        joint_signature_key, joint_signature_parts = (
-            _extract_joint_object_signature_key(
-                result,
-                lm_ids=joint_object_decoder_lm_ids,
-            )
+        final_prediction_info = _annotate_decoder_prediction(
+            final_prediction_info,
+            target_name,
+            (object_decoder_diagnostics or {}).get(target_lm_id),
         )
-        joint_prediction = None
-        joint_prediction_ambiguous = False
-        if joint_signature_key is not None:
-            joint_prediction = joint_object_decoder.get(joint_signature_key)
-            joint_prediction_ambiguous = _is_joint_object_signature_ambiguous(
-                joint_signature_key,
-                joint_object_decoder_diagnostics,
-            )
-        if joint_prediction is not None and not joint_prediction_ambiguous:
-            final_prediction_info = {
-                "final_prediction_graph_id": joint_signature_key,
-                "final_prediction": joint_prediction,
-                "final_prediction_correct": joint_prediction == target_name,
-                "final_prediction_decoded": True,
-                "has_graph_id": True,
-                "final_prediction_signature_graph_ids": dict(
-                    joint_signature_parts or {}
-                ),
-            }
-            final_prediction_lm_id = "lm_child_joint_decoder"
-
-    if target_prediction_ambiguous and final_prediction_lm_id != "lm_child_joint_decoder":
-        parent_prediction_info = lm_object_predictions.get("lm_parent", {})
-        if parent_prediction_info.get("has_graph_id") and not _is_decoder_graph_id_ambiguous(
-            parent_prediction_info.get("final_prediction_graph_id"),
-            (object_decoder_diagnostics or {}).get("lm_parent"),
-        ):
-            final_prediction_info = dict(parent_prediction_info)
-            final_prediction_lm_id = "lm_parent_decoder_fallback"
+    final_prediction_info = _resolve_prediction_info_with_ambiguity_fallback(
+        result,
+        final_prediction_info,
+        prediction_lm_id=target_lm_id,
+        target_name=target_name,
+        object_decoder_diagnostics=object_decoder_diagnostics,
+        joint_object_decoder=joint_object_decoder,
+        joint_object_decoder_diagnostics=joint_object_decoder_diagnostics,
+        joint_object_decoder_lm_ids=joint_object_decoder_lm_ids,
+        parent_prediction_info=parent_prediction_info,
+        allow_parent_fallback=True,
+    )
+    final_prediction_lm_id = final_prediction_info.get("final_prediction_lm_id")
 
     child_lm_primary = {}
     for lm_id in ("lm_morphology", "lm_behavior"):
+        child_prediction_info = dict(
+            lm_object_predictions.get(
+                lm_id,
+                {
+                    "final_prediction_latent_id": None,
+                    "final_prediction_graph_id": None,
+                    "final_prediction": None,
+                    "final_prediction_correct": False,
+                    "final_prediction_decoded": False,
+                    "has_latent_id": False,
+                    "has_graph_id": False,
+                },
+            )
+        )
+        if lm_id == "lm_behavior":
+            child_prediction_info = _resolve_prediction_info_with_ambiguity_fallback(
+                result,
+                child_prediction_info,
+                prediction_lm_id=lm_id,
+                target_name=target_name,
+                object_decoder_diagnostics=object_decoder_diagnostics,
+                joint_object_decoder=joint_object_decoder,
+                joint_object_decoder_diagnostics=joint_object_decoder_diagnostics,
+                joint_object_decoder_lm_ids=joint_object_decoder_lm_ids,
+                parent_prediction_info=parent_prediction_info,
+                allow_parent_fallback=False,
+            )
         child_lm_primary[lm_id] = {
             **_compute_primary_temporal_metrics(
                 trace,
                 target_lm_id=lm_id,
                 boundary_active_threshold=boundary_active_threshold,
             ),
-            **lm_object_predictions.get(
-                lm_id,
-                {
-                    "final_prediction_graph_id": None,
-                    "final_prediction": None,
-                    "final_prediction_correct": False,
-                    "final_prediction_decoded": False,
-                },
-            ),
+            **child_prediction_info,
         }
 
     return {
@@ -1146,47 +1409,145 @@ def _normalize_graph_id(graph_id):
     return normalized
 
 
-def _decode_object_name(graph_id, object_decoder=None):
-    raw_graph_id = _normalize_graph_id(graph_id)
-    if raw_graph_id is None:
+def _extract_raw_identity(payload):
+    if not isinstance(payload, Mapping):
+        return None, False
+
+    has_identity = ("latent_id" in payload) or ("graph_id" in payload)
+    raw_identity = payload.get("latent_id", payload.get("graph_id"))
+    return None if raw_identity is None else str(raw_identity), has_identity
+
+
+def _decode_object_name(identity_id, object_decoder=None):
+    raw_identity = _normalize_graph_id(identity_id)
+    if raw_identity is None:
         return None
 
     if object_decoder is None:
-        return raw_graph_id
-    return object_decoder.get(raw_graph_id)
+        return raw_identity
+    return object_decoder.get(raw_identity)
 
 
 def _extract_lm_object_prediction(result, lm_id, object_decoder=None):
-    has_graph_id = False
-    raw_graph_id = None
+    has_identity = False
+    raw_identity = None
     lm_result = result.get(lm_id)
-    if isinstance(lm_result, dict) and "graph_id" in lm_result:
-        has_graph_id = True
-        raw_graph_id = lm_result.get("graph_id")
+    if isinstance(lm_result, Mapping):
+        raw_identity, has_identity = _extract_raw_identity(lm_result)
 
-    raw_graph_id = None if raw_graph_id is None else str(raw_graph_id)
-    decoded_object = _decode_object_name(raw_graph_id, object_decoder)
-    final_prediction = decoded_object if decoded_object is not None else raw_graph_id
+    decoded_object = _decode_object_name(raw_identity, object_decoder)
+    final_prediction = decoded_object if decoded_object is not None else raw_identity
     return {
-        "final_prediction_graph_id": raw_graph_id,
+        "final_prediction_latent_id": raw_identity,
+        "final_prediction_graph_id": raw_identity,
         "final_prediction": final_prediction,
         "final_prediction_decoded": (
             object_decoder is not None
-            and _normalize_graph_id(raw_graph_id) is not None
+            and _normalize_graph_id(raw_identity) is not None
             and decoded_object is not None
         ),
-        "has_graph_id": has_graph_id,
+        "final_prediction_ambiguous": False,
+        "final_prediction_candidate_objects": [],
+        "final_prediction_resolved": (
+            has_identity and final_prediction is not None
+        ),
+        "has_latent_id": has_identity,
+        "has_graph_id": has_identity,
     }
+
+
+def _finalize_prediction_info(
+    prediction_info,
+    target_name,
+    *,
+    ambiguous=False,
+    candidate_objects=None,
+):
+    resolved_prediction_info = dict(prediction_info or {})
+    raw_identity = resolved_prediction_info.get(
+        "final_prediction_latent_id",
+        resolved_prediction_info.get("final_prediction_graph_id"),
+    )
+    raw_identity = None if raw_identity is None else str(raw_identity)
+    resolved_prediction_info["final_prediction_latent_id"] = raw_identity
+    resolved_prediction_info["final_prediction_graph_id"] = raw_identity
+    has_identity = bool(
+        resolved_prediction_info.get(
+            "has_latent_id",
+            resolved_prediction_info.get("has_graph_id", False),
+        )
+    )
+    resolved_prediction_info["has_latent_id"] = has_identity
+    resolved_prediction_info["has_graph_id"] = has_identity
+    signature_ids = resolved_prediction_info.get(
+        "final_prediction_signature_latent_ids",
+        resolved_prediction_info.get("final_prediction_signature_graph_ids"),
+    )
+    if signature_ids is not None:
+        signature_ids = {
+            str(key): None if value is None else str(value)
+            for key, value in dict(signature_ids).items()
+        }
+        resolved_prediction_info["final_prediction_signature_latent_ids"] = dict(
+            signature_ids
+        )
+        resolved_prediction_info["final_prediction_signature_graph_ids"] = dict(
+            signature_ids
+        )
+    resolved_prediction_info["final_prediction_ambiguous"] = bool(ambiguous)
+    resolved_prediction_info["final_prediction_candidate_objects"] = [
+        str(candidate)
+        for candidate in (candidate_objects or [])
+        if candidate is not None
+    ]
+
+    if ambiguous:
+        resolved_prediction_info["final_prediction"] = None
+        resolved_prediction_info["final_prediction_correct"] = None
+        resolved_prediction_info["final_prediction_decoded"] = False
+    else:
+        resolved_prediction_info["final_prediction_correct"] = (
+            resolved_prediction_info.get("final_prediction") == target_name
+        )
+
+    resolved_prediction_info["final_prediction_resolved"] = bool(
+        resolved_prediction_info.get("has_latent_id")
+        and resolved_prediction_info.get("final_prediction") is not None
+        and not resolved_prediction_info["final_prediction_ambiguous"]
+    )
+    return resolved_prediction_info
+
+
+def _annotate_decoder_prediction(
+    prediction_info,
+    target_name,
+    object_decoder_diagnostics=None,
+):
+    candidates = _decoder_graph_id_candidates(
+        prediction_info.get(
+            "final_prediction_latent_id",
+            prediction_info.get("final_prediction_graph_id"),
+        ),
+        object_decoder_diagnostics,
+    )
+    return _finalize_prediction_info(
+        prediction_info,
+        target_name,
+        ambiguous=len(candidates) > 1,
+        candidate_objects=candidates,
+    )
 
 
 def _collect_lm_object_predictions(
     result,
     target_name,
     object_decoders=None,
+    object_decoder_diagnostics=None,
     lm_ids=("lm_morphology", "lm_behavior", "lm_parent"),
 ):
     predictions = {}
     object_decoders = dict(object_decoders or {})
+    object_decoder_diagnostics = dict(object_decoder_diagnostics or {})
 
     for lm_id in lm_ids:
         prediction = _extract_lm_object_prediction(
@@ -1194,12 +1555,131 @@ def _collect_lm_object_predictions(
             lm_id,
             object_decoder=object_decoders.get(lm_id),
         )
-        prediction["final_prediction_correct"] = (
-            prediction["final_prediction"] == target_name
+        prediction = _annotate_decoder_prediction(
+            prediction,
+            target_name,
+            object_decoder_diagnostics.get(lm_id),
         )
         predictions[lm_id] = prediction
 
     return predictions
+
+
+def _resolve_prediction_info_with_ambiguity_fallback(
+    result,
+    prediction_info,
+    *,
+    prediction_lm_id,
+    target_name,
+    object_decoder_diagnostics=None,
+    joint_object_decoder=None,
+    joint_object_decoder_diagnostics=None,
+    joint_object_decoder_lm_ids=("lm_morphology", "lm_behavior"),
+    parent_prediction_info=None,
+    allow_parent_fallback=True,
+):
+    resolved_prediction_info = dict(prediction_info or {})
+    prediction_diagnostics = (object_decoder_diagnostics or {}).get(prediction_lm_id)
+    if (
+        "final_prediction_ambiguous" not in resolved_prediction_info
+        or "final_prediction_resolved" not in resolved_prediction_info
+    ):
+        resolved_prediction_info = _annotate_decoder_prediction(
+            resolved_prediction_info,
+            target_name,
+            prediction_diagnostics,
+        )
+    resolved_prediction_lm_id = (
+        prediction_lm_id if resolved_prediction_info.get("has_latent_id") else None
+    )
+    prediction_ambiguous = bool(
+        resolved_prediction_info.get("final_prediction_ambiguous")
+    )
+    parent_prediction_info = dict(parent_prediction_info or {})
+    if parent_prediction_info and (
+        "final_prediction_ambiguous" not in parent_prediction_info
+        or "final_prediction_resolved" not in parent_prediction_info
+    ):
+        parent_prediction_info = _annotate_decoder_prediction(
+            parent_prediction_info,
+            target_name,
+            (object_decoder_diagnostics or {}).get("lm_parent"),
+        )
+    parent_prediction_unambiguous = (
+        parent_prediction_info.get("has_latent_id")
+        and not parent_prediction_info.get("final_prediction_ambiguous", False)
+        and parent_prediction_info.get("final_prediction") is not None
+    )
+    parent_prediction_object = (
+        parent_prediction_info.get("final_prediction")
+        if parent_prediction_unambiguous
+        else None
+    )
+
+    if (
+        joint_object_decoder
+        and prediction_lm_id in set(joint_object_decoder_lm_ids)
+    ):
+        joint_signature_key, joint_signature_parts = _extract_joint_object_signature_key(
+            result,
+            lm_ids=joint_object_decoder_lm_ids,
+        )
+        joint_prediction = None
+        joint_prediction_ambiguous = False
+        if joint_signature_key is not None:
+            joint_prediction = joint_object_decoder.get(joint_signature_key)
+            joint_prediction_ambiguous = _is_joint_object_signature_ambiguous(
+                joint_signature_key,
+                joint_object_decoder_diagnostics,
+            )
+        if joint_prediction is not None and not joint_prediction_ambiguous and (
+            prediction_ambiguous
+            or (
+                joint_prediction != resolved_prediction_info.get("final_prediction")
+                and parent_prediction_object == joint_prediction
+            )
+        ):
+            resolved_prediction_info = _finalize_prediction_info(
+                {
+                    "final_prediction_latent_id": joint_signature_key,
+                    "final_prediction_graph_id": joint_signature_key,
+                    "final_prediction": joint_prediction,
+                    "final_prediction_decoded": True,
+                    "has_latent_id": True,
+                    "has_graph_id": True,
+                    "final_prediction_signature_latent_ids": dict(
+                        joint_signature_parts or {}
+                    ),
+                    "final_prediction_signature_graph_ids": dict(
+                        joint_signature_parts or {}
+                    ),
+                },
+                target_name,
+                ambiguous=False,
+                candidate_objects=[joint_prediction],
+            )
+            resolved_prediction_lm_id = "lm_child_joint_decoder"
+
+    if (
+        allow_parent_fallback
+        and prediction_ambiguous
+        and resolved_prediction_lm_id != "lm_child_joint_decoder"
+    ):
+        if parent_prediction_unambiguous:
+            resolved_prediction_info = parent_prediction_info
+            resolved_prediction_lm_id = "lm_parent_decoder_fallback"
+
+    resolved_prediction_info = _finalize_prediction_info(
+        resolved_prediction_info,
+        target_name,
+        ambiguous=bool(resolved_prediction_info.get("final_prediction_ambiguous")),
+        candidate_objects=resolved_prediction_info.get(
+            "final_prediction_candidate_objects",
+            [],
+        ),
+    )
+    resolved_prediction_info["final_prediction_lm_id"] = resolved_prediction_lm_id
+    return resolved_prediction_info
 
 
 def _extract_joint_object_signature_key_from_graph_ids(graph_ids_by_lm, lm_ids):
@@ -1225,9 +1705,7 @@ def _extract_joint_object_signature_key(
     graph_ids_by_lm = {}
     for lm_id in lm_ids:
         lm_result = result.get(lm_id)
-        graph_ids_by_lm[lm_id] = (
-            lm_result.get("graph_id") if isinstance(lm_result, dict) else None
-        )
+        graph_ids_by_lm[lm_id] = _extract_raw_identity(lm_result)[0]
 
     return _extract_joint_object_signature_key_from_graph_ids(
         graph_ids_by_lm,
@@ -1241,7 +1719,7 @@ def _extract_trace_joint_object_signature_key(
 ):
     learning_modules = step_trace.get("learning_modules", {})
     graph_ids_by_lm = {
-        lm_id: learning_modules.get(lm_id, {}).get("graph_id")
+        lm_id: _extract_raw_identity(learning_modules.get(lm_id, {}))[0]
         for lm_id in lm_ids
     }
     return _extract_joint_object_signature_key_from_graph_ids(
@@ -1277,7 +1755,12 @@ def _iter_joint_decoder_signature_keys(
 
 def _iter_decoder_graph_ids(condition_result, lm_id, tail_steps=5):
     prediction = _extract_lm_object_prediction(condition_result, lm_id)
-    raw_graph_id = _normalize_graph_id(prediction.get("final_prediction_graph_id"))
+    raw_graph_id = _normalize_graph_id(
+        prediction.get(
+            "final_prediction_latent_id",
+            prediction.get("final_prediction_graph_id"),
+        )
+    )
     if raw_graph_id is not None:
         yield raw_graph_id
 
@@ -1287,9 +1770,9 @@ def _iter_decoder_graph_ids(condition_result, lm_id, tail_steps=5):
 
     for step_trace in trace:
         raw_graph_id = _normalize_graph_id(
-            step_trace.get("learning_modules", {})
-            .get(lm_id, {})
-            .get("graph_id")
+            _extract_raw_identity(
+                step_trace.get("learning_modules", {}).get(lm_id, {})
+            )[0]
         )
         if raw_graph_id is not None:
             yield raw_graph_id
@@ -1299,6 +1782,7 @@ def _fit_self_supervised_object_decoders(
     per_model_condition_results,
     lm_ids=("lm_morphology", "lm_behavior", "lm_parent"),
     tail_steps=5,
+    training_graph_id_to_target_by_model=None,
 ):
     support = {lm_id: {} for lm_id in lm_ids}
 
@@ -1313,22 +1797,60 @@ def _fit_self_supervised_object_decoders(
                 support[lm_id].setdefault(raw_graph_id, Counter())
                 support[lm_id][raw_graph_id][object_name] += 1
 
+        training_graph_id_to_target = (
+            (training_graph_id_to_target_by_model or {}).get(object_name, {})
+        )
+        for lm_id in lm_ids:
+            lm_mapping = training_graph_id_to_target.get(lm_id, {}) or {}
+            for raw_graph_id, target_objects in lm_mapping.items():
+                normalized_targets = {
+                    normalized_target
+                    for normalized_target in (
+                        _normalize_graph_id(target_object)
+                        for target_object in (target_objects or [])
+                    )
+                    if normalized_target is not None
+                }
+                if object_name not in normalized_targets:
+                    continue
+
+                support[lm_id].setdefault(raw_graph_id, Counter())
+                support[lm_id][raw_graph_id][object_name] += 1
+
     decoders = {}
     diagnostics = {}
     for lm_id, lm_support in support.items():
-        graph_id_to_object = {}
-        graph_id_support = {}
+        latent_id_to_object = {}
+        latent_id_support = {}
+        latent_id_candidate_objects = {}
         for raw_graph_id, counts in lm_support.items():
-            graph_id_to_object[raw_graph_id] = max(
-                counts.items(),
-                key=lambda item: (item[1], item[0]),
-            )[0]
-            graph_id_support[raw_graph_id] = _sorted_counter(counts)
+            latent_id_support[raw_graph_id] = _sorted_counter(counts)
+            candidate_objects = _decoder_candidate_objects_from_counts(
+                counts,
+                lm_id=lm_id,
+            )
+            latent_id_candidate_objects[raw_graph_id] = list(candidate_objects)
+            if len(candidate_objects) == 1:
+                latent_id_to_object[raw_graph_id] = candidate_objects[0]
 
-        decoders[lm_id] = graph_id_to_object
+        decoders[lm_id] = latent_id_to_object
         diagnostics[lm_id] = {
-            "graph_id_to_object": dict(graph_id_to_object),
-            "graph_id_support": graph_id_support,
+            "latent_id_to_object": dict(latent_id_to_object),
+            "graph_id_to_object": dict(latent_id_to_object),
+            "latent_id_support": latent_id_support,
+            "graph_id_support": latent_id_support,
+            "latent_id_candidate_objects": {
+                raw_graph_id: list(candidate_objects)
+                for raw_graph_id, candidate_objects in sorted(
+                    latent_id_candidate_objects.items()
+                )
+            },
+            "graph_id_candidate_objects": {
+                raw_graph_id: list(candidate_objects)
+                for raw_graph_id, candidate_objects in sorted(
+                    latent_id_candidate_objects.items()
+                )
+            },
         }
 
     return decoders, diagnostics
@@ -1414,19 +1936,83 @@ def _top_support_candidates(counter):
     ]
 
 
-def _is_decoder_graph_id_ambiguous(raw_graph_id, object_decoder_diagnostics):
+def _decoder_candidate_objects_from_counts(counter, *, lm_id=None):
+    if not counter:
+        return []
+
+    if str(lm_id) != "lm_behavior":
+        return _top_support_candidates(counter)
+
+    max_count = max(int(count) for count in counter.values())
+    if max_count <= 0:
+        return []
+
+    ratio_threshold = float(max(BEHAVIOR_OBJECT_DECODER_AMBIGUITY_RATIO, 1.0))
+    min_support = max(int(BEHAVIOR_OBJECT_DECODER_AMBIGUITY_MIN_SUPPORT), 1)
+    candidates = [
+        str(label)
+        for label, count in sorted(
+            counter.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if int(count) >= min_support
+        and (float(int(count)) * ratio_threshold) >= float(max_count)
+    ]
+    return candidates if candidates else _top_support_candidates(counter)
+
+
+def _decoder_graph_id_support_counts(raw_graph_id, object_decoder_diagnostics):
     raw_graph_id = _normalize_graph_id(raw_graph_id)
     if raw_graph_id is None or not object_decoder_diagnostics:
-        return False
+        return {}
 
-    counts = (
-        (object_decoder_diagnostics.get("graph_id_support") or {}).get(
+    return (
+        (
+            object_decoder_diagnostics.get("latent_id_support")
+            or object_decoder_diagnostics.get("graph_id_support")
+            or {}
+        ).get(
             raw_graph_id,
             {},
         )
         or {}
     )
-    return len(_top_support_candidates(counts)) > 1
+
+
+def _decoder_graph_id_candidates(raw_graph_id, object_decoder_diagnostics):
+    if object_decoder_diagnostics:
+        raw_graph_id = _normalize_graph_id(raw_graph_id)
+        candidate_objects = (
+            (
+                object_decoder_diagnostics.get("latent_id_candidate_objects")
+                or object_decoder_diagnostics.get("graph_id_candidate_objects")
+                or {}
+            ).get(
+                raw_graph_id,
+                [],
+            )
+            or []
+        )
+        if candidate_objects:
+            return [str(candidate) for candidate in candidate_objects]
+    return _top_support_candidates(
+        _decoder_graph_id_support_counts(
+            raw_graph_id,
+            object_decoder_diagnostics,
+        )
+    )
+
+
+def _is_decoder_graph_id_ambiguous(raw_graph_id, object_decoder_diagnostics):
+    return (
+        len(
+            _decoder_graph_id_candidates(
+                raw_graph_id,
+                object_decoder_diagnostics,
+            )
+        )
+        > 1
+    )
 
 
 def _is_joint_object_signature_ambiguous(
@@ -1444,6 +2030,193 @@ def _is_joint_object_signature_ambiguous(
         or {}
     )
     return len(_top_support_candidates(counts)) > 1
+
+
+def _summarize_lm_alias_source_for_model(
+    object_name,
+    matched_result,
+    *,
+    training_graph_id_to_target=None,
+    training_reporting_alias_diagnostics=None,
+    object_decoder_diagnostics=None,
+    lm_ids=("lm_morphology", "lm_behavior", "lm_parent"),
+):
+    normalized_target = _normalize_graph_id(object_name)
+    if normalized_target is None:
+        return {}
+
+    training_graph_id_to_target = dict(training_graph_id_to_target or {})
+    training_reporting_alias_diagnostics = dict(training_reporting_alias_diagnostics or {})
+    object_decoder_diagnostics = dict(object_decoder_diagnostics or {})
+    per_lm = {}
+
+    for lm_id in lm_ids:
+        lm_training_mapping = {
+            _normalize_graph_id(raw_graph_id): sorted(
+                {
+                    normalized
+                    for normalized in (
+                        _normalize_graph_id(target_object)
+                        for target_object in (target_objects or [])
+                    )
+                    if normalized is not None
+                }
+            )
+            for raw_graph_id, target_objects in (
+                training_graph_id_to_target.get(lm_id, {}) or {}
+            ).items()
+            if _normalize_graph_id(raw_graph_id) is not None
+        }
+        lm_training_mapping = {
+            raw_graph_id: targets
+            for raw_graph_id, targets in lm_training_mapping.items()
+            if targets
+        }
+
+        target_training_latents = {
+            raw_graph_id: list(targets)
+            for raw_graph_id, targets in lm_training_mapping.items()
+            if normalized_target in targets
+        }
+        shared_target_training_latents = {
+            raw_graph_id: list(targets)
+            for raw_graph_id, targets in target_training_latents.items()
+            if len(targets) > 1
+        }
+        alias_stats = (
+            (
+                training_reporting_alias_diagnostics.get(lm_id, {}) or {}
+            ).get("per_target", {})
+            or {}
+        ).get(normalized_target, {}) or {}
+        training_mismatch_steps = int(alias_stats.get("mismatch_steps", 0))
+        shared_training_expected = str(lm_id) == "lm_behavior"
+        training_registration_issue = bool(
+            training_mismatch_steps > 0
+            or (
+                shared_target_training_latents
+                and not shared_training_expected
+            )
+        )
+
+        matched_output_counts = Counter(
+            _iter_decoder_graph_ids(
+                matched_result or {},
+                lm_id,
+                tail_steps=None,
+            )
+        )
+        correct_output_graph_ids = {}
+        shared_output_graph_ids = {}
+        foreign_output_graph_ids = {}
+        unmapped_output_graph_ids = {}
+        output_graph_id_details = {}
+        for raw_graph_id, count in matched_output_counts.items():
+            training_targets = list(lm_training_mapping.get(raw_graph_id, []))
+            decoder_candidates = _decoder_graph_id_candidates(
+                raw_graph_id,
+                object_decoder_diagnostics.get(lm_id),
+            )
+            output_graph_id_details[raw_graph_id] = {
+                "count": int(count),
+                "training_targets": list(training_targets),
+                "decoder_candidates": list(decoder_candidates),
+            }
+            if not training_targets and not decoder_candidates:
+                unmapped_output_graph_ids[raw_graph_id] = int(count)
+            elif (
+                normalized_target not in training_targets
+                and normalized_target not in decoder_candidates
+            ):
+                foreign_output_graph_ids[raw_graph_id] = int(count)
+            elif len(training_targets) > 1 or len(decoder_candidates) > 1:
+                shared_output_graph_ids[raw_graph_id] = int(count)
+            else:
+                correct_output_graph_ids[raw_graph_id] = int(count)
+
+        matched_eval_output_issue = bool(
+            foreign_output_graph_ids or unmapped_output_graph_ids
+        )
+        if training_registration_issue and matched_eval_output_issue:
+            confusion_source = "both"
+        elif training_registration_issue:
+            confusion_source = "training_registration"
+        elif matched_eval_output_issue:
+            confusion_source = "matched_eval_output"
+        else:
+            confusion_source = "none"
+
+        per_lm[lm_id] = {
+            "confusion_source": confusion_source,
+            "training_registration_issue": bool(training_registration_issue),
+            "matched_eval_output_issue": bool(matched_eval_output_issue),
+            "training": {
+                "target_training_latents": {
+                    raw_graph_id: list(targets)
+                    for raw_graph_id, targets in sorted(target_training_latents.items())
+                },
+                "shared_target_training_latents": {
+                    raw_graph_id: list(targets)
+                    for raw_graph_id, targets in sorted(
+                        shared_target_training_latents.items()
+                    )
+                },
+                "shared_training_expected": bool(shared_training_expected),
+                "agreement_steps": int(alias_stats.get("agreement_steps", 0)),
+                "mismatch_steps": training_mismatch_steps,
+                "learning_only_steps": int(alias_stats.get("learning_only_steps", 0)),
+                "output_only_steps": int(alias_stats.get("output_only_steps", 0)),
+                "learning_latent_counts": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(
+                        (alias_stats.get("learning_latent_counts") or {}).items()
+                    )
+                },
+                "output_latent_counts": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(
+                        (alias_stats.get("output_latent_counts") or {}).items()
+                    )
+                },
+                "registered_latent_counts": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(
+                        (alias_stats.get("registered_latent_counts") or {}).items()
+                    )
+                },
+                "learning_output_pairs": {
+                    str(pair): int(count)
+                    for pair, count in sorted(
+                        (alias_stats.get("learning_output_pairs") or {}).items()
+                    )
+                },
+            },
+            "matched_eval": {
+                "output_graph_id_counts": _sorted_counter(matched_output_counts),
+                "correct_target_graph_ids": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(correct_output_graph_ids.items())
+                },
+                "shared_target_graph_ids": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(shared_output_graph_ids.items())
+                },
+                "foreign_graph_ids": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(foreign_output_graph_ids.items())
+                },
+                "unmapped_graph_ids": {
+                    str(raw_graph_id): int(count)
+                    for raw_graph_id, count in sorted(unmapped_output_graph_ids.items())
+                },
+                "graph_id_details": {
+                    str(raw_graph_id): dict(details)
+                    for raw_graph_id, details in sorted(output_graph_id_details.items())
+                },
+            },
+        }
+
+    return per_lm
 
 
 def _summarize_learning_module_trace_coverage(trace):
@@ -1536,6 +2309,7 @@ def _summarize_training_diagnostics(
     known_object_ids = []
     known_state_count = 0
     state_object_totals = Counter()
+    reporting_alias_diagnostics = _snapshot_reporting_alias_diagnostics(exp)
     if lm is not None:
         if hasattr(lm, "get_all_known_object_ids"):
             known_object_ids = sorted(lm.get_all_known_object_ids())
@@ -1558,6 +2332,7 @@ def _summarize_training_diagnostics(
         "known_object_ids": known_object_ids,
         "known_state_count": known_state_count,
         "state_object_totals": _sorted_counter(state_object_totals),
+        "reporting_alias_diagnostics": reporting_alias_diagnostics,
     }
 
 
@@ -1582,6 +2357,20 @@ def _compute_interference_debug(
     behavior_to_final_flips = 0
     target_lost_after_temporal_behavior = 0
     target_lost_after_self_supervised = 0
+    steps_with_joint_hypothesis_candidates = 0
+    steps_with_context_ranked_chart_prior = 0
+    steps_with_vote_ranked_chart_prior = 0
+    steps_with_joint_top_chart = 0
+    steps_with_joint_top_latent_multi_chart = 0
+    steps_with_joint_top_context_ranked_chart_prior = 0
+    steps_with_joint_top_vote_ranked_chart_prior = 0
+    joint_top_chart_counts = Counter()
+    joint_chart_switches = 0
+    joint_chart_switch_opportunities = 0
+    joint_same_latent_chart_switches = 0
+    joint_same_latent_chart_switch_opportunities = 0
+    previous_joint_top_label = None
+    previous_joint_top_chart_id = None
     per_step = []
 
     for step_trace in trace:
@@ -1641,6 +2430,92 @@ def _compute_interference_debug(
         final_top_object_display = (
             final_top_object if final_top_object is not None else final_top_label
         )
+
+        joint_candidates = [
+            dict(candidate)
+            for candidate in (evidence_debug.get("joint_hypothesis_candidates") or [])
+            if isinstance(candidate, Mapping)
+        ]
+        joint_candidates = sorted(
+            joint_candidates,
+            key=lambda candidate: (
+                -float(candidate.get("score", 0.0)),
+                str(candidate.get("latent_id", candidate.get("object_id", ""))),
+                ""
+                if candidate.get("chart_id") is None
+                else str(candidate.get("chart_id")),
+            ),
+        )
+        joint_top_candidate = joint_candidates[0] if joint_candidates else None
+        joint_top_label = None
+        joint_top_object = None
+        joint_top_chart_id = None
+        joint_top_latent_candidates = []
+        joint_top_context_ranked_chart_prior = 0.0
+        joint_top_vote_ranked_chart_prior = 0.0
+        joint_context_ranked_chart_prior_active = False
+        joint_vote_ranked_chart_prior_active = False
+        if joint_candidates:
+            steps_with_joint_hypothesis_candidates += 1
+            joint_context_ranked_chart_prior_active = any(
+                float(candidate.get("context_ranked_chart_prior", 0.0)) > 0.0
+                for candidate in joint_candidates
+            )
+            joint_vote_ranked_chart_prior_active = any(
+                float(candidate.get("vote_ranked_chart_prior", 0.0)) > 0.0
+                for candidate in joint_candidates
+            )
+            if joint_context_ranked_chart_prior_active:
+                steps_with_context_ranked_chart_prior += 1
+            if joint_vote_ranked_chart_prior_active:
+                steps_with_vote_ranked_chart_prior += 1
+
+            joint_top_label = str(
+                joint_top_candidate.get(
+                    "latent_id",
+                    joint_top_candidate.get("object_id"),
+                )
+            )
+            joint_top_object = _decode_object_name(joint_top_label, object_decoder)
+            joint_top_chart_id = joint_top_candidate.get("chart_id")
+            joint_top_context_ranked_chart_prior = float(
+                joint_top_candidate.get("context_ranked_chart_prior", 0.0)
+            )
+            joint_top_vote_ranked_chart_prior = float(
+                joint_top_candidate.get("vote_ranked_chart_prior", 0.0)
+            )
+            if joint_top_chart_id is not None:
+                steps_with_joint_top_chart += 1
+                joint_top_chart_counts[str(joint_top_chart_id)] += 1
+            joint_top_latent_candidates = [
+                dict(candidate)
+                for candidate in joint_candidates
+                if str(candidate.get("latent_id", candidate.get("object_id")))
+                == joint_top_label
+            ]
+            if len(joint_top_latent_candidates) > 1:
+                steps_with_joint_top_latent_multi_chart += 1
+            if joint_top_context_ranked_chart_prior > 0.0:
+                steps_with_joint_top_context_ranked_chart_prior += 1
+            if joint_top_vote_ranked_chart_prior > 0.0:
+                steps_with_joint_top_vote_ranked_chart_prior += 1
+
+        if previous_joint_top_chart_id is not None and joint_top_chart_id is not None:
+            joint_chart_switch_opportunities += 1
+            if previous_joint_top_chart_id != joint_top_chart_id:
+                joint_chart_switches += 1
+        if (
+            previous_joint_top_label is not None
+            and previous_joint_top_label == joint_top_label
+            and previous_joint_top_chart_id is not None
+            and joint_top_chart_id is not None
+        ):
+            joint_same_latent_chart_switch_opportunities += 1
+            if previous_joint_top_chart_id != joint_top_chart_id:
+                joint_same_latent_chart_switches += 1
+
+        previous_joint_top_label = joint_top_label
+        previous_joint_top_chart_id = joint_top_chart_id
 
         if base_top_label is not None:
             base_top_label_counts[base_top_label] += 1
@@ -1719,6 +2594,26 @@ def _compute_interference_debug(
                     ).items()
                 },
                 "temporal_labels": dict(evidence_debug.get("temporal_labels") or {}),
+                "joint_top_label": joint_top_label,
+                "joint_top_object": (
+                    joint_top_object if joint_top_object is not None else joint_top_label
+                ),
+                "joint_top_chart_id": joint_top_chart_id,
+                "joint_hypothesis_candidate_count": len(joint_candidates),
+                "joint_top_latent_candidate_count": len(joint_top_latent_candidates),
+                "joint_top_context_ranked_chart_prior": (
+                    joint_top_context_ranked_chart_prior
+                ),
+                "joint_top_vote_ranked_chart_prior": (
+                    joint_top_vote_ranked_chart_prior
+                ),
+                "joint_context_ranked_chart_prior_active": (
+                    joint_context_ranked_chart_prior_active
+                ),
+                "joint_vote_ranked_chart_prior_active": (
+                    joint_vote_ranked_chart_prior_active
+                ),
+                "joint_top_latent_candidates": joint_top_latent_candidates,
                 "query_bias_norms": dict(evidence_debug.get("query_bias_norms") or {}),
                 "prediction_mismatch": evidence_debug.get("prediction_mismatch"),
                 "action_prediction_error": evidence_debug.get(
@@ -1748,6 +2643,18 @@ def _compute_interference_debug(
             "behavior_to_final_flip_fraction": None,
             "target_lost_after_temporal_behavior_fraction": None,
             "target_lost_after_self_supervised_fraction": None,
+            "steps_with_joint_hypothesis_candidates": 0,
+            "joint_hypothesis_candidate_fraction": None,
+            "joint_top_chart_counts": {},
+            "joint_top_chart_resolved_fraction": None,
+            "joint_top_latent_multi_chart_fraction": None,
+            "joint_context_ranked_chart_prior_active_fraction": None,
+            "joint_vote_ranked_chart_prior_active_fraction": None,
+            "joint_top_context_ranked_chart_prior_fraction": None,
+            "joint_top_vote_ranked_chart_prior_fraction": None,
+            "joint_chart_switch_fraction": None,
+            "joint_same_latent_chart_switch_fraction": None,
+            "joint_dominant_chart_fraction": None,
             "per_step": [],
         }
 
@@ -1772,8 +2679,24 @@ def _compute_interference_debug(
             "behavior_to_final_flip_fraction": None,
             "target_lost_after_temporal_behavior_fraction": None,
             "target_lost_after_self_supervised_fraction": None,
+            "steps_with_joint_hypothesis_candidates": 0,
+            "joint_hypothesis_candidate_fraction": None,
+            "joint_top_chart_counts": {},
+            "joint_top_chart_resolved_fraction": None,
+            "joint_top_latent_multi_chart_fraction": None,
+            "joint_context_ranked_chart_prior_active_fraction": None,
+            "joint_vote_ranked_chart_prior_active_fraction": None,
+            "joint_top_context_ranked_chart_prior_fraction": None,
+            "joint_top_vote_ranked_chart_prior_fraction": None,
+            "joint_chart_switch_fraction": None,
+            "joint_same_latent_chart_switch_fraction": None,
+            "joint_dominant_chart_fraction": None,
             "per_step": per_step,
         }
+
+    dominant_joint_chart_count = (
+        max(joint_top_chart_counts.values()) if joint_top_chart_counts else 0
+    )
 
     return {
         "steps_with_debug": steps_with_debug,
@@ -1818,15 +2741,69 @@ def _compute_interference_debug(
         "target_lost_after_self_supervised_fraction": (
             target_lost_after_self_supervised / steps_with_evidence_debug
         ),
+        "steps_with_joint_hypothesis_candidates": (
+            steps_with_joint_hypothesis_candidates
+        ),
+        "joint_hypothesis_candidate_fraction": (
+            steps_with_joint_hypothesis_candidates / steps_with_evidence_debug
+        ),
+        "joint_top_chart_counts": _sorted_counter(joint_top_chart_counts),
+        "joint_top_chart_resolved_fraction": (
+            steps_with_joint_top_chart / steps_with_joint_hypothesis_candidates
+            if steps_with_joint_hypothesis_candidates > 0
+            else None
+        ),
+        "joint_top_latent_multi_chart_fraction": (
+            steps_with_joint_top_latent_multi_chart
+            / steps_with_joint_hypothesis_candidates
+            if steps_with_joint_hypothesis_candidates > 0
+            else None
+        ),
+        "joint_context_ranked_chart_prior_active_fraction": (
+            steps_with_context_ranked_chart_prior / steps_with_evidence_debug
+        ),
+        "joint_vote_ranked_chart_prior_active_fraction": (
+            steps_with_vote_ranked_chart_prior / steps_with_evidence_debug
+        ),
+        "joint_top_context_ranked_chart_prior_fraction": (
+            steps_with_joint_top_context_ranked_chart_prior
+            / steps_with_joint_hypothesis_candidates
+            if steps_with_joint_hypothesis_candidates > 0
+            else None
+        ),
+        "joint_top_vote_ranked_chart_prior_fraction": (
+            steps_with_joint_top_vote_ranked_chart_prior
+            / steps_with_joint_hypothesis_candidates
+            if steps_with_joint_hypothesis_candidates > 0
+            else None
+        ),
+        "joint_chart_switch_fraction": (
+            joint_chart_switches / joint_chart_switch_opportunities
+            if joint_chart_switch_opportunities > 0
+            else None
+        ),
+        "joint_same_latent_chart_switch_fraction": (
+            joint_same_latent_chart_switches
+            / joint_same_latent_chart_switch_opportunities
+            if joint_same_latent_chart_switch_opportunities > 0
+            else None
+        ),
+        "joint_dominant_chart_fraction": (
+            dominant_joint_chart_count / steps_with_joint_hypothesis_candidates
+            if steps_with_joint_hypothesis_candidates > 0
+            else None
+        ),
         "per_step": per_step,
     }
 
 
 def _extract_trace_context_packet(step_trace, sender_id):
+    lm_trace = (
+        (step_trace.get("learning_modules", {}) or {}).get(sender_id, {}) or {}
+    )
+    output_state = dict(lm_trace.get("output_state") or {})
     packet = (
-        step_trace.get("learning_modules", {})
-        .get(sender_id, {})
-        .get("context_signal")
+        lm_trace.get("context_signal")
     )
     if not isinstance(packet, dict):
         return None
@@ -1840,19 +2817,55 @@ def _extract_trace_context_packet(step_trace, sender_id):
     else:
         context = np.asarray(active_cells, dtype=np.float32)
 
+    latent_id = packet.get("latent_id")
+    graph_id = packet.get("graph_id")
+    if latent_id is None:
+        latent_id = graph_id
+    if graph_id is None:
+        graph_id = latent_id
+    if graph_id is None:
+        latent_id = output_state.get("latent_id", output_state.get("graph_id"))
+        graph_id = latent_id
+    if graph_id is None:
+        latent_id = lm_trace.get("latent_id", lm_trace.get("graph_id"))
+        graph_id = latent_id
+
+    confidence = packet.get("confidence")
+    if confidence is None:
+        confidence = output_state.get("confidence")
+    if confidence is None:
+        confidence = lm_trace.get("evidence", 0.0)
+
+    location = output_state.get("location")
+    if isinstance(location, np.ndarray):
+        location = location.astype(np.float32, copy=True)
+    elif location is not None:
+        location = np.asarray(location, dtype=np.float32)
+
+    pose_vectors = output_state.get("pose_vectors")
+    if isinstance(pose_vectors, np.ndarray):
+        pose_vectors = pose_vectors.astype(np.float32, copy=True)
+    elif pose_vectors is not None:
+        pose_vectors = np.asarray(pose_vectors, dtype=np.float32)
+
     return {
         "active_cells": context,
         "sender_id": str(packet.get("sender_id") or sender_id),
-        "graph_id": packet.get("graph_id"),
-        "confidence": float(packet.get("confidence", 0.0)),
+        "latent_id": latent_id,
+        "graph_id": graph_id,
+        "confidence": float(confidence),
         "sender_step_count": int(packet.get("sender_step_count", 0)),
+        "location": location,
+        "pose_vectors": pose_vectors,
     }
 
 
 def _collect_replayed_lm_step_trace(lm, step, frame):
     mlh = lm.get_current_mlh() if hasattr(lm, "get_current_mlh") else {}
+    raw_identity = mlh.get("latent_id", mlh.get("graph_id"))
     lm_trace = {
-        "graph_id": mlh.get("graph_id"),
+        "latent_id": raw_identity,
+        "graph_id": raw_identity,
         "evidence": float(mlh.get("evidence", 0.0)),
     }
     if hasattr(lm, "get_temporal_prediction_status"):
@@ -1877,6 +2890,80 @@ def _collect_replayed_lm_step_trace(lm, step, frame):
     }
 
 
+def _build_predictive_replay_child_state(packet, child_index):
+    graph_id = _normalize_graph_id(packet.get("latent_id", packet.get("graph_id")))
+    if graph_id is None:
+        return None
+
+    active_cells = packet.get("active_cells")
+    if active_cells is None:
+        active_cells = np.zeros(0, dtype=np.float32)
+    else:
+        active_cells = np.asarray(active_cells, dtype=np.float32)
+
+    location = packet.get("location")
+    if location is None:
+        location = np.zeros(3, dtype=np.float64)
+    else:
+        location = np.asarray(location, dtype=np.float64)
+
+    pose_vectors = packet.get("pose_vectors")
+    if pose_vectors is None:
+        pose_vectors = np.eye(3, dtype=np.float64)
+    else:
+        pose_vectors = np.asarray(pose_vectors, dtype=np.float64)
+
+    return State(
+        location=location,
+        morphological_features={
+            "pose_vectors": pose_vectors,
+            "pose_fully_defined": True,
+            "on_object": True,
+        },
+        non_morphological_features={
+            "latent_id": graph_id,
+            "graph_id": graph_id,
+            "active_cells": active_cells,
+        },
+        confidence=float(np.clip(packet.get("confidence", 0.0), 0.0, 1.0)),
+        use_state=True,
+        sender_id=str(packet.get("sender_id") or f"replay_child_{child_index}"),
+        sender_type="LM",
+    )
+
+
+def _instantiate_parent_replay_lm(
+    parent_state_dict,
+    parent_column_kwargs,
+    parent_lm_kwargs,
+    *,
+    lm_family,
+):
+    if _is_predictive_hypothesis_family(lm_family):
+        effective_lm_kwargs = deepcopy(parent_lm_kwargs)
+        core_kwargs = dict(effective_lm_kwargs.get("core_kwargs", {}))
+        core_state = (parent_state_dict or {}).get("core", {})
+        replay_context_dim = core_state.get("context_dim")
+        if replay_context_dim is None:
+            replay_context_dim = (
+                core_state.get("memory", {}) or {}
+            ).get("embedding_dim")
+        if replay_context_dim is not None:
+            core_kwargs["context_dim"] = int(replay_context_dim)
+        effective_lm_kwargs["core_kwargs"] = core_kwargs
+
+        return PredictiveHypothesisTorchLM(
+            learning_module_id="lm_parent",
+            **effective_lm_kwargs,
+        )
+
+    return CorticalColumnTorchLM(
+        column_kwargs=deepcopy(parent_column_kwargs),
+        learning_module_id="lm_parent",
+        **deepcopy(parent_lm_kwargs),
+    )
+
+
 def _build_replayed_primary_summary(
     replay_lm,
     replay_trace,
@@ -1885,7 +2972,7 @@ def _build_replayed_primary_summary(
     boundary_active_threshold=BOUNDARY_PRESSURE_ACTIVE_THRESHOLD,
 ):
     mlh = replay_lm.get_current_mlh() if hasattr(replay_lm, "get_current_mlh") else {}
-    raw_graph_id = _normalize_graph_id(mlh.get("graph_id"))
+    raw_graph_id = _normalize_graph_id(mlh.get("latent_id", mlh.get("graph_id")))
     decoded_object = _decode_object_name(raw_graph_id, object_decoder)
     primary = _compute_primary_temporal_metrics(
         replay_trace,
@@ -1894,6 +2981,7 @@ def _build_replayed_primary_summary(
     )
     primary.update(
         {
+            "final_prediction_latent_id": raw_graph_id,
             "final_prediction_graph_id": raw_graph_id,
             "final_prediction": (
                 decoded_object if decoded_object is not None else raw_graph_id
@@ -1928,6 +3016,10 @@ def _compare_parent_replay_to_live(live_parent_report, replay_summary):
             replay_primary.get("final_prediction")
             == live_primary.get("final_prediction")
         ),
+        "final_prediction_latent_id_matches_live": (
+            replay_primary.get("final_prediction_latent_id")
+            == live_primary.get("final_prediction_latent_id")
+        ),
         "final_prediction_graph_id_matches_live": (
             replay_primary.get("final_prediction_graph_id")
             == live_primary.get("final_prediction_graph_id")
@@ -1944,6 +3036,26 @@ def _compare_parent_replay_to_live(live_parent_report, replay_summary):
             replay_debug.get("final_target_win_fraction"),
             live_debug.get("final_target_win_fraction"),
         ),
+        "joint_hypothesis_candidate_fraction_delta_vs_live": _delta(
+            replay_debug.get("joint_hypothesis_candidate_fraction"),
+            live_debug.get("joint_hypothesis_candidate_fraction"),
+        ),
+        "joint_top_latent_multi_chart_fraction_delta_vs_live": _delta(
+            replay_debug.get("joint_top_latent_multi_chart_fraction"),
+            live_debug.get("joint_top_latent_multi_chart_fraction"),
+        ),
+        "joint_same_latent_chart_switch_fraction_delta_vs_live": _delta(
+            replay_debug.get("joint_same_latent_chart_switch_fraction"),
+            live_debug.get("joint_same_latent_chart_switch_fraction"),
+        ),
+        "joint_top_context_ranked_chart_prior_fraction_delta_vs_live": _delta(
+            replay_debug.get("joint_top_context_ranked_chart_prior_fraction"),
+            live_debug.get("joint_top_context_ranked_chart_prior_fraction"),
+        ),
+        "joint_top_vote_ranked_chart_prior_fraction_delta_vs_live": _delta(
+            replay_debug.get("joint_top_vote_ranked_chart_prior_fraction"),
+            live_debug.get("joint_top_vote_ranked_chart_prior_fraction"),
+        ),
     }
 
 
@@ -1953,13 +3065,15 @@ def _replay_parent_from_context_trace(
     parent_lm_kwargs,
     matched_trace,
     target_name,
+    lm_family="cortical_column_torch",
     object_decoder=None,
     boundary_active_threshold=BOUNDARY_PRESSURE_ACTIVE_THRESHOLD,
 ):
-    replay_lm = CorticalColumnTorchLM(
-        column_kwargs=deepcopy(parent_column_kwargs),
-        learning_module_id="lm_parent",
-        **deepcopy(parent_lm_kwargs),
+    replay_lm = _instantiate_parent_replay_lm(
+        parent_state_dict,
+        parent_column_kwargs,
+        parent_lm_kwargs,
+        lm_family=lm_family,
     )
     replay_lm.load_state_dict(deepcopy(parent_state_dict))
     replay_lm.set_experiment_mode(ExperimentMode.EVAL)
@@ -1986,8 +3100,25 @@ def _replay_parent_from_context_trace(
             continue
 
         previous_step_count = getattr(replay_lm, "_step_count", 0)
-        for packet in packets:
-            replay_lm.receive_context(**packet)
+        if _is_predictive_hypothesis_family(lm_family):
+            child_states = []
+            for index, packet in enumerate(packets):
+                child_state = _build_predictive_replay_child_state(packet, index)
+                if child_state is None:
+                    child_states = []
+                    break
+                child_states.append(child_state)
+
+            if not child_states:
+                missing_context_steps += 1
+                continue
+
+            if hasattr(replay_lm, "set_action_context"):
+                replay_lm.set_action_context(np.zeros(8, dtype=np.float32))
+            replay_lm.matching_step(None, child_states)
+        else:
+            for packet in packets:
+                replay_lm.receive_context(**packet)
 
         if getattr(replay_lm, "_step_count", 0) <= previous_step_count:
             missing_context_steps += 1
@@ -2030,6 +3161,7 @@ def _build_parent_context_replay_diagnostics(
     parent_column_kwargs,
     parent_lm_kwargs,
     object_decoders,
+    lm_family="cortical_column_torch",
     boundary_active_threshold=BOUNDARY_PRESSURE_ACTIVE_THRESHOLD,
 ):
     per_model_diag = {}
@@ -2042,6 +3174,7 @@ def _build_parent_context_replay_diagnostics(
             parent_lm_kwargs=parent_lm_kwargs,
             matched_trace=matched_trace,
             target_name=name,
+            lm_family=lm_family,
             object_decoder=(object_decoders or {}).get("lm_parent"),
             boundary_active_threshold=boundary_active_threshold,
         )
@@ -2061,10 +3194,17 @@ def _build_parent_context_replay_diagnostics(
         }
 
     return {
+        "supported": True,
+        "lm_family": str(lm_family),
         "per_model": per_model_diag,
         "aggregate": {
+            "supported": True,
             "final_prediction_matches_live_mean": _mean(
                 int(report["vs_live"]["final_prediction_matches_live"])
+                for report in per_model_diag.values()
+            ),
+            "final_prediction_latent_id_matches_live_mean": _mean(
+                int(report["vs_live"]["final_prediction_latent_id_matches_live"])
                 for report in per_model_diag.values()
             ),
             "final_prediction_graph_id_matches_live_mean": _mean(
@@ -2077,6 +3217,36 @@ def _build_parent_context_replay_diagnostics(
             ),
             "final_target_win_fraction_delta_vs_live_mean": _mean(
                 report["vs_live"]["final_target_win_fraction_delta_vs_live"]
+                for report in per_model_diag.values()
+            ),
+            "joint_hypothesis_candidate_fraction_delta_vs_live_mean": _mean(
+                report["vs_live"][
+                    "joint_hypothesis_candidate_fraction_delta_vs_live"
+                ]
+                for report in per_model_diag.values()
+            ),
+            "joint_top_latent_multi_chart_fraction_delta_vs_live_mean": _mean(
+                report["vs_live"][
+                    "joint_top_latent_multi_chart_fraction_delta_vs_live"
+                ]
+                for report in per_model_diag.values()
+            ),
+            "joint_same_latent_chart_switch_fraction_delta_vs_live_mean": _mean(
+                report["vs_live"][
+                    "joint_same_latent_chart_switch_fraction_delta_vs_live"
+                ]
+                for report in per_model_diag.values()
+            ),
+            "joint_top_context_ranked_chart_prior_fraction_delta_vs_live_mean": _mean(
+                report["vs_live"][
+                    "joint_top_context_ranked_chart_prior_fraction_delta_vs_live"
+                ]
+                for report in per_model_diag.values()
+            ),
+            "joint_top_vote_ranked_chart_prior_fraction_delta_vs_live_mean": _mean(
+                report["vs_live"][
+                    "joint_top_vote_ranked_chart_prior_fraction_delta_vs_live"
+                ]
                 for report in per_model_diag.values()
             ),
         },
@@ -2094,15 +3264,63 @@ def _summarize_pairwise_benchmark(pair_report):
             "matched_top1_accuracy_mean": pair_report.get("aggregate", {}).get(
                 "matched_top1_accuracy_mean"
             ),
+            "matched_top1_resolved_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_top1_resolved_fraction_mean"),
+            "matched_top1_strict_accuracy_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_top1_strict_accuracy_mean"),
             "morphology_matched_top1_accuracy_mean": pair_report.get(
                 "aggregate", {}
             ).get("morphology_matched_top1_accuracy_mean"),
+            "morphology_matched_top1_resolved_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("morphology_matched_top1_resolved_fraction_mean"),
+            "morphology_matched_top1_strict_accuracy_mean": pair_report.get(
+                "aggregate", {}
+            ).get("morphology_matched_top1_strict_accuracy_mean"),
             "behavior_matched_top1_accuracy_mean": pair_report.get(
                 "aggregate", {}
             ).get("behavior_matched_top1_accuracy_mean"),
+            "behavior_matched_top1_resolved_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("behavior_matched_top1_resolved_fraction_mean"),
+            "behavior_matched_top1_strict_accuracy_mean": pair_report.get(
+                "aggregate", {}
+            ).get("behavior_matched_top1_strict_accuracy_mean"),
             "parent_matched_top1_accuracy_mean": pair_report.get(
                 "aggregate", {}
             ).get("parent_matched_top1_accuracy_mean"),
+            "parent_matched_top1_resolved_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("parent_matched_top1_resolved_fraction_mean"),
+            "parent_matched_top1_strict_accuracy_mean": pair_report.get(
+                "aggregate", {}
+            ).get("parent_matched_top1_strict_accuracy_mean"),
+            "matched_joint_hypothesis_candidate_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_hypothesis_candidate_fraction_mean"),
+            "matched_joint_top_chart_resolved_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_top_chart_resolved_fraction_mean"),
+            "matched_joint_top_latent_multi_chart_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_top_latent_multi_chart_fraction_mean"),
+            "matched_joint_chart_switch_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_chart_switch_fraction_mean"),
+            "matched_joint_same_latent_chart_switch_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_same_latent_chart_switch_fraction_mean"),
+            "matched_joint_top_context_ranked_chart_prior_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_top_context_ranked_chart_prior_fraction_mean"),
+            "matched_joint_top_vote_ranked_chart_prior_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_top_vote_ranked_chart_prior_fraction_mean"),
+            "matched_joint_dominant_chart_fraction_mean": pair_report.get(
+                "aggregate", {}
+            ).get("matched_joint_dominant_chart_fraction_mean"),
         },
         "per_model": {},
     }
@@ -2121,6 +3339,7 @@ def _summarize_pairwise_benchmark(pair_report):
                     key: matched.get("primary", {}).get(key)
                     for key in (
                         "final_prediction",
+                        "final_prediction_latent_id",
                         "final_prediction_graph_id",
                         "final_prediction_correct",
                     )
@@ -2129,6 +3348,9 @@ def _summarize_pairwise_benchmark(pair_report):
                     "final_prediction": child_predictions.get(
                         "lm_morphology", {}
                     ).get("final_prediction"),
+                    "final_prediction_latent_id": child_predictions.get(
+                        "lm_morphology", {}
+                    ).get("final_prediction_latent_id"),
                     "final_prediction_graph_id": child_predictions.get(
                         "lm_morphology", {}
                     ).get("final_prediction_graph_id"),
@@ -2141,6 +3363,33 @@ def _summarize_pairwise_benchmark(pair_report):
                     "final_target_win_fraction": child_debug.get(
                         "lm_morphology", {}
                     ).get("final_target_win_fraction"),
+                    "joint_hypothesis_candidate_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_hypothesis_candidate_fraction"),
+                    "joint_top_chart_resolved_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_top_chart_resolved_fraction"),
+                    "joint_top_latent_multi_chart_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_top_latent_multi_chart_fraction"),
+                    "joint_chart_switch_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_chart_switch_fraction"),
+                    "joint_same_latent_chart_switch_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_same_latent_chart_switch_fraction"),
+                    "joint_top_context_ranked_chart_prior_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_top_context_ranked_chart_prior_fraction"),
+                    "joint_top_vote_ranked_chart_prior_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_top_vote_ranked_chart_prior_fraction"),
+                    "joint_dominant_chart_fraction": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_dominant_chart_fraction"),
+                    "joint_top_chart_counts": child_debug.get(
+                        "lm_morphology", {}
+                    ).get("joint_top_chart_counts", {}),
                     "final_top_label_counts": child_debug.get(
                         "lm_morphology", {}
                     ).get("final_top_label_counts", {}),
@@ -2149,6 +3398,9 @@ def _summarize_pairwise_benchmark(pair_report):
                     "final_prediction": child_predictions.get(
                         "lm_behavior", {}
                     ).get("final_prediction"),
+                    "final_prediction_latent_id": child_predictions.get(
+                        "lm_behavior", {}
+                    ).get("final_prediction_latent_id"),
                     "final_prediction_graph_id": child_predictions.get(
                         "lm_behavior", {}
                     ).get("final_prediction_graph_id"),
@@ -2161,6 +3413,33 @@ def _summarize_pairwise_benchmark(pair_report):
                     "final_target_win_fraction": child_debug.get(
                         "lm_behavior", {}
                     ).get("final_target_win_fraction"),
+                    "joint_hypothesis_candidate_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_hypothesis_candidate_fraction"),
+                    "joint_top_chart_resolved_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_top_chart_resolved_fraction"),
+                    "joint_top_latent_multi_chart_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_top_latent_multi_chart_fraction"),
+                    "joint_chart_switch_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_chart_switch_fraction"),
+                    "joint_same_latent_chart_switch_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_same_latent_chart_switch_fraction"),
+                    "joint_top_context_ranked_chart_prior_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_top_context_ranked_chart_prior_fraction"),
+                    "joint_top_vote_ranked_chart_prior_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_top_vote_ranked_chart_prior_fraction"),
+                    "joint_dominant_chart_fraction": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_dominant_chart_fraction"),
+                    "joint_top_chart_counts": child_debug.get(
+                        "lm_behavior", {}
+                    ).get("joint_top_chart_counts", {}),
                     "final_top_label_counts": child_debug.get(
                         "lm_behavior", {}
                     ).get("final_top_label_counts", {}),
@@ -2169,6 +3448,7 @@ def _summarize_pairwise_benchmark(pair_report):
                     key: parent_prediction.get(key)
                     for key in (
                         "final_prediction",
+                        "final_prediction_latent_id",
                         "final_prediction_graph_id",
                         "final_prediction_correct",
                     )
@@ -2195,6 +3475,9 @@ def _run_pairwise_benchmark_subprocess(
     boundary_active_threshold,
     fully_self_supervised_lms,
     object_decoder_tail_steps,
+    lm_family,
+    detail_grid_shape,
+    use_detail_aware_sensors,
 ):
     if any(
         cfg
@@ -2236,7 +3519,14 @@ def _run_pairwise_benchmark_subprocess(
         str(float(boundary_active_threshold)),
         "--object-decoder-tail-steps",
         str(int(object_decoder_tail_steps)),
+        "--lm-family",
+        str(lm_family),
+        "--detail-grid-shape",
+        str(int(detail_grid_shape[0])),
+        str(int(detail_grid_shape[1])),
     ]
+    if use_detail_aware_sensors:
+        cmd.append("--use-detail-aware-sensors")
     if fully_self_supervised_lms:
         cmd.append("--fully-self-supervised-lms")
 
@@ -2265,6 +3555,9 @@ def _run_pairwise_child_diagnostics(
     boundary_active_threshold,
     fully_self_supervised_lms,
     object_decoder_tail_steps,
+    lm_family,
+    detail_grid_shape,
+    use_detail_aware_sensors,
 ):
     pairs = list(combinations(list(models), 2))
     if not pairs:
@@ -2273,26 +3566,30 @@ def _run_pairwise_child_diagnostics(
     pair_reports = {}
     for model_pair in pairs:
         pair_report = None
-        try:
-            pair_report = _run_pairwise_benchmark_subprocess(
-                model_pair=model_pair,
-                phase_bins=phase_bins,
-                train_cycles=train_cycles,
-                eval_cycles=eval_cycles,
-                stretch=stretch,
-                compression_stride=compression_stride,
-                resolution=resolution,
-                column_kwargs=deepcopy(column_kwargs),
-                morphology_lm_kwargs=deepcopy(morphology_lm_kwargs),
-                behavior_lm_kwargs=deepcopy(behavior_lm_kwargs),
-                parent_column_kwargs=deepcopy(parent_column_kwargs),
-                parent_lm_kwargs=deepcopy(parent_lm_kwargs),
-                boundary_active_threshold=boundary_active_threshold,
-                fully_self_supervised_lms=fully_self_supervised_lms,
-                object_decoder_tail_steps=object_decoder_tail_steps,
-            )
-        except Exception:
-            pair_report = None
+        if not _is_predictive_hypothesis_family(lm_family):
+            try:
+                pair_report = _run_pairwise_benchmark_subprocess(
+                    model_pair=model_pair,
+                    phase_bins=phase_bins,
+                    train_cycles=train_cycles,
+                    eval_cycles=eval_cycles,
+                    stretch=stretch,
+                    compression_stride=compression_stride,
+                    resolution=resolution,
+                    column_kwargs=deepcopy(column_kwargs),
+                    morphology_lm_kwargs=deepcopy(morphology_lm_kwargs),
+                    behavior_lm_kwargs=deepcopy(behavior_lm_kwargs),
+                    parent_column_kwargs=deepcopy(parent_column_kwargs),
+                    parent_lm_kwargs=deepcopy(parent_lm_kwargs),
+                    boundary_active_threshold=boundary_active_threshold,
+                    fully_self_supervised_lms=fully_self_supervised_lms,
+                    object_decoder_tail_steps=object_decoder_tail_steps,
+                    lm_family=lm_family,
+                    detail_grid_shape=detail_grid_shape,
+                    use_detail_aware_sensors=use_detail_aware_sensors,
+                )
+            except Exception:
+                pair_report = None
 
         if pair_report is None:
             pair_report = run_benchmark(
@@ -2312,6 +3609,9 @@ def _run_pairwise_child_diagnostics(
                 fully_self_supervised_lms=fully_self_supervised_lms,
                 object_decoder_tail_steps=object_decoder_tail_steps,
                 include_parent_replay_diagnostics=False,
+                lm_family=lm_family,
+                detail_grid_shape=detail_grid_shape,
+                use_detail_aware_sensors=use_detail_aware_sensors,
             )
         pair_reports[_pairwise_model_key(model_pair)] = _summarize_pairwise_benchmark(
             pair_report
@@ -2351,7 +3651,20 @@ def run_benchmark(
     fully_self_supervised_lms=False,
     object_decoder_tail_steps=5,
     include_parent_replay_diagnostics=False,
+    lm_family="cortical_column_torch",
+    detail_grid_shape=(5, 5),
+    use_detail_aware_sensors=False,
 ):
+    _configure_benchmark_threading()
+
+    lm_family = str(lm_family)
+    if lm_family not in VALID_LM_FAMILIES:
+        raise ValueError(f"Unknown lm_family: {lm_family}")
+    requested_resolution = tuple(int(value) for value in resolution)
+    resolution = _apply_family_resolution_defaults(requested_resolution, lm_family)
+    detail_grid_shape = _normalize_detail_grid_shape(detail_grid_shape)
+    use_detail_aware_sensors = bool(use_detail_aware_sensors)
+
     model_names = list(models or ("fox", "cesiumman", "robot"))
     column_kwargs = dict(column_kwargs or {})
     benchmark_seed = int(column_kwargs.get("seed", 42))
@@ -2371,6 +3684,7 @@ def run_benchmark(
         if name not in MODEL_SPECS:
             raise ValueError(f"Unknown model spec: {name}")
         spec = dict(MODEL_SPECS[name])
+        spec = _apply_family_model_geometry_defaults(spec, lm_family)
         spec["name"] = name
         specs.append(spec)
 
@@ -2392,14 +3706,47 @@ def run_benchmark(
         "goal_state_min_separation_ratio",
         parent_lm_kwargs.get("evidence_separation_ratio", 1.5),
     )
+    if _is_predictive_hypothesis_family(lm_family):
+        parent_column_kwargs.setdefault(
+            "n_minicolumns",
+            int(column_kwargs.get("n_minicolumns", 512)),
+        )
+        if morphology_lm_kwargs is None:
+            morphology_lm_kwargs = {}
+        if behavior_lm_kwargs is None:
+            behavior_lm_kwargs = {}
+
     morphology_lm_kwargs, behavior_lm_kwargs = _resolve_child_lm_kwargs(
         morphology_lm_kwargs=morphology_lm_kwargs,
         behavior_lm_kwargs=behavior_lm_kwargs,
     )
-    child_lm_track12_matrix = _build_child_lm_track12_matrix(
-        morphology_lm_kwargs=morphology_lm_kwargs,
-        behavior_lm_kwargs=behavior_lm_kwargs,
+    morphology_lm_kwargs = _apply_family_lm_defaults(
+        lm_family,
+        morphology_lm_kwargs,
     )
+    behavior_lm_kwargs = _apply_family_lm_defaults(
+        lm_family,
+        behavior_lm_kwargs,
+    )
+    parent_lm_kwargs = _apply_family_lm_defaults(
+        lm_family,
+        parent_lm_kwargs,
+        is_parent=True,
+    )
+
+    if _is_predictive_hypothesis_family(lm_family):
+        child_lm_track12_matrix = {
+            "family": lm_family,
+            "in_parity": None,
+            "reason": "track12_child_temporal_configs_do_not_apply_to_track14_core",
+            "morphology": {},
+            "behavior": {},
+        }
+    else:
+        child_lm_track12_matrix = _build_child_lm_track12_matrix(
+            morphology_lm_kwargs=morphology_lm_kwargs,
+            behavior_lm_kwargs=behavior_lm_kwargs,
+        )
 
     def _make_experiment(spec, state_dict=None):
         exp = Panda3DTorchExperiment(
@@ -2418,6 +3765,9 @@ def run_benchmark(
             morphology_lm_kwargs=deepcopy(morphology_lm_kwargs),
             behavior_lm_kwargs=deepcopy(behavior_lm_kwargs),
             parent_lm_kwargs=deepcopy(parent_lm_kwargs),
+            lm_family=lm_family,
+            detail_grid_shape=detail_grid_shape,
+            use_detail_aware_sensors=use_detail_aware_sensors,
             motor_actions=[
                 MoveForward,
                 MoveTangentially,
@@ -2467,161 +3817,216 @@ def run_benchmark(
         finally:
             phase_exp.close()
 
-        exp = _make_experiment(spec, state_dict=saved_state)
-        try:
-            anim_name = _select_animation_name(
-                exp,
-                preferred=spec["preferred_animation"],
+        train_schedule = _build_schedule(n_frames, cycles=1)
+        train_object_name = None if fully_self_supervised_lms else spec["name"]
+        max_training_attempts = (
+            TRACK14_TRAINING_MAX_ATTEMPTS
+            if (
+                _is_predictive_hypothesis_family(lm_family)
+                and train_object_name is not None
             )
-            train_schedule = _build_schedule(n_frames, cycles=1)
-            training_trace = []
+            else 1
+        )
 
-            for _ in range(train_cycles):
-                train_object_name = None if fully_self_supervised_lms else spec["name"]
-                result = exp.run_episode(
-                    mode=ExperimentMode.TRAIN,
-                    object_name=train_object_name,
-                    anim_name=anim_name,
-                    frame_schedule=train_schedule,
-                    collect_trace=True,
+        for training_attempt in range(1, max_training_attempts + 1):
+            exp = _make_experiment(spec, state_dict=saved_state)
+            try:
+                anim_name = _select_animation_name(
+                    exp,
+                    preferred=spec["preferred_animation"],
                 )
-                training_trace.extend(result.get("trace", []))
+                training_trace = []
 
-            train_phase_targets = _phase_targets_for_schedule(
-                phase_info["phase_by_frame"],
-                train_schedule * train_cycles,
-            )
-            latent_decoder = _fit_latent_phase_decoder(
-                training_trace,
-                train_phase_targets,
-            )
-            training_diagnostics = _summarize_training_diagnostics(
-                exp,
-                training_trace,
-                latent_decoder,
-            )
-            omission_segment = _find_phase_segment(
-                n_frames,
-                phase_bins,
-                phase_info.get("phase_by_frame"),
-            )
+                for _ in range(train_cycles):
+                    result = exp.run_episode(
+                        mode=ExperimentMode.TRAIN,
+                        object_name=train_object_name,
+                        anim_name=anim_name,
+                        frame_schedule=train_schedule,
+                        collect_trace=True,
+                    )
+                    training_trace.extend(result.get("trace", []))
 
-            training_specs.append(
-                {
-                    **spec,
-                    "animation": anim_name,
-                    "n_frames": n_frames,
-                    "phase_info": phase_info,
-                    "latent_decoder": latent_decoder,
-                    "training_diagnostics": training_diagnostics,
-                    "omission_segment": omission_segment,
-                }
-            )
-            saved_state = deepcopy(exp.monty.state_dict())
-            final_parent_state_dict = deepcopy(
-                exp.monty.learning_modules[2].state_dict()
-            )
-        finally:
-            exp.close()
+                missing_learning_modules = _learning_modules_missing_target_object(
+                    exp,
+                    train_object_name,
+                    lm_family,
+                )
+                if missing_learning_modules:
+                    if training_attempt < max_training_attempts:
+                        continue
+                    missing_str = ", ".join(sorted(missing_learning_modules))
+                    raise RuntimeError(
+                        "Track 14 training did not learn target "
+                        f"{train_object_name} after {max_training_attempts} attempts "
+                        f"(missing: {missing_str})"
+                    )
+
+                train_phase_targets = _phase_targets_for_schedule(
+                    phase_info["phase_by_frame"],
+                    train_schedule * train_cycles,
+                )
+                latent_decoder = _fit_latent_phase_decoder(
+                    training_trace,
+                    train_phase_targets,
+                )
+                training_diagnostics = _summarize_training_diagnostics(
+                    exp,
+                    training_trace,
+                    latent_decoder,
+                )
+                training_diagnostics["attempts_used"] = training_attempt
+                training_diagnostics["camera_initialization"] = dict(
+                    getattr(exp, "_last_camera_init_debug", {}) or {}
+                )
+                training_graph_id_to_target = _snapshot_graph_id_target_mappings(exp)
+                omission_segment = _find_phase_segment(
+                    n_frames,
+                    phase_bins,
+                    phase_info.get("phase_by_frame"),
+                )
+
+                training_specs.append(
+                    {
+                        **spec,
+                        "animation": anim_name,
+                        "n_frames": n_frames,
+                        "phase_info": phase_info,
+                        "latent_decoder": latent_decoder,
+                        "training_diagnostics": training_diagnostics,
+                        "training_graph_id_to_target": training_graph_id_to_target,
+                        "omission_segment": omission_segment,
+                    }
+                )
+                saved_state = deepcopy(exp.monty.state_dict())
+                final_parent_state_dict = deepcopy(
+                    exp.monty.learning_modules[2].state_dict()
+                )
+                break
+            finally:
+                exp.close()
 
     for spec in training_specs:
-        exp = _make_experiment(spec, state_dict=saved_state)
-        try:
-            matched_schedule = _build_schedule(spec["n_frames"], cycles=eval_cycles)
-            stretched_schedule = _build_schedule(
-                spec["n_frames"],
-                cycles=eval_cycles,
-                stretch=stretch,
-            )
-            compressed_schedule = _build_strided_schedule(
-                spec["n_frames"],
-                cycles=eval_cycles,
-                stride=compression_stride,
-            )
-            omission_schedule, omission_windows = _build_omission_schedule(
-                spec["n_frames"],
-                cycles=eval_cycles,
-                segment=spec["omission_segment"],
-            )
-            perturb_schedule, perturb_windows = _build_perturbed_schedule(
-                spec["n_frames"],
-                cycles=eval_cycles,
-                segment=spec["omission_segment"],
-            )
+        matched_schedule = _build_schedule(spec["n_frames"], cycles=eval_cycles)
+        stretched_schedule = _build_schedule(
+            spec["n_frames"],
+            cycles=eval_cycles,
+            stretch=stretch,
+        )
+        compressed_schedule = _build_strided_schedule(
+            spec["n_frames"],
+            cycles=eval_cycles,
+            stride=compression_stride,
+        )
+        omission_schedule, omission_windows = _build_omission_schedule(
+            spec["n_frames"],
+            cycles=eval_cycles,
+            segment=spec["omission_segment"],
+        )
+        perturb_schedule, perturb_windows = _build_perturbed_schedule(
+            spec["n_frames"],
+            cycles=eval_cycles,
+            segment=spec["omission_segment"],
+        )
+        max_eval_attempts = (
+            TRACK14_TRAINING_MAX_ATTEMPTS
+            if _is_predictive_hypothesis_family(lm_family)
+            else 1
+        )
 
-            matched = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=matched_schedule,
-                collect_trace=True,
-                collect_context_signals=include_parent_replay_diagnostics,
-                collect_action_history=True,
-            )
-            matched_action_history = matched.get("action_history", [])
-            matched_action_stats = _compute_action_history_stats(
-                matched_action_history,
-                matched.get("action_context_history", []),
-            )
-            active_replay = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=matched_schedule,
-                collect_trace=True,
-                forced_action_sequences=matched_action_history,
-                action_context_mode="executed",
-            )
-            action_blind_replay = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=matched_schedule,
-                collect_trace=True,
-                forced_action_sequences=matched_action_history,
-                action_context_mode="none",
-            )
-            stretched = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=stretched_schedule,
-                collect_trace=True,
-            )
-            compressed = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=compressed_schedule,
-                collect_trace=True,
-            )
-            omitted = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=omission_schedule,
-                collect_trace=True,
-            )
-            perturbed = exp.run_episode(
-                mode=ExperimentMode.EVAL,
-                anim_name=spec["animation"],
-                frame_schedule=perturb_schedule,
-                collect_trace=True,
-            )
+        for eval_attempt in range(1, max_eval_attempts + 1):
+            exp = _make_experiment(spec, state_dict=saved_state)
+            try:
+                matched = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=matched_schedule,
+                    collect_trace=True,
+                    collect_context_signals=include_parent_replay_diagnostics,
+                    collect_action_history=True,
+                )
+                if (
+                    _is_predictive_hypothesis_family(lm_family)
+                    and not _result_has_processed_learning_step(matched)
+                ):
+                    if eval_attempt < max_eval_attempts:
+                        continue
+                    raise RuntimeError(
+                        "Track 14 evaluation did not produce a processed LM step "
+                        f"for {spec['name']} after {max_eval_attempts} attempts"
+                    )
 
-            raw_eval_results[spec["name"]] = {
-                "matched": matched,
-                "matched_schedule": matched_schedule,
-                "matched_action_stats": matched_action_stats,
-                "active_replay": active_replay,
-                "action_blind_replay": action_blind_replay,
-                "stretched": stretched,
-                "stretched_schedule": stretched_schedule,
-                "compressed": compressed,
-                "compressed_schedule": compressed_schedule,
-                "omitted": omitted,
-                "omission_schedule": omission_schedule,
-                "omission_windows": omission_windows,
-                "perturbed": perturbed,
-                "perturb_schedule": perturb_schedule,
-                "perturb_windows": perturb_windows,
-            }
-        finally:
-            exp.close()
+                matched_action_history = matched.get("action_history", [])
+                matched_action_stats = _compute_action_history_stats(
+                    matched_action_history,
+                    matched.get("action_context_history", []),
+                )
+                matched_camera_initialization = dict(
+                    getattr(exp, "_last_camera_init_debug", {}) or {}
+                )
+                active_replay = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=matched_schedule,
+                    collect_trace=True,
+                    forced_action_sequences=matched_action_history,
+                    action_context_mode="executed",
+                )
+                action_blind_replay = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=matched_schedule,
+                    collect_trace=True,
+                    forced_action_sequences=matched_action_history,
+                    action_context_mode="none",
+                )
+                stretched = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=stretched_schedule,
+                    collect_trace=True,
+                )
+                compressed = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=compressed_schedule,
+                    collect_trace=True,
+                )
+                omitted = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=omission_schedule,
+                    collect_trace=True,
+                )
+                perturbed = exp.run_episode(
+                    mode=ExperimentMode.EVAL,
+                    anim_name=spec["animation"],
+                    frame_schedule=perturb_schedule,
+                    collect_trace=True,
+                )
+
+                raw_eval_results[spec["name"]] = {
+                    "matched": matched,
+                    "matched_schedule": matched_schedule,
+                    "matched_eval_attempts_used": eval_attempt,
+                    "matched_camera_initialization": matched_camera_initialization,
+                    "matched_action_stats": matched_action_stats,
+                    "active_replay": active_replay,
+                    "action_blind_replay": action_blind_replay,
+                    "stretched": stretched,
+                    "stretched_schedule": stretched_schedule,
+                    "compressed": compressed,
+                    "compressed_schedule": compressed_schedule,
+                    "omitted": omitted,
+                    "omission_schedule": omission_schedule,
+                    "omission_windows": omission_windows,
+                    "perturbed": perturbed,
+                    "perturb_schedule": perturb_schedule,
+                    "perturb_windows": perturb_windows,
+                }
+                break
+            finally:
+                exp.close()
 
         # Wait until all per-model eval results are collected before fitting
         # decoders and assembling the benchmark report.
@@ -2630,11 +4035,20 @@ def run_benchmark(
 
         joint_object_decoder = {}
         joint_object_decoder_diagnostics = {}
-        if fully_self_supervised_lms:
+        use_latent_object_decoders = (
+            fully_self_supervised_lms
+            or _is_predictive_hypothesis_family(lm_family)
+        )
+        if use_latent_object_decoders:
+            training_graph_id_to_target_by_model = {
+                spec["name"]: spec.get("training_graph_id_to_target", {})
+                for spec in training_specs
+            }
             object_decoders, object_decoder_diagnostics = (
                 _fit_self_supervised_object_decoders(
                     raw_eval_results,
                     tail_steps=object_decoder_tail_steps,
+                    training_graph_id_to_target_by_model=training_graph_id_to_target_by_model,
                 )
             )
             joint_object_decoder, joint_object_decoder_diagnostics = (
@@ -2653,6 +4067,10 @@ def run_benchmark(
             raw_eval = raw_eval_results[spec["name"]]
             matched = raw_eval["matched"]
             matched_schedule = raw_eval["matched_schedule"]
+            matched_eval_attempts_used = raw_eval["matched_eval_attempts_used"]
+            matched_camera_initialization = raw_eval[
+                "matched_camera_initialization"
+            ]
             matched_action_stats = raw_eval["matched_action_stats"]
             active_replay = raw_eval["active_replay"]
             action_blind_replay = raw_eval["action_blind_replay"]
@@ -2805,9 +4223,26 @@ def run_benchmark(
                 "omission_segment_selection_mode": spec["omission_segment"].get(
                     "selection_mode"
                 ),
+                "matched_eval_attempts_used": matched_eval_attempts_used,
+                "matched_camera_initialization": matched_camera_initialization,
                 "matched_action_stats": matched_action_stats,
                 "latent_phase_decoder": spec["latent_decoder"],
                 "object_identity_decoder": dict(object_decoder_diagnostics),
+                "alias_source_diagnostics": _summarize_lm_alias_source_for_model(
+                    spec["name"],
+                    matched,
+                    training_graph_id_to_target=spec.get(
+                        "training_graph_id_to_target",
+                        {},
+                    ),
+                    training_reporting_alias_diagnostics=(
+                        (spec.get("training_diagnostics") or {}).get(
+                            "reporting_alias_diagnostics",
+                            {},
+                        )
+                    ),
+                    object_decoder_diagnostics=object_decoder_diagnostics,
+                ),
                 "training": spec["training_diagnostics"],
                 "matched": matched_report,
                 "active_replay": {
@@ -2860,38 +4295,92 @@ def run_benchmark(
 
             per_model[spec["name"]]["matched"].pop("action_history", None)
 
+        matched_primary_summary = _prediction_accuracy_summary(
+            report["matched"]["primary"] for report in per_model.values()
+        )
+        matched_morphology_summary = _prediction_accuracy_summary(
+            report["matched"]["child_lm_primary"]["lm_morphology"]
+            for report in per_model.values()
+        )
+        matched_behavior_summary = _prediction_accuracy_summary(
+            report["matched"]["child_lm_primary"]["lm_behavior"]
+            for report in per_model.values()
+        )
+        matched_parent_summary = _prediction_accuracy_summary(
+            report["matched"]["lm_object_predictions"]["lm_parent"]
+            for report in per_model.values()
+        )
+        stretched_primary_summary = _prediction_accuracy_summary(
+            report["stretched"]["primary"] for report in per_model.values()
+        )
+        compressed_primary_summary = _prediction_accuracy_summary(
+            report["compressed"]["primary"] for report in per_model.values()
+        )
+
         aggregate = {
             "n_models": len(per_model),
-            "matched_top1_accuracy_mean": _mean(
-                report["matched"]["primary"]["final_prediction_correct"]
+            "training_attempts_used_max": max(
+                report["training"].get("attempts_used", 1)
                 for report in per_model.values()
             ),
-            "morphology_matched_top1_accuracy_mean": _mean(
-                report["matched"]["child_lm_primary"]["lm_morphology"][
-                    "final_prediction_correct"
-                ]
+            "matched_eval_attempts_used_max": max(
+                report.get("matched_eval_attempts_used", 1)
                 for report in per_model.values()
             ),
-            "behavior_matched_top1_accuracy_mean": _mean(
-                report["matched"]["child_lm_primary"]["lm_behavior"][
-                    "final_prediction_correct"
-                ]
-                for report in per_model.values()
+            "matched_top1_accuracy_mean": matched_primary_summary[
+                "accuracy_mean"
+            ],
+            "matched_top1_resolved_fraction_mean": matched_primary_summary[
+                "resolved_fraction_mean"
+            ],
+            "matched_top1_strict_accuracy_mean": matched_primary_summary[
+                "strict_accuracy_mean"
+            ],
+            "morphology_matched_top1_accuracy_mean": matched_morphology_summary[
+                "accuracy_mean"
+            ],
+            "morphology_matched_top1_resolved_fraction_mean": (
+                matched_morphology_summary["resolved_fraction_mean"]
             ),
-            "parent_matched_top1_accuracy_mean": _mean(
-                report["matched"]["lm_object_predictions"]["lm_parent"][
-                    "final_prediction_correct"
-                ]
-                for report in per_model.values()
+            "morphology_matched_top1_strict_accuracy_mean": (
+                matched_morphology_summary["strict_accuracy_mean"]
             ),
-            "stretched_top1_accuracy_mean": _mean(
-                report["stretched"]["primary"]["final_prediction_correct"]
-                for report in per_model.values()
+            "behavior_matched_top1_accuracy_mean": matched_behavior_summary[
+                "accuracy_mean"
+            ],
+            "behavior_matched_top1_resolved_fraction_mean": (
+                matched_behavior_summary["resolved_fraction_mean"]
             ),
-            "compressed_top1_accuracy_mean": _mean(
-                report["compressed"]["primary"]["final_prediction_correct"]
-                for report in per_model.values()
+            "behavior_matched_top1_strict_accuracy_mean": (
+                matched_behavior_summary["strict_accuracy_mean"]
             ),
+            "parent_matched_top1_accuracy_mean": matched_parent_summary[
+                "accuracy_mean"
+            ],
+            "parent_matched_top1_resolved_fraction_mean": (
+                matched_parent_summary["resolved_fraction_mean"]
+            ),
+            "parent_matched_top1_strict_accuracy_mean": matched_parent_summary[
+                "strict_accuracy_mean"
+            ],
+            "stretched_top1_accuracy_mean": stretched_primary_summary[
+                "accuracy_mean"
+            ],
+            "stretched_top1_resolved_fraction_mean": stretched_primary_summary[
+                "resolved_fraction_mean"
+            ],
+            "stretched_top1_strict_accuracy_mean": stretched_primary_summary[
+                "strict_accuracy_mean"
+            ],
+            "compressed_top1_accuracy_mean": compressed_primary_summary[
+                "accuracy_mean"
+            ],
+            "compressed_top1_resolved_fraction_mean": compressed_primary_summary[
+                "resolved_fraction_mean"
+            ],
+            "compressed_top1_strict_accuracy_mean": compressed_primary_summary[
+                "strict_accuracy_mean"
+            ],
             "omission_surprise_delta_mean": _mean(
                 report["omission"]["windowed_primary"]["mean_surprise_delta"]
                 for report in per_model.values()
@@ -2984,6 +4473,54 @@ def run_benchmark(
                 ]
                 for report in per_model.values()
             ),
+            "matched_joint_hypothesis_candidate_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_hypothesis_candidate_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_top_chart_resolved_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_top_chart_resolved_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_top_latent_multi_chart_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_top_latent_multi_chart_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_chart_switch_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_chart_switch_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_same_latent_chart_switch_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_same_latent_chart_switch_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_top_context_ranked_chart_prior_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_top_context_ranked_chart_prior_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_top_vote_ranked_chart_prior_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_top_vote_ranked_chart_prior_fraction"
+                ]
+                for report in per_model.values()
+            ),
+            "matched_joint_dominant_chart_fraction_mean": _mean(
+                report["matched"]["interference_debug"][
+                    "joint_dominant_chart_fraction"
+                ]
+                for report in per_model.values()
+            ),
             "matched_action_context_nonzero_fraction_mean": _mean(
                 report["matched_action_stats"]["nonzero_action_context_fraction"]
                 for report in per_model.values()
@@ -3034,15 +4571,30 @@ def run_benchmark(
             "stretch": stretch,
             "compression_stride": compression_stride,
             "resolution": list(resolution),
+            "requested_resolution": list(requested_resolution),
+            "lm_family": lm_family,
+            "detail_grid_shape": list(detail_grid_shape),
+            "use_detail_aware_sensors": use_detail_aware_sensors,
             "column_kwargs": dict(column_kwargs),
             "morphology_column_kwargs": dict(morphology_column_kwargs),
             "behavior_column_kwargs": dict(behavior_column_kwargs),
+            "parent_column_kwargs": dict(parent_column_kwargs),
             "benchmark_seed": benchmark_seed,
             "boundary_active_threshold": float(boundary_active_threshold),
             "real_assets_only": True,
-            "core_temporal_state_mode": "trace_bank_d_t",
-            "input_geometry_mode": "inferred_relative_hidden_state",
-            "trace_biased_inference": True,
+            "core_temporal_state_mode": (
+                "predictive_hypothesis_message_state"
+                if _is_predictive_hypothesis_family(lm_family)
+                else "trace_bank_d_t"
+            ),
+            "input_geometry_mode": (
+                "detail_packet_plus_internal_object_state"
+                if _is_predictive_hypothesis_family(lm_family)
+                else "inferred_relative_hidden_state"
+            ),
+            "trace_biased_inference": (
+                False if _is_predictive_hypothesis_family(lm_family) else True
+            ),
             "child_lm_temporal_parity": child_lm_track12_matrix["in_parity"],
             "child_lm_track12_matrix": child_lm_track12_matrix,
             "temporal_trace_config": dict(
@@ -3052,7 +4604,11 @@ def run_benchmark(
                 "forced_action_replay_with_efference_ablation"
             ),
             "full_active_passive_test": False,
-            "temporal_learning_mode": "self_supervised_predictive_trace_state",
+            "temporal_learning_mode": (
+                "local_predictive_hypothesis_online_update"
+                if _is_predictive_hypothesis_family(lm_family)
+                else "self_supervised_predictive_trace_state"
+            ),
             "temporal_state_provider_used": False,
             "phase_labels_used_in_training": False,
             "motor_control_mode": (
@@ -3092,6 +4648,11 @@ def run_benchmark(
                 if fully_self_supervised_lms
                 else "none"
             ),
+            "object_identity_ambiguity_reporting_mode": (
+                "ambiguous_graph_ids_remain_unresolved_and_are_excluded_from_accuracy"
+                if fully_self_supervised_lms
+                else "none"
+            ),
             "object_identity_decoder_tail_steps": int(object_decoder_tail_steps),
             "object_identity_decoder": dict(object_decoder_diagnostics),
             "joint_object_identity_decoder": dict(
@@ -3112,6 +4673,7 @@ def run_benchmark(
                 parent_column_kwargs=parent_column_kwargs,
                 parent_lm_kwargs=parent_lm_kwargs,
                 object_decoders=object_decoders,
+                lm_family=lm_family,
                 boundary_active_threshold=boundary_active_threshold,
             )
 
@@ -3134,6 +4696,9 @@ def run_diagnostic_harness(
     boundary_active_threshold=BOUNDARY_PRESSURE_ACTIVE_THRESHOLD,
     fully_self_supervised_lms=False,
     object_decoder_tail_steps=5,
+    lm_family="cortical_column_torch",
+    detail_grid_shape=(5, 5),
+    use_detail_aware_sensors=False,
 ):
     report = run_benchmark(
         models=models,
@@ -3152,6 +4717,9 @@ def run_diagnostic_harness(
         fully_self_supervised_lms=fully_self_supervised_lms,
         object_decoder_tail_steps=object_decoder_tail_steps,
         include_parent_replay_diagnostics=True,
+        lm_family=lm_family,
+        detail_grid_shape=detail_grid_shape,
+        use_detail_aware_sensors=use_detail_aware_sensors,
     )
 
     report.setdefault("diagnostics", {})["pairwise_child_only"] = (
@@ -3171,6 +4739,9 @@ def run_diagnostic_harness(
             boundary_active_threshold=boundary_active_threshold,
             fully_self_supervised_lms=fully_self_supervised_lms,
             object_decoder_tail_steps=object_decoder_tail_steps,
+            lm_family=lm_family,
+            detail_grid_shape=detail_grid_shape,
+            use_detail_aware_sensors=use_detail_aware_sensors,
         )
     )
     return report
@@ -3211,6 +4782,21 @@ def main():
         "--diagnostic-harness",
         action="store_true",
     )
+    parser.add_argument(
+        "--lm-family",
+        default="cortical_column_torch",
+        choices=VALID_LM_FAMILIES,
+    )
+    parser.add_argument(
+        "--detail-grid-shape",
+        nargs=2,
+        type=int,
+        default=[5, 5],
+    )
+    parser.add_argument(
+        "--use-detail-aware-sensors",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     runner = run_diagnostic_harness if args.diagnostic_harness else run_benchmark
@@ -3230,6 +4816,9 @@ def main():
         boundary_active_threshold=args.boundary_active_threshold,
         fully_self_supervised_lms=args.fully_self_supervised_lms,
         object_decoder_tail_steps=args.object_decoder_tail_steps,
+        lm_family=args.lm_family,
+        detail_grid_shape=tuple(args.detail_grid_shape),
+        use_detail_aware_sensors=args.use_detail_aware_sensors,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

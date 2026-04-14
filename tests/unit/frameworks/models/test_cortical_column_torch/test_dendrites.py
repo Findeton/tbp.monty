@@ -1,7 +1,7 @@
 # Copyright 2025-2026 Thousand Brains Project
 # MIT License
 
-"""Tests for sparse dendrites (COO tensor matmul architecture)."""
+"""Tests for sparse dendrites and their connected-synapse cache."""
 
 import unittest
 
@@ -131,8 +131,8 @@ class TestSparseDendrites(unittest.TestCase):
         depol2 = dend2.predict(x)
         self.assertTrue(torch.allclose(depol1, depol2))
 
-    def test_sparse_matmul_architecture(self):
-        """Verify the internal sparse COO tensor is actually built and used."""
+    def test_connected_synapse_cache_architecture(self):
+        """Verify the internal connected-synapse cache is actually built."""
         dend = SparseDendrites(
             n_cells=16, connected_threshold=0.3, initial_permanence=0.5,
         )
@@ -142,17 +142,24 @@ class TestSparseDendrites(unittest.TestCase):
         # Force rebuild
         dend._rebuild_sparse()
 
-        # The sparse tensor D should exist
-        self.assertIsNotNone(dend._D)
-        self.assertTrue(dend._D.is_sparse)
-        self.assertEqual(dend._D.shape, (2, 16))
+        self.assertIsNotNone(dend._segment_sources)
+        self.assertIsNotNone(dend._segment_permanences)
+        self.assertEqual(dend._segment_sources.shape, (2, dend.max_synapses_per_segment))
+        self.assertEqual(
+            dend._segment_permanences.shape,
+            (2, dend.max_synapses_per_segment),
+        )
+        self.assertEqual(dend._segment_sources[0, 0].item(), 1)
+        self.assertEqual(dend._segment_sources[0, 1].item(), 2)
+        self.assertEqual(dend._segment_sources[1, 0].item(), 4)
+        self.assertEqual(dend._segment_sources[1, 1].item(), 5)
 
         # seg_to_cell should map segment 0→cell 0, segment 1→cell 3
         self.assertEqual(dend._seg_to_cell[0].item(), 0)
         self.assertEqual(dend._seg_to_cell[1].item(), 3)
 
     def test_cache_invalidation(self):
-        """Mutations invalidate the sparse tensor cache."""
+        """Mutations invalidate the connected-synapse cache."""
         dend = SparseDendrites(n_cells=8)
         dend.grow_segment(0, [1])
         dend._rebuild_sparse()
